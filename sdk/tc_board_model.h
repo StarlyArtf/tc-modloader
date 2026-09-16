@@ -17,6 +17,7 @@
 namespace tc {
 
 using TCBoardContainsFn = uint8_t (*)(const void* set, uint64_t id);
+using TCBoardLenFn = uint64_t (*)(const void* set);
 
 struct TCBoardModel {
     const void* selected_components = nullptr;
@@ -24,6 +25,7 @@ struct TCBoardModel {
     const void* prev_selected_components = nullptr;
     const void* prev_selected_wires = nullptr;
     TCBoardContainsFn contains = nullptr;
+    TCBoardLenFn len = nullptr;
 
     bool load(const TCHost* host) {
         if (host == nullptr) return false;
@@ -38,12 +40,16 @@ struct TCBoardModel {
         contains = reinterpret_cast<TCBoardContainsFn>(
             host->resolve_symbol(host->context,
                                  "contains__modelZboardZboard_u1842"));
+        len = reinterpret_cast<TCBoardLenFn>(
+            host->resolve_symbol(host->context,
+                                 "len__modelZboardZboard_u19087"));
         return valid();
     }
 
     bool valid() const {
         return selected_components != nullptr &&
-               selected_wires != nullptr && contains != nullptr;
+               selected_wires != nullptr && contains != nullptr &&
+               len != nullptr;
     }
 
     bool isComponentSelected(uint64_t component_id) const {
@@ -67,6 +73,26 @@ struct TCBoardModel {
     bool isWirePreviouslySelected(uint64_t wire_id) const {
         return valid() && hasPreviousSelection() &&
                contains(prev_selected_wires, wire_id) != 0;
+    }
+
+    uint64_t selectedComponentCount() const {
+        return valid() ? len(selected_components) : 0;
+    }
+
+    uint64_t selectedWireCount() const {
+        return valid() ? len(selected_wires) : 0;
+    }
+
+    uint64_t previousSelectedComponentCount() const {
+        return valid() && hasPreviousSelection()
+                   ? len(prev_selected_components)
+                   : 0;
+    }
+
+    uint64_t previousSelectedWireCount() const {
+        return valid() && hasPreviousSelection()
+                   ? len(prev_selected_wires)
+                   : 0;
     }
 };
 

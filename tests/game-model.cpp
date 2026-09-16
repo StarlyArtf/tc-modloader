@@ -175,6 +175,14 @@ uint8_t fakeBoardContains(const void* set, uint64_t id) {
     return 0;
 }
 
+uint64_t fakeBoardLen(const void* set) {
+    if (set == gSelectedComponents) return gSelectedComponentIds.size();
+    if (set == gSelectedWires) return gSelectedWireIds.size();
+    if (set == gPrevSelectedComponents) return gPrevSelectedComponentIds.size();
+    if (set == gPrevSelectedWires) return gPrevSelectedWireIds.size();
+    return 0;
+}
+
 void fakeSimSubmit(void*, uint8_t command, int64_t target) {
     gSimObservedCommand = command;
     gSimObservedTarget = target;
@@ -285,6 +293,9 @@ void* fakeResolve(void*, const char* name) {
     }
     if (symbol == "contains__modelZboardZboard_u1842") {
         return reinterpret_cast<void*>(&fakeBoardContains);
+    }
+    if (symbol == "len__modelZboardZboard_u19087") {
+        return reinterpret_cast<void*>(&fakeBoardLen);
     }
     if (symbol == "is_campaign__modelZmodel95types_u739") {
         return &gIsCampaign;
@@ -462,7 +473,11 @@ int main() {
         !board.isComponentPreviouslySelected(43) ||
         board.isComponentPreviouslySelected(42) ||
         !board.isWirePreviouslySelected(8) ||
-        board.isWirePreviouslySelected(7)) {
+        board.isWirePreviouslySelected(7) ||
+        board.selectedComponentCount() != 1 ||
+        board.selectedWireCount() != 1 ||
+        board.previousSelectedComponentCount() != 1 ||
+        board.previousSelectedWireCount() != 1) {
         std::cerr << "board selection query mismatch\n";
         return 1;
     }
