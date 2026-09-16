@@ -185,8 +185,8 @@ std::vector<uint8_t> buildPayload() {
     addPin(writer, kOutputPin, 14, -10, 0x1000000000000003ULL, "Out", -2, 1);
 
     writer.i64(3);  // wires
-    addWire(writer, -8, -13, {0x000B, 0x2002, 0x0000});
-    addWire(writer, -8, -7, {0x000B, 0x6002, 0x0000});
+    addWire(writer, -8, -13, {0x000B, 0x4002, 0x0000});
+    addWire(writer, -8, -7, {0x000B, 0xC002, 0x0000});
     addWire(writer, 6, -10, {0x0005, 0x0000});
     return writer.bytes;
 }
