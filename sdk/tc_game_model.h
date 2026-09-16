@@ -58,6 +58,13 @@ struct TCPrototype {
     alignas(8) unsigned char bytes[0x5a8];
 };
 
+// Nim string object as used by the pinned build: length followed by a
+// pointer to the payload.  rawNewString() creates such an object.
+struct TCNimString {
+    uint64_t length;
+    void* data;
+};
+
 // Input/output pin entries in a Prototype are each 0x38 bytes.  The raw word
 // size value is the 8 bytes at +0x10 (verified in get_input_word_size and
 // get_output_word_size).
@@ -69,6 +76,7 @@ using TCGetPrototypeFn = void (*)(const void* kind, void* out);
 using TCGetCustomPrototypeFn = void (*)(uint64_t custom_id, void* out);
 using TCWordSizeFn = uint64_t (*)(uint8_t kind, uint16_t pin_index,
                                   const void* expected_word_size);
+using TCRawNewStringFn = void (*)(void* out, int64_t length);
 using TCCustomPrototypeSetFn = void (*)(uint64_t custom_id,
                                         const void* prototype);
 using TCCustomPrototypeDelFn = void (*)(uint64_t custom_id);
@@ -79,6 +87,7 @@ struct TCGameModel {
     TCGetCustomPrototypeFn get_custom_prototype = nullptr;
     TCWordSizeFn get_input_word_size = nullptr;
     TCWordSizeFn get_output_word_size = nullptr;
+    TCRawNewStringFn raw_new_string = nullptr;
     const void* auto_size = nullptr;
     const void* prototypes_table = nullptr;
     const void* category_order = nullptr;
@@ -123,6 +132,8 @@ struct TCGameModel {
             resolve("get_input_word_size__modelZboardZprototype95list_u4196"));
         get_output_word_size = reinterpret_cast<TCWordSizeFn>(
             resolve("get_output_word_size__modelZboardZprototype95list_u4353"));
+        raw_new_string = reinterpret_cast<TCRawNewStringFn>(
+            resolve("rawNewString"));
         auto_size = resolve("AUTO_SIZE__modelZmodel95types_u54");
         prototypes_table = resolve("PROTOTYPES__modelZboardZprototype95list_u3772");
         category_order = resolve("CATEGORY_ORDER__modelZboardZprototype95list_u21");
@@ -144,6 +155,10 @@ struct TCGameModel {
     bool wordSizeValid() const {
         return get_input_word_size != nullptr &&
                get_output_word_size != nullptr && auto_size != nullptr;
+    }
+
+    bool stringAllocValid() const {
+        return raw_new_string != nullptr;
     }
 
     // Fetch a prototype into out.  For custom prototypes use
@@ -320,6 +335,40 @@ struct TCGameModel {
         custom_prototypes_del(custom_id);
         return true;
     }
+
+    // Replace the verified name/description fields with a newly allocated
+    // Nim string.  The old template string is not freed; use this only on a
+    // working copy before registering it, never on a live table entry.
+    bool setPrototypeName(TCPrototype& prototype, const char* utf8) const {
+        return setPrototypeString(prototype, utf8, 0x10);
+    }
+
+    bool setPrototypeDescription(TCPrototype& prototype,
+                                 const char* utf8) const {
+        return setPrototypeString(prototype, utf8, 0x28);
+    }
+
+    bool setPrototypeString(TCPrototype& prototype, const char* utf8,
+                            size_t field_offset) const {
+        if (!raw_new_string || utf8 == nullptr ||
+            field_offset > sizeof(prototype.bytes) ||
+            sizeof(TCNimString) > sizeof(prototype.bytes) - field_offset) {
+            return false;
+        }
+        const size_t length = strlen(utf8);
+        if (length > INT64_MAX) return false;
+
+        TCNimString value{};
+        raw_new_string(&value, static_cast<int64_t>(length));
+        if (!value.data) return false;
+
+        // Nim payload: length/capacity at +0, UTF-8 bytes at +8.
+        memset(static_cast<unsigned char*>(value.data) + 8, 0, length + 1);
+        memcpy(static_cast<unsigned char*>(value.data) + 8, utf8, length);
+
+        memcpy(prototype.bytes + field_offset, &value, sizeof(value));
+        return true;
+    }
 };
 
 // Verified Prototype offsets:
@@ -375,6 +424,30 @@ inline uint64_t pinWordSizeRaw(const TCPin& pin) {
     return value;
 }
 
+inline TCNimString prototypeName(const TCPrototype& p) {
+    TCNimString value{};
+    memcpy(&value.length, p.bytes + 0x10, sizeof(value.length));
+    memcpy(&value.data, p.bytes + 0x18, sizeof(value.data));
+    return value;
+}
+
+inline TCNimString prototypeDescription(const TCPrototype& p) {
+    TCNimString value{};
+    memcpy(&value.length, p.bytes + 0x28, sizeof(value.length));
+    memcpy(&value.data, p.bytes + 0x30, sizeof(value.data));
+    return value;
+}
+
+inline const char* prototypeNameCStr(const TCPrototype& p) {
+    TCNimString value = prototypeName(p);
+    return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
+}
+
+inline const char* prototypeDescriptionCStr(const TCPrototype& p) {
+    TCNimString value = prototypeDescription(p);
+    return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
+}
+
 // Small convenience wrapper for the verified template workflow.  It owns a
 // working TCPrototype copy and keeps the model reference used to register it.
 // Identity/visual fields not yet reverse-engineered remain raw bytes; they can
@@ -405,6 +478,14 @@ class TCPrototypeBuilder {
 
     void setOutputPins(TCPin* pins) {
         prototypeSetOutputPins(prototype_, pins);
+    }
+
+    bool setName(const char* utf8) {
+        return model_->setPrototypeName(prototype_, utf8);
+    }
+
+    bool setDescription(const char* utf8) {
+        return model_->setPrototypeDescription(prototype_, utf8);
     }
 
     void setRawField(size_t offset, const void* data, size_t size) {

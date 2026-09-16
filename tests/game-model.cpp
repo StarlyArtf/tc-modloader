@@ -1,6 +1,7 @@
 #include "../sdk/tc_game_model.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -100,6 +101,13 @@ uint64_t fakeOutputWordSize(uint8_t kind, uint16_t pin_index,
     return static_cast<uint64_t>(kind) * 1000 + pin_index;
 }
 
+void fakeRawNewString(void* out, int64_t length) {
+    auto* value = static_cast<tc::TCNimString*>(out);
+    value->length = length;
+    value->data = std::malloc(static_cast<size_t>(length) + 16);
+    std::memset(value->data, 0, static_cast<size_t>(length) + 16);
+}
+
 void fakeSetCustomPrototype(uint64_t id, const void* prototype) {
     const auto* proto = static_cast<const tc::TCPrototype*>(prototype);
     gCustomPrototypes[id] = *proto;
@@ -142,6 +150,9 @@ void* fakeResolve(void*, const char* name) {
     if (symbol ==
         "get_output_word_size__modelZboardZprototype95list_u4353") {
         return reinterpret_cast<void*>(&fakeOutputWordSize);
+    }
+    if (symbol == "rawNewString") {
+        return reinterpret_cast<void*>(&fakeRawNewString);
     }
     if (symbol == "AUTO_SIZE__modelZmodel95types_u54") {
         return &gAutoSize;
@@ -203,6 +214,10 @@ int main() {
         std::cerr << "model did not resolve required symbols\n";
         return 1;
     }
+    if (!model.stringAllocValid()) {
+        std::cerr << "model did not resolve rawNewString\n";
+        return 1;
+    }
     if (!model.mutationValid()) {
         std::cerr << "model did not resolve mutation symbols\n";
         return 1;
@@ -248,6 +263,17 @@ int main() {
     if (!builder.ready() ||
         tc::prototypeInputCount(builder.prototype()) != 2) {
         std::cerr << "prototype builder template mismatch\n";
+        return 1;
+    }
+    if (!builder.setName("My Gate") ||
+        !builder.setDescription("Custom gate")) {
+        std::cerr << "prototype builder string assignment failed\n";
+        return 1;
+    }
+    if (std::strcmp(tc::prototypeNameCStr(builder.prototype()), "My Gate") != 0 ||
+        std::strcmp(tc::prototypeDescriptionCStr(builder.prototype()),
+                    "Custom gate") != 0) {
+        std::cerr << "prototype name/description mismatch\n";
         return 1;
     }
     tc::TCPin builderPins[2]{};

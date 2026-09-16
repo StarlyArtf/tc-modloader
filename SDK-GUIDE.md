@@ -104,6 +104,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `builtinPrototypeCount()`、`builtinPrototypeKindAt()`、`isBuiltinPrototypeKind()` 从 `PROTOTYPES` 哈希表安全枚举内置 kind，避免向 `getPrototype` 传入未知 key。
 - `cloneBuiltinPrototype(kind, out)` 复制一个已验证的内置元件模板；`registerBuiltinAsCustom(kind, custom_id, out)` 进一步把它写入自定义元件表。
 - `TCPrototypeBuilder` 封装“复制模板 → 调整已核实字段 → 注册为自定义元件”的工作流；未反推出的身份字段仍可通过 `setRawField` 写入。
+- 已验证 `Prototype +0x10` 为名称、`+0x28` 为描述；`setPrototypeName`／`setPrototypeDescription` 以及 Builder 的 `setName`／`setDescription` 使用游戏 `rawNewString` 分配 Nim 字符串。
 - `get_input_word_size`／`get_output_word_size` 只在提供合法内置 kind 时调用，封装默认传 `AUTO_SIZE` 对象地址作为期望宽度。
 - `custom_prototypes_set(id, prototype)`／`custom_prototypes_del(id)` 是已核实的低层注册原语，`in_custom_prototypes`／`notin_custom_prototypes` 用于查询，`customPrototypeCount()` 读取 `cc_length`，`customPrototypeIdAt(index)` 读取 `cc_live_values` 中的 ID。
 - `TCGameModel::setCustomPrototype` 会深拷贝传入的 `TCPrototype`，调用后原对象可以释放。
