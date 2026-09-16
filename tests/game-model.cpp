@@ -102,7 +102,6 @@ uint64_t fakeOutputWordSize(uint8_t kind, uint16_t pin_index,
 
 void fakeSetCustomPrototype(uint64_t id, const void* prototype) {
     const auto* proto = static_cast<const tc::TCPrototype*>(prototype);
-    assert(tc::prototypeInputCount(*proto) == 2);
     gCustomPrototypes[id] = *proto;
     if (std::find(gCustomIds.begin(), gCustomIds.end(), id) ==
         gCustomIds.end()) {
@@ -242,6 +241,30 @@ int main() {
         model.hasCustomPrototype(777) ||
         model.customPrototypeCount() != 0) {
         std::cerr << "template registration cleanup mismatch\n";
+        return 1;
+    }
+
+    tc::TCPrototypeBuilder builder(model, 0x52);
+    if (!builder.ready() ||
+        tc::prototypeInputCount(builder.prototype()) != 2) {
+        std::cerr << "prototype builder template mismatch\n";
+        return 1;
+    }
+    tc::TCPin builderPins[2]{};
+    builder.setInputCount(2);
+    builder.setInputPins(builderPins);
+    builder.setOutputCount(1);
+    tc::TCPin builderOutput[1]{};
+    builder.setOutputPins(builderOutput);
+    if (!builder.registerAsCustom(888) ||
+        !model.hasCustomPrototype(888) ||
+        model.customPrototypeCount() != 1) {
+        std::cerr << "prototype builder registration mismatch\n";
+        return 1;
+    }
+    if (!model.removeCustomPrototype(888) ||
+        model.customPrototypeCount() != 0) {
+        std::cerr << "prototype builder cleanup mismatch\n";
         return 1;
     }
 

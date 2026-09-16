@@ -375,6 +375,56 @@ inline uint64_t pinWordSizeRaw(const TCPin& pin) {
     return value;
 }
 
+// Small convenience wrapper for the verified template workflow.  It owns a
+// working TCPrototype copy and keeps the model reference used to register it.
+// Identity/visual fields not yet reverse-engineered remain raw bytes; they can
+// be modified through setRawField() when their offsets are known.
+class TCPrototypeBuilder {
+ public:
+    TCPrototypeBuilder(const TCGameModel& model, uint8_t builtin_kind)
+        : model_(&model), kind_(builtin_kind), ready_(false) {
+        ready_ = model.cloneBuiltinPrototype(builtin_kind, prototype_);
+    }
+
+    bool ready() const { return ready_; }
+    uint8_t kind() const { return kind_; }
+    TCPrototype& prototype() { return prototype_; }
+    const TCPrototype& prototype() const { return prototype_; }
+
+    void setInputCount(uint64_t count) {
+        prototypeSetInputCount(prototype_, count);
+    }
+
+    void setInputPins(TCPin* pins) {
+        prototypeSetInputPins(prototype_, pins);
+    }
+
+    void setOutputCount(uint64_t count) {
+        prototypeSetOutputCount(prototype_, count);
+    }
+
+    void setOutputPins(TCPin* pins) {
+        prototypeSetOutputPins(prototype_, pins);
+    }
+
+    void setRawField(size_t offset, const void* data, size_t size) {
+        if (offset <= sizeof(prototype_.bytes) &&
+            size <= sizeof(prototype_.bytes) - offset) {
+            memcpy(prototype_.bytes + offset, data, size);
+        }
+    }
+
+    bool registerAsCustom(uint64_t custom_id) const {
+        return ready_ && model_->setCustomPrototype(custom_id, prototype_);
+    }
+
+ private:
+    const TCGameModel* model_;
+    uint8_t kind_;
+    bool ready_;
+    TCPrototype prototype_{};
+};
+
 }  // namespace tc
 
 #endif  // TC_GAME_MODEL_H
