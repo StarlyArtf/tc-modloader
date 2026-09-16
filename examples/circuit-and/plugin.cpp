@@ -1,6 +1,7 @@
 #include "../../sdk/tc_mod.h"
 #include "and_fixture.hpp"
 #include <cstring>
+#include <fstream>
 #include <string>
 
 static const TCHost* host;
@@ -9,6 +10,25 @@ static tc::TCComponentModel components;
 
 static void log(const std::string& message) {
     if (host) host->log(host->context, message.c_str());
+}
+
+// Optional diagnostic override for the cached design statistics.  When the
+// file <plugin data>/design-stats.txt contains "<gates> <delay>", those numbers
+// are written into the registered prototype instead of the fixture defaults.
+// This is how the game reports a component's own cost, so it is also the knob
+// for checking that the values mod authors write really reach the UI.
+static void applyDesignStatsOverride(uint64_t& gates, uint64_t& delay) {
+    if (!host || !host->data_directory_utf8) return;
+    std::ifstream file(std::string(host->data_directory_utf8) + "/design-stats.txt");
+    long long parsed_gates = 0;
+    long long parsed_delay = 0;
+    if (file >> parsed_gates >> parsed_delay && parsed_gates >= 0 &&
+        parsed_delay >= 0) {
+        gates = static_cast<uint64_t>(parsed_gates);
+        delay = static_cast<uint64_t>(parsed_delay);
+        log("circuit-and: design stats override gates=" + std::to_string(gates) +
+            " delay=" + std::to_string(delay));
+    }
 }
 
 extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
@@ -55,8 +75,11 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     // The game keeps the delay cached in the definition header verbatim, so a
     // definition must carry its real critical path.  Write the design's own
     // statistics explicitly instead of trusting whatever the source bytes say.
-    if (!game.setPrototypeGateCost(prototype, tc_example::kDesignGates) ||
-        !game.setPrototypeDelay(prototype, tc_example::kDesignDelay)) {
+    uint64_t design_gates = tc_example::kDesignGates;
+    uint64_t design_delay = tc_example::kDesignDelay;
+    applyDesignStatsOverride(design_gates, design_delay);
+    if (!game.setPrototypeGateCost(prototype, design_gates) ||
+        !game.setPrototypeDelay(prototype, design_delay)) {
         log("circuit-and: design cost update failed");
         return 8;
     }
