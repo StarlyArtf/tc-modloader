@@ -51,7 +51,15 @@ SDK 定义：sdk/tc_mod_api.h。开发指南：SDK-GUIDE.md。
 
 原生 Mod 可以解析 EXE 中的符号、调用已知签名的游戏函数、安装函数 Hook 并调用原函数、执行每帧逻辑、处理快捷键、使用游戏自身 ImGui 创建新面板。
 
-这是通用底层扩展能力。`sdk/tc_game_model.h` 已提供实验性的原型／组件对象模型封装，覆盖已核实的 Prototype、引脚、WordSize 布局，以及 `custom_prototypes_set`／`custom_prototypes_del` 低层注册原语。文件解析型 `add_custom_prototype` 仍需继续核实完整栈参数布局；调用未核实签名前不能只凭函数名猜测。
+这是通用底层扩展能力。`sdk/tc_mod.h` 提供聚合入口，覆盖：
+- 原型／组件对象模型：内置枚举、模板复制、名称/描述/SVG、自定义元件注册。
+- board 选择状态：当前/上一帧选中元件与导线，含计数和 ID 枚举。
+- 游戏状态：战役、关卡、字宽、当前输入/输出。
+- 仿真：周期、设置、run/pause/reset。
+- 导线：读取、取色、添加、放置、更新。
+- 存档：保存次数和当前 level/schematic 路径。
+
+文件解析型 `add_custom_prototype` 仍需继续核实完整栈参数布局；调用未核实签名前不能只凭函数名猜测。
 
 ## 启停、更新和恢复
 
