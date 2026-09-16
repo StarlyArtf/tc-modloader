@@ -416,9 +416,12 @@ struct TCGameModel {
         return true;
     }
 
-    // Insert a gate-cost/delay pair for a prototype kind.  The game builds
-    // this score table before native plugins load, so kinds registered by
-    // plugins (notably custom kind 0x4e) otherwise stay out of totals.
+    // Insert an entry into the per-kind score table.  The game builds this
+    // table before native plugins load, so a kind a plugin introduces stays
+    // out of it otherwise.  Note that custom component instances (kind 0x4e)
+    // do NOT read this table: get_cost resolves them through
+    // get_custom_prototype and returns the prototype's own gate/delay fields
+    // (see setPrototypeGateCost / setPrototypeDelay).
     bool addComponentCost(uint8_t kind, uint64_t gate_cost,
                           uint64_t delay_cost) const {
         if (!add_cost) return false;
@@ -448,6 +451,30 @@ struct TCGameModel {
     bool setPrototypeShapeSvg(TCPrototype& prototype,
                               const char* utf8) const {
         return setPrototypeString(prototype, utf8, kPrototypeShapeSvgOffset);
+    }
+
+    // Cached design statistics of a circuit-backed prototype.  The game
+    // recomputes the gate count while parsing a definition but keeps the
+    // stored delay verbatim, and both values feed the gate/delay cost that
+    // every UI surface reports for the component.  A definition therefore has
+    // to carry its real critical path; patch it here when the serialized header
+    // cannot be prepared ahead of time.
+    bool setPrototypeGateCost(TCPrototype& prototype, uint64_t value) const {
+        return setPrototypeRaw(prototype, kPrototypeGateCostOffset, &value);
+    }
+
+    bool setPrototypeDelay(TCPrototype& prototype, uint64_t value) const {
+        return setPrototypeRaw(prototype, kPrototypeDelayOffset, &value);
+    }
+
+    bool setPrototypeRaw(TCPrototype& prototype, size_t field_offset,
+                         const void* data) const {
+        if (data == nullptr || field_offset > sizeof(prototype.bytes) ||
+            sizeof(uint64_t) > sizeof(prototype.bytes) - field_offset) {
+            return false;
+        }
+        memcpy(prototype.bytes + field_offset, data, sizeof(uint64_t));
+        return true;
     }
 
     bool setPrototypeString(TCPrototype& prototype, const char* utf8,
@@ -638,6 +665,13 @@ class TCPrototypeBuilder {
 
     bool setShapeSvg(const char* utf8) {
         return model_->setPrototypeShapeSvg(prototype_, utf8);
+    }
+
+    // Circuit-backed components: store the design's own gate count and
+    // critical-path delay so the reported cost matches the design.
+    bool setDesignCost(uint64_t gates, uint64_t delay) {
+        return model_->setPrototypeGateCost(prototype_, gates) &&
+               model_->setPrototypeDelay(prototype_, delay);
     }
 
     void setRawField(size_t offset, const void* data, size_t size) {

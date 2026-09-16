@@ -365,3 +365,47 @@ get_cost__modelZscores_u2321          0x140158d60   (component) -> (gates, delay
 只挂钩子、不修改状态，日志前缀 `cost-watch:`）。它同时观测 `get_cost`、
 `get_delay_cost_u2316`、`get_gate_cost_u2560`、`preorder_u8749` 与 `build_scores`，
 并周期性打印界面正在显示的 `gates/delay`、各 kind 的代价返回值以及原型字段。
+
+### 11.1 结论：延迟差异来自定义头里的缓存值（已定位并修复）
+
+真机日志（两次会话）给出的关键事实：
+
+| 板子 | 界面分数 |
+|---|---|
+| 输入 → **内置与门(0x04)** → 输出（`get_cost` 报 `g=1,d=1`） | gates=1 **delay=1** |
+| 同一板子换成 **自定义 AND2(0x4e)**（`get_cost` 报 `g=1,d=2`） | gates=1 **delay=1** |
+
+也就是：自定义实例的 `get_cost` 确实返回 2，但整板延迟仍是 1 —— 板级延迟走的是
+`preorder` 对电路展开后的真实关键路径（这里就是那个与门的 1），并不读原型的缓存延迟。
+门数同理来自真实电路。
+
+真正被误读的是**定义头部的两个 i64**。它们不是随便的填充值，而是**该设计自身的
+缓存统计 `(门数, 延迟)`**。证据一：用户自己元件工坊里的设计文件
+（`%APPDATA%\Turing Complete\schematics\foundry\*`，本构建写 v16）分别是
+`4or=(3,2)`、`8or=(7,3)`、`1and8=(8,1)`、`half-add=(4,2)`、`RS=(12,5)`、
+`RV32I/ALU=(8302,109)`，零扩展类设计为 `(0,0)`，数值都与"门数 / 关键路径深度"吻合。
+
+证据二（受控实验）：同一个 fixture 只改头部这两个 i64，重新导入后读取原型字段：
+
+| 头部写入 `(a, b)` | 注册后的 `prototype+0x130 / +0x138` |
+|---|---|
+| `(3, 2)` | `(1, 2)` |
+| `(0, 0)` | `(1, 0)` |
+| `(7, 5)` | `(1, 5)` |
+
+即解析时游戏**重算门数**，但**原样保留头部的延迟**。因此头部写成多少，元件信息/代价
+面板就报多少。
+
+最初的 fixture 把头部写成 `(3, 2)`，那其实是从 `foundry/4or` 抄来的数值，于是出现了
+"元件自称延迟 2、整板却按 1 计"的现象。修复：
+
+* `tests/and-component-fixture.cpp` 与 `examples/circuit-and/and_fixture.hpp` 现在写
+  `(1, 1)`（单个与门的真实门数与关键路径），并保留命令行覆盖以便继续做对照实验。
+* `TCGameModel::setPrototypeGateCost` / `setPrototypeDelay`（以及
+  `TCPrototypeBuilder::setDesignCost`）允许插件在注册前把这两个字段改写成设计自己的
+  统计值；示例 Mod 现在会显式写入并打印它们。
+* 示例 Mod 不再调用 `addComponentCost(0x4e, ...)`：自定义实例的代价只读原型字段，
+  该调用对实例延迟没有影响（保留 API 供其它 kind 使用）。
+
+沙箱复验：导入修复后的定义，探针读到 `prototype gates=1 delay=1`，与真机整板
+`delay=1` 一致；内置与门对照同样为 1。

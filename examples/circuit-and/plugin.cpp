@@ -52,28 +52,31 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         log("circuit-and: shape update failed");
         return 7;
     }
+    // The game keeps the delay cached in the definition header verbatim, so a
+    // definition must carry its real critical path.  Write the design's own
+    // statistics explicitly instead of trusting whatever the source bytes say.
+    if (!game.setPrototypeGateCost(prototype, tc_example::kDesignGates) ||
+        !game.setPrototypeDelay(prototype, tc_example::kDesignDelay)) {
+        log("circuit-and: design cost update failed");
+        return 8;
+    }
     const uint64_t gate_cost = tc::prototypeGateCost(prototype);
     const uint64_t delay_cost = tc::prototypeDelay(prototype);
     if (!game.setCustomPrototype(imported.custom_id, prototype)) {
         log("circuit-and: prototype write failed");
-        return 8;
+        return 9;
     }
     if (components.releasePrototype(prototype) != tc::TCComponentStatus::Ok) {
         log("circuit-and: snapshot release failed");
-        return 9;
+        return 10;
     }
 
-    // Custom components share kind 0x4e, but the static score table built at
-    // game startup has no entry for it. Insert the prototype's verified
-    // gate-cost/delay pair so the UI's gate/delay totals include instances.
-    if ((gate_cost || delay_cost) &&
-        game.addComponentCost(0x4E, gate_cost, delay_cost)) {
-        log("circuit-and: inserted custom cost gate=" +
-            std::to_string(gate_cost) + " delay=" +
-            std::to_string(delay_cost));
-    }
-
+    // Kind 0x4e instances read their cost straight from the prototype fields
+    // above, so no entry in the per-kind score table is needed.  A board's
+    // critical path is computed from the inlined design, which for this
+    // fixture is the same single gate delay.
     log("circuit-and: registered AND2 Test id=" +
-        std::to_string(imported.custom_id));
+        std::to_string(imported.custom_id) + " design gates=" +
+        std::to_string(gate_cost) + " delay=" + std::to_string(delay_cost));
     return 0;
 }

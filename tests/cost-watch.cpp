@@ -25,12 +25,18 @@ using GetDelayCostFn = int64_t (*)(const void* component, int64_t fallback);
 using GetGateCostFn = uint64_t (*)(const void* components, uint8_t recursive);
 using BuildScoresFn = void (*)(void* score, void* a1, float a2, double scale);
 using PreorderFn = void (*)(void* model, void* level, void* solution);
+using UpdateWireFn = bool (*)(void* context, void* a1, void* a2, uint32_t point,
+                              uint8_t fifth);
 
 GetCostFn get_cost_original;
 GetDelayCostFn get_delay_cost_original;
 GetGateCostFn get_gate_cost_original;
 BuildScoresFn build_scores_original;
 PreorderFn preorder_original;
+UpdateWireFn update_wire_original;
+
+void* board_context = nullptr;
+std::string last_board;
 
 struct KindStat {
     uint64_t calls = 0;
@@ -99,11 +105,19 @@ uint64_t hookedGetGateCost(const void* components, uint8_t recursive) {
 void hookedBuildScores(void* score, void* a1, float a2, double scale) {
     build_scores_original(score, a1, a2, scale);
     if (!score) return;
-    std::memcpy(&score_gates, static_cast<unsigned char*>(score), 8);
-    std::memcpy(&score_delay, static_cast<unsigned char*>(score) + 8, 8);
-    score_flag = static_cast<unsigned char*>(score)[0x20];
+    int64_t gates = 0;
+    int64_t delay = 0;
+    std::memcpy(&gates, static_cast<unsigned char*>(score), 8);
+    std::memcpy(&delay, static_cast<unsigned char*>(score) + 8, 8);
+    const int flag = static_cast<unsigned char*>(score)[0x20];
     ++score_calls;
-    dirty = true;
+    // build_scores runs every frame; only a real value change is interesting.
+    if (gates != score_gates || delay != score_delay || flag != score_flag) {
+        score_gates = gates;
+        score_delay = delay;
+        score_flag = flag;
+        dirty = true;
+    }
 }
 
 void hookedPreorder(void* model, void* level, void* solution) {
@@ -112,8 +126,55 @@ void hookedPreorder(void* model, void* level, void* solution) {
     preorder_original(model, level, solution);
 }
 
+bool hookedUpdateWire(void* context, void* a1, void* a2, uint32_t point,
+                      uint8_t fifth) {
+    board_context = context;
+    return update_wire_original(context, a1, a2, point, fifth);
+}
+
+// Reads the live board through the same layout the placement/persistence
+// probes use and reports what the game's cost function says per component.
+std::string describeBoard() {
+    if (!board_context) return "board=<no context yet>";
+    auto* base = static_cast<unsigned char*>(board_context);
+    uint64_t components = 0;
+    uint64_t wires = 0;
+    void* payload = nullptr;
+    std::memcpy(&components, base + 0x78, sizeof(components));
+    std::memcpy(&wires, base + 0x98, sizeof(wires));
+    std::memcpy(&payload, base + 0x80, sizeof(payload));
+    if (!payload || components > 4096) return "board=<unreadable>";
+    std::ostringstream text;
+    text << "board components=" << components << " wires=" << wires << " [";
+    for (uint64_t i = 0; i < components; ++i) {
+        auto* component =
+            static_cast<unsigned char*>(payload) + 8 + i * 0x238;
+        const auto kind = *reinterpret_cast<const uint8_t*>(component);
+        text << (i ? ", " : "") << "0x" << std::hex << static_cast<int>(kind)
+             << std::dec;
+        if (kind == 0x4e) {
+            uint64_t id = 0;
+            std::memcpy(&id, component + 0x188, sizeof(id));
+            text << ":id=" << id;
+        }
+        if (get_cost_original) {
+            uint64_t pair[2] = {0, 0};
+            get_cost_original(pair, component);
+            text << "(g=" << pair[0] << ",d=" << pair[1] << ")";
+        }
+    }
+    text << "]";
+    return text.str();
+}
+
 void report(double time) {
     if (time - last_report < 1.5) return;
+    const std::string board = describeBoard();
+    const bool board_changed = board != last_board;
+    if (board_changed) {
+        last_board = board;
+        dirty = true;
+    }
     // Log whenever something changed, plus a slow heartbeat so the log shows
     // that the observation mod is alive during a manual session.
     const bool heartbeat = time - last_report >= 15.0;
@@ -152,6 +213,7 @@ void report(double time) {
         }
         last_prototype_check = time;
     }
+    if (board_changed) line << " | " << board;
     (void)custom;
     log(line.str());
     last_report = time;
@@ -180,8 +242,11 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         h->context, "build_scores__presenterZboard95uiZmenu95bar_u886");
     auto* preorder_target = h->resolve_symbol(
         h->context, "preorder__modelZsimulationZpreorder_u8749");
+    auto* update_target = h->resolve_symbol(
+        h->context,
+        "handle_update_wire__presenterZuser95inputZboard95ioZactionZnone_u5");
     if (!get_cost_target || !get_delay_target || !get_gate_target ||
-        !build_scores_target || !preorder_target) {
+        !build_scores_target || !preorder_target || !update_target) {
         log("cost-watch: symbol lookup failed");
         return 3;
     }
@@ -199,12 +264,15 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
                        reinterpret_cast<void**>(&build_scores_original)) != 0 ||
         h->create_hook(h->context, preorder_target,
                        reinterpret_cast<void*>(hookedPreorder),
-                       reinterpret_cast<void**>(&preorder_original)) != 0) {
+                       reinterpret_cast<void**>(&preorder_original)) != 0 ||
+        h->create_hook(h->context, update_target,
+                       reinterpret_cast<void*>(hookedUpdateWire),
+                       reinterpret_cast<void**>(&update_wire_original)) != 0) {
         log("cost-watch: hook install failed");
         return 4;
     }
     plugin->on_frame = frame;
     log("cost-watch: observing get_cost, get_delay_cost, get_gate_cost, "
-        "build_scores, preorder");
+        "build_scores, preorder, board");
     return 0;
 }

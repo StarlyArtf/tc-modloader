@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
-$taskFixture = Join-Path $taskRepo 'build\and2_component.data'
+$taskFixture = if($env:TC_FIXTURE) { $env:TC_FIXTURE } else { Join-Path $taskRepo 'build\and2_component.data' }
 $taskSolution = Join-Path $taskRepo 'build\and2_solution.data'
 foreach($taskFile in @($taskFixture,$taskSolution)) {
   if(!(Test-Path -LiteralPath $taskFile)) { throw "Missing $taskFile; run build.ps1 first" }

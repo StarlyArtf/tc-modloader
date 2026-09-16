@@ -18,6 +18,17 @@ constexpr uint16_t kInputPin = 0x4F;
 constexpr uint16_t kOutputPin = 0x51;
 constexpr uint16_t kAndGate = 0x04;
 
+// The definition header carries the design's cached (gate count, delay) pair.
+// The game recomputes the gate count when the definition is parsed, but it
+// trusts the stored delay verbatim, so a definition must carry its real
+// critical path.  Reference values from the shipped hub designs:
+//   foundry/4or      -> (3, 2)     foundry/8or   -> (7, 3)
+//   foundry/1and8    -> (8, 1)     foundry/half-add -> (4, 2)
+// This AND is a single gate, so the correct pair is (1, 1); the command line
+// can still override both fields for controlled experiments.
+int64_t kMetaGates = 1;
+int64_t kMetaDelay = 1;
+
 struct Writer {
     std::vector<uint8_t> bytes;
 
@@ -236,8 +247,11 @@ std::vector<uint8_t> buildPayload() {
     Writer writer;
     writer.i64(static_cast<int64_t>(kAndComponentId));
     writer.u32(0);
-    writer.i64(3);       // copied from the verified Not ZR component
-    writer.i64(2);       // copied from the verified Not ZR component
+    // These two fields are carried in the serialized definition.  Their exact
+    // meaning is under investigation (see research/COMPONENT-PIPELINE.md);
+    // the generator lets callers vary them for controlled experiments.
+    writer.i64(kMetaGates);  // copied from the verified Not ZR component
+    writer.i64(kMetaDelay);  // copied from the verified Not ZR component
     writer.u8(1);        // simulation settings are present
     writer.i64(10000);   // maximum cycle count
     writer.sequence_i64({});
@@ -267,6 +281,8 @@ int main(int argc, char** argv) {
     const std::filesystem::path output =
         argc > 1 ? std::filesystem::path(argv[1])
                  : std::filesystem::path("build/and2_component.data");
+    if (argc > 2) kMetaGates = std::stoll(argv[2]);
+    if (argc > 3) kMetaDelay = std::stoll(argv[3]);
     const auto raw = buildPayload();
     std::vector<uint8_t> encoded;
     encoded.push_back(14);  // save-format version

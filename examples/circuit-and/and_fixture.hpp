@@ -11,6 +11,11 @@ namespace tc_example {
 
 constexpr uint64_t kAndComponentId = 0x414E44325F303031ULL;
 
+// Cached design statistics stored in the definition header.  The registered
+// prototype keeps this delay verbatim, so it must be the real critical path.
+constexpr int64_t kDesignGates = 1;
+constexpr int64_t kDesignDelay = 1;
+
 struct Writer {
     std::vector<uint8_t> bytes;
 
@@ -103,8 +108,12 @@ inline std::vector<uint8_t> buildAndComponentPayload() {
     Writer writer;
     writer.i64(static_cast<int64_t>(kAndComponentId));
     writer.u32(0);
-    writer.i64(3);
-    writer.i64(2);
+    // The definition header stores the design's cached (gate count, delay).
+    // The game recomputes the gate count on load but trusts the stored delay,
+    // so a definition must carry its real critical path.  One AND gate is
+    // (1, 1); see the shipped hub designs for reference values.
+    writer.i64(kDesignGates);
+    writer.i64(kDesignDelay);
     writer.u8(1);
     writer.i64(10000);
     writer.u16(0);
