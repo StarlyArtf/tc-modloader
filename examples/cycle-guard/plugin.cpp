@@ -22,7 +22,8 @@ static void** settings;
 static std::atomic<int64_t> budget{100},hits{0},lastRequested{0},lastEffective{0};
 static std::atomic<bool> guard{true};
 static void* model;
-static bool show=false,keyWasDown=false,autoShown=false;
+static bool show=false;
+static constexpr int kToolbarFlags = 1|2|4|8|32|64|256;
 #ifdef TC_GUARD_SELFTEST
 static bool (*originalButton)(const char*,V2,int);
 static uint64_t testStartTime;
@@ -40,6 +41,20 @@ static void intercepted(void* state,uint8_t command,int64_t target){
 static void text(const std::string&s){proc<void(*)(const char*,const char*)>("igTextUnformatted")(s.c_str(),nullptr);}
 static bool button(const char* s){return proc<bool(*)(const char*,V2)>("igButton")(s,{0,0});}
 static void same(){proc<void(*)(float,float)>("igSameLine")(0,-1);}
+static void drawToolbar(int64_t now,bool ready){
+ proc<void(*)(V2,int)>("igSetNextWindowPos")({12,12},1);
+ bool open=true;
+ if(proc<bool(*)(const char*,bool*,int)>("igBegin")("周期运行守卫 · 工具条###TCCycleGuardToolbar",&open,kToolbarFlags)){
+  proc<void(*)(float)>("igSetWindowFontScale")(0.62f);
+  bool on=guard.load();if(proc<bool(*)(const char*,bool*)>("igCheckbox")("拦截",&on))guard=on;
+  same();if(button(show?"隐藏面板":"守卫面板"))show=!show;
+  same();proc<void(*)(bool)>("igBeginDisabled")(!ready||!model);
+  if(button("运行 N")){auto n=budget.load();gameSim(model,0,now>INT64_MAX-n?INT64_MAX:now+n);}
+  same();if(button("连续"))gameSim(model,0,INT64_MAX);
+  proc<void(*)()>("igEndDisabled")();
+  text("周期 "+std::to_string(now)+"  |  已拦截 "+std::to_string(hits.load())+" 次");
+ }proc<void(*)()>("igEnd")();
+}
 static void frame(void*,const TCFrame* frameInfo){
 #ifdef TC_GUARD_SELFTEST
  static int phase=0;static double start=0,stable=0;static int64_t expected=0,delay=0;
@@ -49,17 +64,17 @@ static void frame(void*,const TCFrame* frameInfo){
 #else
  (void)frameInfo;
 #endif
- DWORD foreground=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground);bool down=foreground==GetCurrentProcessId()&&(GetAsyncKeyState(VK_F6)&0x8000);if(down&&!keyWasDown)show=!show;keyWasDown=down;if(!show)return;
+ bool ready=settings&&*settings;auto now=ready?getCycle():0;
+ if(ready&&model)drawToolbar(now,ready);
+ if(!show)return;
  proc<void(*)(V2,int)>("igSetNextWindowPos")({24,110},2);
  proc<void(*)(V2,int)>("igSetNextWindowSize")({620,430},2);
  if(proc<bool(*)(const char*,bool*,int)>("igBegin")("周期运行守卫 · Native Mod###TCCycleGuard",&show,0)){
   proc<void(*)(float)>("igSetWindowFontScale")(0.62f);
-  text("F6 显示 / 隐藏。这个面板来自 .mod 包中的 DLL。");
+  text("工具条上的“守卫面板”按钮打开 / 隐藏此面板。");
   bool on=guard.load();if(proc<bool(*)(const char*,bool*)>("igCheckbox")("拦截游戏运行命令",&on))guard=on;
   text("每次最多运行："+std::to_string(budget.load())+" 个周期");
   for(auto n:{1,10,100,1000}){if(button(std::to_string(n).c_str()))budget=n;if(n!=1000)same();}
- bool ready=settings&&*settings;auto now=ready?getCycle():0;
- if(!autoShown&&ready&&model){show=true;autoShown=true;}
  text("当前周期："+std::to_string(now)+"  |  已拦截："+std::to_string(hits.load())+" 次");
   proc<void(*)(bool)>("igBeginDisabled")(!ready||!model);
   if(button("运行 N 个周期")){auto n=budget.load();gameSim(model,0,now>INT64_MAX-n?INT64_MAX:now+n);}
