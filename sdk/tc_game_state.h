@@ -16,6 +16,7 @@ struct TCGameStateModel {
     const uint64_t* level_used_input = nullptr;
     const uint64_t* level_used_outputs = nullptr;
     const uint8_t* display_numbers_as = nullptr;
+    const uint8_t* run_cycle_control_allowed = nullptr;
 
     bool load(const TCHost* host) {
         if (host == nullptr) return false;
@@ -40,6 +41,10 @@ struct TCGameStateModel {
             host->resolve_symbol(
                 host->context,
                 "display_numbers_as__presenterZutilitiesZhelper95functions_u100"));
+        run_cycle_control_allowed = static_cast<const uint8_t*>(
+            host->resolve_symbol(
+                host->context,
+                "is_run_cycle_control_allowed__presenterZutilities_u29533"));
         return is_campaign != nullptr;
     }
 
@@ -88,6 +93,10 @@ struct TCGameStateModel {
 
     uint8_t displayNumbersAs() const {
         return display_numbers_as ? *display_numbers_as : 0;
+    }
+
+    bool isRunCycleControlAllowed() const {
+        return run_cycle_control_allowed && *run_cycle_control_allowed;
     }
 };
 
