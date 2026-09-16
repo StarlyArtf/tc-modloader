@@ -10,7 +10,8 @@ $taskPatterns = @(
   'component-placement-playtest-*',
   'component-persistence-playtest-*',
   'component-cost-playtest-*',
-  'cost-watch-smoke-*'
+  'cost-watch-smoke-*',
+  'circuit-and-playtest-*'
 )
 $taskRemoved = @()
 foreach($taskPattern in $taskPatterns) {
