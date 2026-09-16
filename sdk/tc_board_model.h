@@ -25,6 +25,7 @@ struct TCBoardModel {
     const void* selected_wires = nullptr;
     const void* prev_selected_components = nullptr;
     const void* prev_selected_wires = nullptr;
+    const void* selection_kind_cache = nullptr;
     TCBoardContainsFn contains = nullptr;
     TCBoardLenFn len = nullptr;
 
@@ -38,6 +39,8 @@ struct TCBoardModel {
             host->context, "prev_selected_components__modelZboardZboard_u41");
         prev_selected_wires = host->resolve_symbol(
             host->context, "prev_selected_wires__modelZboardZboard_u44");
+        selection_kind_cache = host->resolve_symbol(
+            host->context, "selection_kind_cache__modelZboardZboard_u9060");
         contains = reinterpret_cast<TCBoardContainsFn>(
             host->resolve_symbol(host->context,
                                  "contains__modelZboardZboard_u1842"));
@@ -103,6 +106,10 @@ struct TCBoardModel {
     bool previousSelectionEmpty() const {
         return previousSelectedComponentCount() == 0 &&
                previousSelectedWireCount() == 0;
+    }
+
+    const void* selectionKindCache() const {
+        return selection_kind_cache;
     }
 
     uint64_t selectedComponentIdAt(uint64_t index) const {

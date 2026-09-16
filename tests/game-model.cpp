@@ -29,6 +29,7 @@ alignas(8) unsigned char gSelectedComponentBuckets[4 * 0x20]{};
 alignas(8) unsigned char gSelectedWireBuckets[4 * 0x20]{};
 alignas(8) unsigned char gPrevSelectedComponentBuckets[4 * 0x20]{};
 alignas(8) unsigned char gPrevSelectedWireBuckets[4 * 0x20]{};
+alignas(8) unsigned char gSelectionKindCache[16]{};
 uint8_t gIsCampaign = 1;
 uint64_t gCurrentWordSize = 8;
 uint64_t gLevelUsedInput = 3;
@@ -335,6 +336,9 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "len__modelZboardZboard_u19087") {
         return reinterpret_cast<void*>(&fakeBoardLen);
     }
+    if (symbol == "selection_kind_cache__modelZboardZboard_u9060") {
+        return gSelectionKindCache;
+    }
     if (symbol == "is_campaign__modelZmodel95types_u739") {
         return &gIsCampaign;
     }
@@ -571,6 +575,10 @@ int main() {
         board.previousSelectedWireIdAt(0) != 8 ||
         board.selectionEmpty() || board.previousSelectionEmpty()) {
         std::cerr << "board selection query mismatch\n";
+        return 1;
+    }
+    if (board.selectionKindCache() != gSelectionKindCache) {
+        std::cerr << "board selection kind cache mismatch\n";
         return 1;
     }
     if (!model.mutationValid()) {
