@@ -199,7 +199,7 @@ void setupBoardSet(unsigned char* object, unsigned char* buckets,
 
 void fakeRawNewString(void* out, int64_t length) {
     auto* value = static_cast<tc::TCNimString*>(out);
-    value->length = length;
+    value->length = 0; // Real rawNewString reserves capacity only.
     value->data = std::malloc(static_cast<size_t>(length) + 16);
     std::memset(value->data, 0, static_cast<size_t>(length) + 16);
 }
@@ -697,6 +697,8 @@ int main() {
         return 1;
     }
     if (std::strcmp(tc::prototypeNameCStr(builder.prototype()), "My Gate") != 0 ||
+        tc::prototypeName(builder.prototype()).length != 7 ||
+        tc::prototypeDescription(builder.prototype()).length != 11 ||
         std::strcmp(tc::prototypeDescriptionCStr(builder.prototype()),
                     "Custom gate") != 0 ||
         std::strcmp(tc::prototypeShapeSvgCStr(builder.prototype()),
@@ -704,6 +706,10 @@ int main() {
         std::cerr << "prototype string field mismatch\n";
         return 1;
     }
+    tc::TCPrototype emptyText{};
+    assert(model.setPrototypeName(emptyText, ""));
+    assert(tc::prototypeName(emptyText).length == 0);
+    assert(tc::prototypeName(emptyText).data == nullptr);
     tc::TCPin builderPins[2]{};
     builder.setInputCount(2);
     builder.setInputPins(builderPins);

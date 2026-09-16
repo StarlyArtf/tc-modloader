@@ -121,8 +121,8 @@ struct TCGameModel {
 
     // Registration/list primitives.  set/del are the low-level verified
     // mutation APIs. add_custom_prototype parses a circuit and has a hidden
-    // result pointer (see research/COMPONENT-PIPELINE.md). Its runtime ownership
-    // and error contract are not yet verified, so it is not wrapped here.
+    // result pointer (see research/COMPONENT-PIPELINE.md). The separate experimental
+    // TCComponentModel wraps circuit import, thread/error guards and cleanup.
     bool mutationValid() const {
         return custom_prototypes_set != nullptr &&
                custom_prototypes_del != nullptr &&
@@ -444,12 +444,14 @@ struct TCGameModel {
         if (length > INT64_MAX) return false;
 
         TCNimString value{};
-        raw_new_string(&value, static_cast<int64_t>(length));
-        if (!value.data) return false;
-
-        // Nim payload: length/capacity at +0, UTF-8 bytes at +8.
-        memset(static_cast<unsigned char*>(value.data) + 8, 0, length + 1);
-        memcpy(static_cast<unsigned char*>(value.data) + 8, utf8, length);
+        if (length) {
+            raw_new_string(&value, static_cast<int64_t>(length));
+            if (!value.data) return false;
+            // rawNewString reserves capacity but returns logical length zero.
+            value.length = length;
+            memcpy(static_cast<unsigned char*>(value.data) + 8, utf8, length);
+            static_cast<unsigned char*>(value.data)[8 + length] = 0;
+        }
 
         memcpy(prototype.bytes + field_offset, &value, sizeof(value));
         return true;
