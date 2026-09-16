@@ -107,6 +107,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `TCPrototype` 大小为 `0x5a8`，输入引脚数量在 `+0x60`、数据指针在 `+0x68`，输出引脚数量在 `+0x80`、数据指针在 `+0x88`。
 - 每个引脚条目为 `0x38` 字节，原始 WordSize 在 `+0x10`。
 - `get_prototype(kind_ptr, out)` 和 `get_custom_prototype(custom_id, out)` 由 `TCGameModel::getPrototype` 封装。
+- `TCPrototypeKind +0x188` 的自定义 ID 为 **uint64_t**，此前 uint16_t 声明已修正。低 16 位只用于哈希表初始槽位，身份比较使用完整 64 位；相关插件需重新编译。
 - `builtinPrototypeCount()`、`builtinPrototypeKindAt()`、`isBuiltinPrototypeKind()` 从 `PROTOTYPES` 哈希表安全枚举内置 kind，避免向 `getPrototype` 传入未知 key。
 - `cloneBuiltinPrototype(kind, out)` 复制一个已验证的内置元件模板；`registerBuiltinAsCustom(kind, custom_id, out)` 进一步把它写入自定义元件表。
 - `TCPrototypeBuilder` 封装“复制模板 → 调整已核实字段 → 注册为自定义元件”的工作流；未反推出的身份字段仍可通过 `setRawField` 写入。
@@ -132,7 +133,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `custom_prototypes_set(id, prototype)`／`custom_prototypes_del(id)` 是已核实的低层注册原语，`in_custom_prototypes`／`notin_custom_prototypes` 用于查询，`customPrototypeCount()` 读取 `cc_length`，`customPrototypeIdAt(index)` 读取 `cc_live_values` 中的 ID。
 - `TCGameModel::setCustomPrototype` 会深拷贝传入的 `TCPrototype`，调用后原对象可以释放。
 
-边界：内置元件的 kind 是一个单字节键。`TCGameModel` 不会枚举所有 kind；传入未知 kind 可能触发游戏自己的 Nim 索引／键错误并使原生插件崩溃。自定义元件 ID 查询缺失时返回空对象。`setCustomPrototype` 只负责把 `TCPrototype` 写入自定义元件表；一个能被游戏正确显示、放置和仿真的完整 `Prototype` 仍需填充名称、形状、颜色等未在头文件中建模的字段。文件解析型 `add_custom_prototype` 仍待继续核实其完整栈参数布局。
+边界：内置元件的 kind 是一个单字节键。请使用已提供的内置表枚举，避免向游戏查询任意字节值；未知 kind 可能触发 Nim 索引／键错误。自定义元件 ID 查询缺失时返回空对象。`setCustomPrototype` 只负责原型表写入，复制内置模板不会自动构造自定义元件的内部电路，也不会注册新的仿真逻辑。文件解析型 `add_custom_prototype` 的隐藏返回指针和三个机器级输入参数已由静态分析确认；复杂栈参数属于内部的 `reload_custom_prototype`。生命周期、错误处理和完整放置／仿真仍待实机验证，暂不提供可调用封装。详见 [元件链路研究](research/COMPONENT-PIPELINE.md)。
 
 ## 每帧回调和界面
 
