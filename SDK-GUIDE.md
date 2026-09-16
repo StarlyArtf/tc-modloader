@@ -83,6 +83,8 @@ Windows x64 的返回值、隐藏返回指针、参数大小、Nim 对象布局�
 
 `sdk/tc_mod.h` 还提供 `TCMod` 聚合对象，调用一次 `load(host)` 即可加载全部已封装模型。
 
+示例插件 `examples/mod-inspector` 直接使用 `TCMod` 显示战役状态、存档数、周期、选中元件/导线数等只读信息。
+
 ```cpp
 #include "tc_game_model.h"
 
