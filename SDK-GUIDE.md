@@ -81,6 +81,8 @@ Windows x64 的返回值、隐藏返回指针、参数大小、Nim 对象布局�
 
 插件也可以直接包含总入口 `sdk/tc_mod.h`，一次引入上述模型头文件。
 
+`sdk/tc_mod.h` 还提供 `TCMod` 聚合对象，调用一次 `load(host)` 即可加载全部已封装模型。
+
 ```cpp
 #include "tc_game_model.h"
 

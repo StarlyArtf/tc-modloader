@@ -461,6 +461,12 @@ int main() {
         std::cerr << "save model mismatch\n";
         return 1;
     }
+
+    tc::TCMod mod;
+    if (!mod.load(&host) || !mod.valid()) {
+        std::cerr << "aggregate TCMod mismatch\n";
+        return 1;
+    }
     wire.addWire(nullptr, 42, 9);
     if (gWireAddedPoint != 42 || gWireAddedColor != 9) {
         std::cerr << "wire add mismatch\n";
