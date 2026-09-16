@@ -18,6 +18,23 @@ uint64_t gCustomCount = 0;
 std::map<uint64_t, tc::TCPrototype> gCustomPrototypes;
 std::vector<uint64_t> gCustomIds;
 alignas(16) unsigned char gCustomLiveValues[16 * 16]{};
+alignas(16) unsigned char gPrototypeTable[16]{};
+alignas(16) unsigned char gPrototypeBuckets[4 * tc::kPrototypeBucketStride]{};
+
+void setupPrototypeTable() {
+    uint64_t length = 4;
+    std::memcpy(gPrototypeTable, &length, sizeof(length));
+    void* buckets = gPrototypeBuckets;
+    std::memcpy(gPrototypeTable + 8, &buckets, sizeof(buckets));
+
+    const uint8_t keys[] = {0x31, 0x52, 0x5f};
+    for (int i = 0; i < 3; ++i) {
+        uint64_t hash = i + 1;
+        unsigned char* bucket = gPrototypeBuckets + i * tc::kPrototypeBucketStride;
+        std::memcpy(bucket + tc::kPrototypeBucketHashOffset, &hash, sizeof(hash));
+        std::memcpy(bucket + tc::kPrototypeBucketKeyOffset, &keys[i], 1);
+    }
+}
 
 void rebuildLiveValues() {
     std::memset(gCustomLiveValues, 0, sizeof(gCustomLiveValues));
@@ -131,7 +148,7 @@ void* fakeResolve(void*, const char* name) {
         return &gAutoSize;
     }
     if (symbol == "PROTOTYPES__modelZboardZprototype95list_u3772") {
-        return reinterpret_cast<void*>(0x2000);
+        return gPrototypeTable;
     }
     if (symbol == "CATEGORY_ORDER__modelZboardZprototype95list_u21") {
         return reinterpret_cast<void*>(0x3000);
@@ -170,6 +187,7 @@ int main() {
     static_assert(sizeof(tc::TCPrototype) == 0x5a8,
                   "Prototype size changed");
     static_assert(sizeof(tc::TCPin) == 0x38, "Pin size changed");
+    setupPrototypeTable();
 
     TCHost host{};
     host.api_version = TC_MOD_API_VERSION;
@@ -188,6 +206,16 @@ int main() {
     }
     if (!model.mutationValid()) {
         std::cerr << "model did not resolve mutation symbols\n";
+        return 1;
+    }
+
+    if (model.builtinPrototypeCount() != 3 ||
+        model.builtinPrototypeKindAt(0) != 0x31 ||
+        model.builtinPrototypeKindAt(2) != 0x5f ||
+        !model.isBuiltinPrototypeKind(0x52) ||
+        model.isBuiltinPrototypeKind(0x99) ||
+        model.builtinPrototypeIndexForKind(0x5f) != 2) {
+        std::cerr << "built-in prototype enumeration mismatch\n";
         return 1;
     }
 

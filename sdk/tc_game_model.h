@@ -18,6 +18,8 @@
 //   notin_custom_prototypes__modelZboardZcustom95prototype95list_u189
 //   cc_length__modelZboardZcustom95prototype95list_u8
 //   cc_live_values__modelZboardZcustom95prototype95list_u7
+//   PROTOTYPES table layout (length, bucket pointer, 0x5b8-byte buckets,
+//     key byte at +0x10, nonzero hash at +0x08)
 //
 // The remaining fields are left as opaque raw bytes.  Do not pass unknown
 // built-in kind bytes to getPrototype(); the pinned build raises a Nim index
@@ -36,6 +38,11 @@ namespace tc {
 // custom-prototype branch and causes the uint16_t at +0x188 to be used as the
 // custom prototype ID.
 enum : uint8_t { kPrototypeKindCustom = 0x4e };
+enum : uint64_t {
+    kPrototypeBucketStride = 0x5b8,
+    kPrototypeBucketHashOffset = 0x08,
+    kPrototypeBucketKeyOffset = 0x10
+};
 
 // The only two fields read by get_prototype() in the pinned build.  Keep this
 // struct as raw storage rather than a meaningful object model.
@@ -178,6 +185,89 @@ struct TCGameModel {
         uint64_t value = 0;
         memcpy(&value, custom_prototype_count, sizeof(value));
         return value;
+    }
+
+    // Enumerate the built-in PROTOTYPES hash table without ever passing an
+    // unknown key to get_prototype().  The table object is two qwords:
+    // length, bucket pointer.  Buckets are 0x5b8 bytes; an occupied bucket
+    // has a nonzero hash at +0x08 and its single-byte key at +0x10.
+    uint64_t builtinPrototypeCount() const {
+        if (!prototypes_table) return 0;
+        uint64_t length = 0;
+        void* buckets = nullptr;
+        memcpy(&length, prototypes_table, sizeof(length));
+        memcpy(&buckets, static_cast<const unsigned char*>(prototypes_table) + 8,
+               sizeof(buckets));
+        if (!buckets || length > 4096) return 0;
+
+        uint64_t count = 0;
+        for (uint64_t i = 0; i < length; ++i) {
+            uint64_t hash = 0;
+            const auto* bucket =
+                static_cast<const unsigned char*>(buckets) +
+                i * kPrototypeBucketStride;
+            memcpy(&hash, bucket + kPrototypeBucketHashOffset, sizeof(hash));
+            if (hash != 0) ++count;
+        }
+        return count;
+    }
+
+    uint8_t builtinPrototypeKindAt(uint64_t occupied_index) const {
+        if (!prototypes_table || occupied_index >= builtinPrototypeCount()) {
+            return 0;
+        }
+        uint64_t length = 0;
+        void* buckets = nullptr;
+        memcpy(&length, prototypes_table, sizeof(length));
+        memcpy(&buckets, static_cast<const unsigned char*>(prototypes_table) + 8,
+               sizeof(buckets));
+        if (!buckets || length > 4096) return 0;
+
+        uint64_t seen = 0;
+        for (uint64_t i = 0; i < length; ++i) {
+            uint64_t hash = 0;
+            const auto* bucket =
+                static_cast<const unsigned char*>(buckets) +
+                i * kPrototypeBucketStride;
+            memcpy(&hash, bucket + kPrototypeBucketHashOffset, sizeof(hash));
+            if (hash == 0) continue;
+            if (seen == occupied_index) {
+                uint8_t key = 0;
+                memcpy(&key, bucket + kPrototypeBucketKeyOffset, sizeof(key));
+                return key;
+            }
+            ++seen;
+        }
+        return 0;
+    }
+
+    bool isBuiltinPrototypeKind(uint8_t kind) const {
+        return builtinPrototypeIndexForKind(kind) != ~uint64_t{0};
+    }
+
+    uint64_t builtinPrototypeIndexForKind(uint8_t kind) const {
+        if (!prototypes_table) return ~uint64_t{0};
+        uint64_t length = 0;
+        void* buckets = nullptr;
+        memcpy(&length, prototypes_table, sizeof(length));
+        memcpy(&buckets, static_cast<const unsigned char*>(prototypes_table) + 8,
+               sizeof(buckets));
+        if (!buckets || length > 4096) return ~uint64_t{0};
+
+        uint64_t occupied = 0;
+        for (uint64_t i = 0; i < length; ++i) {
+            uint64_t hash = 0;
+            const auto* bucket =
+                static_cast<const unsigned char*>(buckets) +
+                i * kPrototypeBucketStride;
+            memcpy(&hash, bucket + kPrototypeBucketHashOffset, sizeof(hash));
+            if (hash == 0) continue;
+            uint8_t key = 0;
+            memcpy(&key, bucket + kPrototypeBucketKeyOffset, sizeof(key));
+            if (key == kind) return occupied;
+            ++occupied;
+        }
+        return ~uint64_t{0};
     }
 
     // cc_live_values entries are 16 bytes: {uint64_t id, uint16_t id_low,
