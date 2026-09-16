@@ -32,7 +32,7 @@ alignas(8) unsigned char gPrevSelectedComponents[24]{};
 alignas(8) unsigned char gPrevSelectedWires[24]{};
 uint8_t gIsCampaign = 1;
 alignas(8) unsigned char gLevelProgress[16]{};
-alignas(8) unsigned char gCampaignName[16]{};
+alignas(8) unsigned char gCampaignName[64]{};
 alignas(8) unsigned char gSimulationCircuitState[16]{};
 void* gSimulationSettingsValue = reinterpret_cast<void*>(1);
 void* gSimulationSettingsPointer = &gSimulationSettingsValue;
@@ -367,6 +367,12 @@ int main() {
     std::memcpy(gSchematicPayload + 8, "Sch", 3);
     gSchematicPayload[11] = 0;
     std::memcpy(gSchematicTls, &schematicString, sizeof(schematicString));
+    tc::TCNimString campaignString{};
+    campaignString.length = 8;
+    campaignString.data = gCampaignName + 16;
+    std::memcpy(gCampaignName + 24, "Campaign", 8);
+    gCampaignName[32] = 0;
+    std::memcpy(gCampaignName, &campaignString, sizeof(campaignString));
 
     TCHost host{};
     host.api_version = TC_MOD_API_VERSION;
@@ -398,6 +404,7 @@ int main() {
     if (!state.load(&host) || !state.valid() || !state.isCampaign() ||
         state.levelProgress() != gLevelProgress ||
         state.campaignNamePtr() != gCampaignName ||
+        std::strcmp(state.campaignNameCStr(), "Campaign") != 0 ||
         state.simulationCircuitState() != gSimulationCircuitState) {
         std::cerr << "game state model mismatch\n";
         return 1;

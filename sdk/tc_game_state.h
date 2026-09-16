@@ -1,7 +1,7 @@
 #ifndef TC_GAME_STATE_H
 #define TC_GAME_STATE_H
 
-#include "tc_mod_api.h"
+#include "tc_game_model.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -40,6 +40,17 @@ struct TCGameStateModel {
 
     const void* campaignNamePtr() const {
         return campaign_name;
+    }
+
+    TCNimString campaignName() const {
+        TCNimString value{};
+        if (campaign_name) memcpy(&value, campaign_name, sizeof(value));
+        return value;
+    }
+
+    const char* campaignNameCStr() const {
+        TCNimString value = campaignName();
+        return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
     }
 
     const void* simulationCircuitState() const {
