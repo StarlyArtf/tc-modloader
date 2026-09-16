@@ -5,13 +5,14 @@ $taskGame = Split-Path $taskRepo
 $taskSeconds = if($env:TC_SMOKE_SECONDS) { [int]$env:TC_SMOKE_SECONDS } else { 25 }
 $taskMod = Join-Path $taskRepo 'dist\dev.sim-state.mod'
 if(!(Test-Path -LiteralPath $taskMod)) { throw 'Missing dist\dev.sim-state.mod; run build.ps1 first' }
+$taskCustom = ($env:TC_SIM_STATE_CUSTOM -eq '1')
 
 $taskTest = Join-Path $taskRepo ('build\sim-state-playtest-' + [guid]::NewGuid().ToString('N'))
 $taskRoot = Join-Path $taskTest 'game'
 $taskProfile = Join-Path $taskTest 'home'
 $taskData = Join-Path $taskRoot 'tc-modloader-data\plugin-data\dev.sim-state'
 $taskSchema = Join-Path $taskProfile 'AppData\Roaming\Turing Complete Mods\profiles\default\schematics\and_gate\Default'
-New-Item -ItemType Directory -Force $taskRoot,$taskProfile,(Join-Path $taskRoot 'mods'),$taskData,$taskSchema | Out-Null
+New-Item -ItemType Directory -Force $taskRoot,$taskProfile,(Join-Path $taskRoot 'mods'),$taskData,(Join-Path $taskData 'fixtures'),$taskSchema | Out-Null
 foreach($taskDir in @('asset','campaign','translations')) {
   Copy-Item -LiteralPath (Join-Path $taskGame $taskDir) -Destination $taskRoot -Recurse
 }
@@ -20,7 +21,14 @@ foreach($taskFile in @('Turing Complete.exe','compile.dll','tc_game_engine.dll',
 }
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\tc-loader.dll') -Destination (Join-Path $taskRoot 'game_engine.dll')
 Copy-Item -LiteralPath $taskMod -Destination (Join-Path $taskRoot 'mods\dev.sim-state.mod')
-Copy-Item -LiteralPath (Join-Path $taskRepo 'build\and2_solution_builtin.data') -Destination (Join-Path $taskSchema 'circuit.data')
+$taskSolution = if($taskCustom) { Join-Path $taskRepo 'build\and2_solution.data' } else { Join-Path $taskRepo 'build\and2_solution_builtin.data' }
+if(!(Test-Path -LiteralPath $taskSolution)) { throw "Missing sim-state solution: $taskSolution" }
+Copy-Item -LiteralPath $taskSolution -Destination (Join-Path $taskSchema 'circuit.data')
+if($taskCustom) {
+  $taskFixture = Join-Path $taskRepo 'build\and2_component.data'
+  if(!(Test-Path -LiteralPath $taskFixture)) { throw "Missing custom fixture: $taskFixture" }
+  Copy-Item -LiteralPath $taskFixture -Destination (Join-Path $taskData 'fixtures\and2_component.data')
+}
 & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply dev.sim-state
 if($LASTEXITCODE){throw 'Sim state package apply failed'}
 

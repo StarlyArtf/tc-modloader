@@ -8,9 +8,13 @@
 
 #include "../sdk/tc_mod.h"
 #include <windows.h>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -43,6 +47,12 @@ using SimDo = void (*)(void*, uint8_t, int64_t);
 SimDo sim_do_original;
 using InvisibleButton = bool (*)(const char*, V2, int);
 InvisibleButton invisible_original;
+using StateReadU64 = uint64_t (*)(int64_t);
+StateReadU64 state_read_original;
+using GetSimState = void* (*)(void*, const void*);
+GetSimState get_sim_state_original;
+using GetTestState = int64_t (*)();
+GetTestState get_test_state;
 
 bool started = false;
 double start_time = 0;
@@ -53,6 +63,7 @@ bool done = false;
 int64_t desired_cycle = 1;
 int test_frame = -1;
 int test_button_index = 0;
+bool imported_custom = false;
 
 void* state_global = nullptr;  // address of the raw simulation_state pointer
 void* input_replay_global = nullptr;
@@ -62,6 +73,12 @@ std::vector<std::vector<unsigned char>> snapshots;
 std::vector<std::vector<unsigned char>> input_replay_snapshots;
 std::vector<std::vector<unsigned char>> output_history_snapshots;
 std::vector<int64_t> snapshot_cycles;
+std::mutex read_mutex;
+std::map<int64_t, uint64_t> state_read_counts;
+std::map<int64_t, uint64_t> state_read_last;
+std::mutex gss_mutex;
+std::map<std::string, std::pair<uint64_t, uint64_t>> gss_stats;
+std::map<std::string, uint64_t> gss_last1;
 
 void log(const std::string& message) {
     if (host) host->log(host->context, message.c_str());
@@ -120,6 +137,42 @@ void interceptedSimDo(void* state, uint8_t command, int64_t target) {
         log("sim-state: model captured from sim_do " + hex(model));
     }
     if (sim_do_original) sim_do_original(state, command, target);
+}
+
+uint64_t hookedStateReadU64(int64_t index) {
+    uint64_t value = state_read_original ? state_read_original(index) : 0;
+    std::lock_guard<std::mutex> lock(read_mutex);
+    ++state_read_counts[index];
+    state_read_last[index] = value;
+    return value;
+}
+
+void* hookedGetSimState(void* result, const void* descriptor) {
+    void* out = get_sim_state_original
+                    ? get_sim_state_original(result, descriptor)
+                    : nullptr;
+    uint64_t value = 0;
+    uint64_t value1 = 0;
+    if (result) std::memcpy(&value, result, sizeof(value));
+    if (result) std::memcpy(&value1, static_cast<const unsigned char*>(result) + 8,
+                             sizeof(value1));
+    std::string key = descriptor ? "desc:" : "desc:null";
+    if (descriptor) {
+        const auto* bytes = static_cast<const unsigned char*>(descriptor);
+        std::ostringstream text;
+        for (size_t i = 0; i < 0x40; ++i) {
+            char buf[4];
+            std::snprintf(buf, sizeof(buf), "%02x", bytes[i]);
+            text << buf;
+        }
+        key += text.str();
+    }
+    std::lock_guard<std::mutex> lock(gss_mutex);
+    auto& entry = gss_stats[key];
+    entry.first += 1;
+    entry.second = value;
+    gss_last1[key] = value1;
+    return out;
 }
 
 bool hookedInvisible(const char* id, V2 size, int flags) {
@@ -192,6 +245,20 @@ void finish() {
         report << "changed_slots=0\n";
     }
 
+    if (snapshots.size() == 4) {
+        for (uint64_t word_offset : {256u, 264u, 272u, 280u}) {
+            report << "qword " << word_offset << " seq=";
+            for (const auto& snap : snapshots) {
+                uint64_t value = 0;
+                if (word_offset + 8 <= snap.size()) {
+                    std::memcpy(&value, snap.data() + word_offset, 8);
+                }
+                report << value << ",";
+            }
+            report << "\n";
+        }
+    }
+
     const auto report_small = [&](const char* label,
                                   const std::vector<std::vector<unsigned char>>& snaps) {
         report << label << " snapshots=" << snaps.size() << "\n";
@@ -224,6 +291,30 @@ void finish() {
     };
     report_small("input_replay", input_replay_snapshots);
     report_small("output_history", output_history_snapshots);
+
+    {
+        std::lock_guard<std::mutex> lock(read_mutex);
+        report << "state_read_u64 observed indices=" << state_read_counts.size() << "\n";
+        uint64_t printed = 0;
+        for (const auto& entry : state_read_counts) {
+            if (printed++ < 200) {
+                report << "read_index " << entry.first << " calls=" << entry.second
+                       << " last=" << state_read_last[entry.first] << "\n";
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(gss_mutex);
+        report << "get_sim_state observed descriptors=" << gss_stats.size() << "\n";
+        uint64_t printed = 0;
+        for (const auto& entry : gss_stats) {
+            if (printed++ < 100) {
+                report << entry.first << " calls=" << entry.second.first
+                       << " last0=" << entry.second.second
+                       << " last1=" << gss_last1[entry.first] << "\n";
+            }
+        }
+    }
 
     const auto folder = std::string(host->data_directory_utf8);
     std::ofstream(folder + "/state-map.txt") << report.str();
@@ -292,7 +383,8 @@ static void frame(void*, const TCFrame* value) {
         }
         if (readState()) {
             log("sim-state: snapshot at cycle " + std::to_string(cycle) +
-                " buffer=" + hex(state_buffer));
+                " buffer=" + hex(state_buffer) +
+                " test_state=" + (get_test_state ? std::to_string(get_test_state()) : "?"));
         }
         ++desired_cycle;
         stage_time = elapsed;
@@ -311,6 +403,22 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     if (!h || !plugin || h->api_version != TC_MOD_API_VERSION) return 1;
     host = h;
     if (!mod.load(h) || !mod.valid() || !mod.components.valid()) return 2;
+
+    const std::string folder = h->data_directory_utf8;
+    {
+        std::ifstream fixture(folder + "/fixtures/and2_component.data",
+                              std::ios::binary);
+        if (fixture) {
+            std::string bytes((std::istreambuf_iterator<char>(fixture)), {});
+            const std::string directory = folder + "/fixtures/";
+            auto imported = mod.components.importCircuit(
+                "AND2 Test", bytes.data(), bytes.size(), directory.c_str());
+            if (!imported.ok()) return 8;
+            imported_custom = true;
+            log("sim-state: imported custom AND2 id=" +
+                std::to_string(imported.custom_id));
+        }
+    }
 
     load_level = reinterpret_cast<LoadLevel>(
         h->resolve_symbol(h->context, "load_level__modelZutilities_u7740"));
@@ -332,6 +440,12 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     auto* invisible_target = h->resolve_symbol(h->context, "igInvisibleButton");
     auto* sim_do_target = h->resolve_symbol(
         h->context, "sim_do__modelZsimulationZcompile95thread_u3036");
+    auto* state_read_target = h->resolve_symbol(
+        h->context, "sim_state_read_u64__modelZsimulator95types_u159");
+    auto* get_sim_state_target = h->resolve_symbol(
+        h->context, "get_sim_state__modelZsimulationZcontroller_u102");
+    get_test_state = reinterpret_cast<GetTestState>(h->resolve_symbol(
+        h->context, "sim_get_test_state__modelZsimulationZcontroller_u26"));
     if (!update_target || !invisible_target || !sim_do_target) return 4;
 
     if (h->create_hook(h->context, update_target,
@@ -349,12 +463,26 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
                        reinterpret_cast<void**>(&invisible_original)) != 0) {
         return 7;
     }
+    if (state_read_target &&
+        h->create_hook(h->context, state_read_target,
+                       reinterpret_cast<void*>(&hookedStateReadU64),
+                       reinterpret_cast<void**>(&state_read_original)) != 0) {
+        return 9;
+    }
+    if (get_sim_state_target &&
+        h->create_hook(h->context, get_sim_state_target,
+                       reinterpret_cast<void*>(&hookedGetSimState),
+                       reinterpret_cast<void**>(&get_sim_state_original)) != 0) {
+        return 10;
+    }
 
     unsigned char* initial_buffer =
         *reinterpret_cast<unsigned char**>(state_global);
+    state_buffer = initial_buffer;
     log("sim-state: state global=" + hex(state_global) +
         " buffer=" + hex(initial_buffer) +
-        " size=" + std::to_string(kSimulationStateSize));
+        " size=" + std::to_string(kSimulationStateSize) +
+        " custom=" + std::to_string(imported_custom ? 1 : 0));
     plugin->on_frame = frame;
     return 0;
 }

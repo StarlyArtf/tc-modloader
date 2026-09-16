@@ -509,6 +509,28 @@ RAM 等 36 个 kind 共用同一个分支 `0x140227e30`**（结构型分支）�
 还需再用自定义元件 fixture 跑一遍，才能确认内部 `0x4f/0x51` 引脚对应的
 `simulation_state` 槽位。
 
+### 12.2 自定义元件内部槽位与首个负结果（2026-09-17）
+
+`tests/sim-state-probe.cpp` 现在支持 `TC_SIM_STATE_CUSTOM=1`：它会导入
+`and2_component.data`，并加载带 `0x4e` 自定义实例的 `and2_solution.data`。
+真机沙箱中，四份快照（cycle `-1 1 2 3`）显示 AND2 自定义实例的内部状态：
+
+| 含义 | 典型 `simulation_state` 字节偏移 | 序列 |
+|---|---|---|
+| 输入低 bit | `256/257/262/263/266` | `0,1,0,1` |
+| 输入高 bit | `258/259/260/261/267` | `0,0,1,1` |
+| 输出 | `264/265` | `0,0,0,1` |
+
+游戏 UI 读输出时走 `sim_state_read_u64(264)`；`get_sim_state` 的返回结果
+`last0` 也在 0/1 之间变化。已尝试在这两个只读接口上把 AND 输出改成 OR
+（仅实验，未提交行为修改），但 `sim_get_test_state` 仍然在 cycle 3 返回
+`1`（win）。这说明关卡测试的输出判定不是通过这两个 UI 读取入口完成的，
+而是在仿真/JIT 线程内部直接完成的。
+
+结论：路线 1 不能只 Hook `sim_state_read_u64`/`get_sim_state` 来改变逻辑；
+下一步必须进入仿真线程的每周期路径（`jit_function`/`jit` 包装或生成的
+状态写入点），在测试判定读取输出之前写入插件算出的状态。
+
 实验步骤（下一轮执行）：
 
 1. 新建 `tests/sim-state-probe.cpp`：导入一个自定义元件 → 载入 `and_gate` 关卡 →
