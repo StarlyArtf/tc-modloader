@@ -15,6 +15,7 @@ struct TCGameStateModel {
     const uint64_t* current_word_size = nullptr;
     const uint64_t* level_used_input = nullptr;
     const uint64_t* level_used_outputs = nullptr;
+    const uint8_t* display_numbers_as = nullptr;
 
     bool load(const TCHost* host) {
         if (host == nullptr) return false;
@@ -35,6 +36,10 @@ struct TCGameStateModel {
         level_used_outputs = static_cast<const uint64_t*>(
             host->resolve_symbol(host->context,
                                  "level_used_outputs__modelZsimulationZcontroller_u4"));
+        display_numbers_as = static_cast<const uint8_t*>(
+            host->resolve_symbol(
+                host->context,
+                "display_numbers_as__presenterZutilitiesZhelper95functions_u100"));
         return is_campaign != nullptr;
     }
 
@@ -79,6 +84,10 @@ struct TCGameStateModel {
 
     uint64_t levelUsedOutputs() const {
         return level_used_outputs ? *level_used_outputs : 0;
+    }
+
+    uint8_t displayNumbersAs() const {
+        return display_numbers_as ? *display_numbers_as : 0;
     }
 };
 
