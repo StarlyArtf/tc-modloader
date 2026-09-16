@@ -8,7 +8,8 @@ static const TCHost* host;
 template<class T>T api(const char*n){return reinterpret_cast<T>(host->engine_proc(host->context,n));}
 template<class T>T sym(const char*n){return reinterpret_cast<T>(host->resolve_symbol(host->context,n));}
 static Palette palette;static std::filesystem::path file;static V4 table[256];static float gpu[256*3];static float edit[3]={0.85f,0.3f,0.65f};static std::string status;
-static unsigned char* context;static int seen=-100,selected=0,hoverId=-1;static bool visible=true,picking=false,dirty=true,pending=false,editing=false;
+static unsigned char* context;static int seen=-100,selected=0,hoverId=-1;static bool visible=false,picking=false,dirty=true,pending=false,editing=false;
+static constexpr int kToolbarFlags = 1|2|4|8|32|64|256;
 using Update=bool(*)(void*,void*,void*,uint32_t,uint8_t);static Update originalUpdate;
 using AddWire=void(*)(void*,uint32_t,uint8_t);static AddWire originalAddWire;
 using PlaceWire=void(*)(void*,void*,void*,void*,void*,void*);static PlaceWire originalPlaceWire;
@@ -53,6 +54,20 @@ static bool update(void* model,void* ctx,void* input,uint32_t point,uint8_t fift
 }
 static void text(const char*s){api<void(*)(const char*,const char*)>("igTextUnformatted")(s,nullptr);}
 static bool button(const char*s){return api<bool(*)(const char*,V2)>("igButton")(s,{0,0});}
+static void drawToolbar(){
+ float w=api<float(*)()>("igGetWindowWidth")();
+ api<void(*)(V2,int)>("igSetNextWindowSize")({240,0},1);
+ api<void(*)(V2,int)>("igSetNextWindowPos")({w-250,12},1);
+ bool open=true;
+ if(api<bool(*)(const char*,bool*,int)>("igBegin")("导线调色盘 · 工具条###TCWirePaletteToolbar",&open,kToolbarFlags)){
+  api<void(*)(float)>("igSetWindowFontScale")(0.6f);
+  if(button(visible?"隐藏面板":"调色盘"))visible=!visible;
+  api<void(*)(float,float)>("igSameLine")(0,-1);
+  if(button(picking?"取消取色":"取色器"))picking=!picking;
+  std::string colorText="当前颜色 ID："+std::to_string(selected);
+  text(colorText.c_str());
+ }api<void(*)()>("igEnd")();
+}
 #ifdef TC_WIRE_SELFTEST
 #include "../../tests/wire-palette-playtest.hpp"
 #endif
@@ -67,10 +82,11 @@ static void frame(void*,const TCFrame*f){
  if(!isProgram){isProgram=(PFNGLISPROGRAMPROC)wglGetProcAddress("glIsProgram");location=(PFNGLGETUNIFORMLOCATIONPROC)wglGetProcAddress("glGetUniformLocation");useProgram=(PFNGLUSEPROGRAMPROC)wglGetProcAddress("glUseProgram");uniform=(PFNGLUNIFORM3FVPROC)wglGetProcAddress("glUniform3fv");}
  static GLuint scanId=1;static int nextUpload=0;
  if(isProgram&&location&&useProgram&&uniform){int budget=programs.empty()?8192:1024;bool wrapped=false;while(budget-->0){if(scanId>65535u){scanId=1;wrapped=true;}GLuint p=scanId++;if(isProgram(p)){int l=location(p,"tc_custom_wire_colors");if(l>=0)rememberProgram(p,l);}}if(wrapped){programs.erase(std::remove_if(programs.begin(),programs.end(),[](const auto&e){return !isProgram(e.first);}),programs.end());}if(dirty||f->frame_number>=nextUpload){for(auto [p,l]:programs)if(isProgram(p))uploadUniform(p,l,256,gpu);dirty=false;nextUpload=f->frame_number+60;}}
- DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);static bool last=false;bool down=pid==GetCurrentProcessId()&&(GetAsyncKeyState(VK_F7)&0x8000);if(down&&!last)visible=!visible;last=down;if(pid==GetCurrentProcessId()&&(GetAsyncKeyState(VK_ESCAPE)&0x8000))picking=false;
+ if(context)drawToolbar();
+ DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);if(pid==GetCurrentProcessId()&&(GetAsyncKeyState(VK_ESCAPE)&0x8000))picking=false;
  if(!visible)return;api<void(*)(V2,int)>("igSetNextWindowSize")({510,800},2);api<void(*)(V2,int)>("igSetNextWindowPos")({660,110},2);
  if(api<bool(*)(const char*,bool*,int)>("igBegin")("导线调色盘###TCWirePalette",&visible,0)){
- api<void(*)(float)>("igSetWindowFontScale")(0.6f);text("F7 显示 / 隐藏 · RGB 精确取色");
+ api<void(*)(float)>("igSetWindowFontScale")(0.6f);text("工具条上的“调色盘”按钮打开 / 隐藏此面板 · RGB 精确取色");
  api<void(*)(float)>("igSetNextItemWidth")(360);
  if(api<bool(*)(const char*,float*,int)>("igColorPicker3")("##picker",edit,0))editing=true;
  if(editing&&(api<bool(*)()>("igIsItemDeactivatedAfterEdit")()||(!api<bool(*)()>("igIsAnyItemActive")()&&!api<bool(*)(int)>("igIsMouseDown_Nil")(0)))){commit();editing=false;}
