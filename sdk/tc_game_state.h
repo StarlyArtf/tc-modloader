@@ -12,6 +12,7 @@ struct TCGameStateModel {
     const void* level_progress = nullptr;
     const void* campaign_name = nullptr;
     const void* simulation_circuit_state = nullptr;
+    const uint64_t* current_word_size = nullptr;
 
     bool load(const TCHost* host) {
         if (host == nullptr) return false;
@@ -23,6 +24,9 @@ struct TCGameStateModel {
             host->context, "campaign_name__modelZmodel95types_u836");
         simulation_circuit_state = host->resolve_symbol(
             host->context, "simulation_circuit_state__modelZsimulator95types_u78");
+        current_word_size = static_cast<const uint64_t*>(
+            host->resolve_symbol(host->context,
+                                 "current_word_size__modelZmodel95types_u741"));
         return is_campaign != nullptr;
     }
 
@@ -55,6 +59,10 @@ struct TCGameStateModel {
 
     const void* simulationCircuitState() const {
         return simulation_circuit_state;
+    }
+
+    uint64_t currentWordSize() const {
+        return current_word_size ? *current_word_size : 0;
     }
 };
 

@@ -117,6 +117,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `TCBoardModel` 通过 `len__modelZboardZboard_u19087` 提供当前/上一帧选中元件和导线数量。
 - `TCBoardModel` 现在可以枚举当前/上一帧选中的元件 ID 和导线 ID。
 - 新增 `tc_game_state.h`：读取 `is_campaign`、`level_progress`、`campaign_name`、`simulation_circuit_state` 等全局游戏状态。
+- `TCGameStateModel` 现在也读取 `current_word_size`，提供 `currentWordSize()`。
 - 新增 `tc_simulation.h`：封装 `sim_do`、`sim_get_cycle`、`simulation_settings`、`get/set_command_setting`，支持提交仿真命令、读取/修改命令设置。
 - 新增 `tc_wire_model.h`：封装导线读取、取色、添加、放置和更新函数，以及 `INVALID_WIRE_ID`。
 - 新增 `tc_save_model.h`：读取 `save_count`，并通过 `__emutls_get_address` 获取当前线程的 level/schematic 存档路径。
