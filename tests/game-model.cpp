@@ -3,6 +3,7 @@
 #include "../sdk/tc_game_state.h"
 #include "../sdk/tc_simulation.h"
 #include "../sdk/tc_wire_model.h"
+#include "../sdk/tc_save_model.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
@@ -45,6 +46,11 @@ uint8_t gPipetteResult = 7;
 uint8_t gWireAddedColor = 255;
 uint32_t gWireAddedPoint = 0;
 bool gWireUpdated = false;
+int64_t gSaveCount = 5;
+alignas(8) unsigned char gLevelTls[16]{};
+alignas(8) unsigned char gSchematicTls[16]{};
+alignas(8) unsigned char gLevelPayload[16]{};
+alignas(8) unsigned char gSchematicPayload[16]{};
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
 std::set<uint64_t> gPrevSelectedComponentIds;
@@ -207,6 +213,11 @@ bool fakeUpdateWire(void*, void*, void*, uint32_t, uint8_t) {
     return true;
 }
 
+void* fakeEmutlsGetAddress(void* control) {
+    if (control == gLevelTls || control == gSchematicTls) return control;
+    return nullptr;
+}
+
 void* fakeResolve(void*, const char* name) {
     std::string symbol(name ? name : "");
     if (symbol ==
@@ -320,6 +331,18 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "INVALID_WIRE_ID__modelZsave95mongerZcommon_u3578") {
         return &gInvalidWireId;
     }
+    if (symbol == "save_count__modelZsave_u11") {
+        return &gSaveCount;
+    }
+    if (symbol == "__emutls_v.global_save_level_path__modelZmodel95types_u79") {
+        return gLevelTls;
+    }
+    if (symbol == "__emutls_v.global_save_schematic_path__modelZmodel95types_u81") {
+        return gSchematicTls;
+    }
+    if (symbol == "__emutls_get_address") {
+        return reinterpret_cast<void*>(&fakeEmutlsGetAddress);
+    }
     return nullptr;
 }
 
@@ -332,6 +355,18 @@ int main() {
                   "Prototype size changed");
     static_assert(sizeof(tc::TCPin) == 0x38, "Pin size changed");
     setupPrototypeTable();
+    tc::TCNimString levelString{};
+    levelString.length = 2;
+    levelString.data = gLevelPayload;
+    std::memcpy(gLevelPayload + 8, "Lv", 2);
+    gLevelPayload[10] = 0;
+    std::memcpy(gLevelTls, &levelString, sizeof(levelString));
+    tc::TCNimString schematicString{};
+    schematicString.length = 3;
+    schematicString.data = gSchematicPayload;
+    std::memcpy(gSchematicPayload + 8, "Sch", 3);
+    gSchematicPayload[11] = 0;
+    std::memcpy(gSchematicTls, &schematicString, sizeof(schematicString));
 
     TCHost host{};
     host.api_version = TC_MOD_API_VERSION;
@@ -381,6 +416,14 @@ int main() {
         wire.wireAt(nullptr, 1) != -12345 ||
         wire.pipetteWire(nullptr, 1) != 7) {
         std::cerr << "wire model mismatch\n";
+        return 1;
+    }
+
+    tc::TCSaveModel save;
+    if (!save.load(&host) || !save.valid() || save.saveCount() != 5 ||
+        std::strcmp(save.levelPathCStr(), "Lv") != 0 ||
+        std::strcmp(save.schematicPathCStr(), "Sch") != 0) {
+        std::cerr << "save model mismatch\n";
         return 1;
     }
     wire.addWire(nullptr, 42, 9);
