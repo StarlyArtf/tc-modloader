@@ -49,4 +49,8 @@ try {
  if($LASTEXITCODE){throw 'Game model test build failed'}
  & .\build\game-model-test.exe
  if($LASTEXITCODE){throw 'Game model tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-model.cpp -o build\component-model-test.exe
+ if($LASTEXITCODE){throw 'Component model test build failed'}
+ & .\build\component-model-test.exe
+ if($LASTEXITCODE){throw 'Component model tests failed'}
 } finally { Pop-Location }

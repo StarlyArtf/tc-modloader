@@ -133,7 +133,50 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `custom_prototypes_set(id, prototype)`／`custom_prototypes_del(id)` 是已核实的低层注册原语，`in_custom_prototypes`／`notin_custom_prototypes` 用于查询，`customPrototypeCount()` 读取 `cc_length`，`customPrototypeIdAt(index)` 读取 `cc_live_values` 中的 ID。
 - `TCGameModel::setCustomPrototype` 会深拷贝传入的 `TCPrototype`，调用后原对象可以释放。
 
-边界：内置元件的 kind 是一个单字节键。请使用已提供的内置表枚举，避免向游戏查询任意字节值；未知 kind 可能触发 Nim 索引／键错误。自定义元件 ID 查询缺失时返回空对象。`setCustomPrototype` 只负责原型表写入，复制内置模板不会自动构造自定义元件的内部电路，也不会注册新的仿真逻辑。文件解析型 `add_custom_prototype` 的隐藏返回指针和三个机器级输入参数已由静态分析确认；复杂栈参数属于内部的 `reload_custom_prototype`。生命周期、错误处理和完整放置／仿真仍待实机验证，暂不提供可调用封装。详见 [元件链路研究](research/COMPONENT-PIPELINE.md)。
+边界：内置元件的 kind 是一个单字节键。请使用已提供的内置表枚举，避免向游戏查询任意字节值；未知 kind 可能触发 Nim 索引／键错误。自定义元件 ID 查询缺失时返回空对象。`setCustomPrototype` 只负责原型表写入，复制内置模板不会自动构造自定义元件的内部电路，也不会注册新的仿真逻辑。文件解析型入口现有实验封装，见下节；完整放置／仿真仍待验证。详见 [元件链路研究](research/COMPONENT-PIPELINE.md)。
+
+## 电路型元件导入（实验）
+
+`sdk/tc_component_model.h` 提供 `TCComponentModel`，也可通过 `TCMod::components`
+访问。这是可选能力：`TCMod::valid()` 不保证它可用，需要另查 `components.valid()`。
+
+| 函数 | 行为 |
+| --- | --- |
+| `importCircuit(name, bytes, length, directory)` | 将现有 `circuit.data` 的二进制内容交给游戏解析并注册，返回状态及完整 64 位 ID |
+| `updateFromDirectory(directory, name)` | 使用游戏自身路径读取及更新流程，读取 `directory + "circuit.data"` |
+| `releasePrototype(owned)` | 释放游戏 getter 返回的独立原型快照，并将其清零 |
+| `readiness()` | 检查符号是否齐备、是否为绑定线程、当前 Nim 错误状态 |
+
+```cpp
+// 在游戏主/渲染线程绑定并调用，仿真应处于停止状态。
+tc::TCComponentModel components;
+if (!components.load(host)) return 2;
+auto result = components.updateFromDirectory("D:/my-mod/circuit/", "My component");
+if (result.ok()) {
+    tc::TCPrototype snapshot{};
+    game.getCustomPrototype(result.custom_id, snapshot); // game 为已加载的 TCGameModel
+    // 使用 snapshot；名称/引脚等内部指针仅在释放前有效。
+    components.releasePrototype(snapshot);
+}
+```
+
+目录使用 UTF-8，必须带结尾 `/` 或 `\`。导入 ID 来自电路文件，不能通过名称参数指定；
+同 ID 会更新已有原型。调用不是事务，失败不承诺回滚。注册发生在内存中，接口不会
+替插件安排下次启动导入，也不保证元件自动进入菜单。它不注册新的原生 kind 或周期回调。
+
+状态包括 `Ok`、`Unavailable`、`WrongThread`、`InvalidArgument`、`NimError` 和 `Rejected`。
+封装会拒绝错线程及已有 Nim 错误状态的调用，调用后检查错误，但不清除游戏错误标志，
+也不能捕获访问违规或游戏内部终止。畸形电路输入的恢复能力未验证。
+
+临时输入字符串使用游戏分配器，显式设置长度并在同线程释放。不能把临时插件内存标成
+Nim 静态字符串：游戏可能共享而不是复制这种内存。原 `setPrototypeName` 等函数遗漏
+逻辑长度的问题也已修复，并支持空字符串。
+
+`releasePrototype` 只用于游戏 getter 返回、由调用方独占的快照；不能用于原型表条目、
+浅拷贝对象或带借用引脚数组的 Builder。当前 Builder 仍没有完整的自动所有权管理。
+
+隔离实机已通过二进制导入、同 ID 更新、名称长度、快照释放和缺失目录拒绝；
+测试样本没有自定义 I/O 端口，菜单、放置、连线及仿真正确性尚未验收。
 
 ## 每帧回调和界面
 

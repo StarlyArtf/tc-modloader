@@ -30,6 +30,9 @@ const names = {
   dynInit: 'atmmodelatssimulationatssimulator_functionsdotnim_DatInit000',
   jitThread: 'jit_function__modelZsimulationZsimulator95functions_u84',
   jit: 'jit__modelZsimulationZjitZjit_u1807',
+  stringAllocate: 'rawNewString',
+  stringFree: 'deallocShared',
+  prototypeDestroy: 'eqdestroy___modelZboardZprototype95list_u3259',
 };
 const asm = {};
 const functions = {};
@@ -96,6 +99,13 @@ check('Dynamic library name is compile.dll', bytes.subarray(offset(0x1405349c8),
 const table = 0x140534a60;
 const customBranch = table + bytes.readInt32LE(offset(table) + 0x4e * 4);
 check('Custom kind dispatches to shared codegen branch', customBranch === 0x140227e30);
+check('rawNewString initializes logical length to zero',
+  /mov\s+QWORD PTR \[rsp\+0x20\],0x0/.test(asm.stringAllocate));
+check('rawNewString stores requested capacity in payload',
+  /mov\s+QWORD PTR \[rax\],rbx/.test(asm.stringAllocate));
+check('String allocation and release use the same thread allocator',
+  asm.stringAllocate.includes('<__emutls_v.allocator__system_u7164>') &&
+  asm.stringFree.includes('<__emutls_v.allocator__system_u7164>'));
 const report = { executableSha256: hash, scope: 'Static binary evidence only; no gameplay validation',
   checks, customCodegenBranch: `0x${customBranch.toString(16)}`, functions };
 fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2) + '\n');
