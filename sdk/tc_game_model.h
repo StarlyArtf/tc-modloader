@@ -225,6 +225,16 @@ struct TCGameModel {
         return setCustomPrototype(custom_id, out);
     }
 
+    bool registerNamedBuiltinAsCustom(uint8_t kind, uint64_t custom_id,
+                                      const char* name,
+                                      const char* description) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return false;
+        if (!setPrototypeName(prototype, name)) return false;
+        if (!setPrototypeDescription(prototype, description)) return false;
+        return setCustomPrototype(custom_id, prototype);
+    }
+
     const char* builtinPrototypeName(uint8_t kind) const {
         TCPrototype prototype{};
         if (!cloneBuiltinPrototype(kind, prototype)) return nullptr;

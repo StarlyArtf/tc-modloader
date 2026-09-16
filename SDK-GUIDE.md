@@ -111,6 +111,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `cloneBuiltinPrototype(kind, out)` 复制一个已验证的内置元件模板；`registerBuiltinAsCustom(kind, custom_id, out)` 进一步把它写入自定义元件表。
 - `TCPrototypeBuilder` 封装“复制模板 → 调整已核实字段 → 注册为自定义元件”的工作流；未反推出的身份字段仍可通过 `setRawField` 写入。
 - `TCGameModel::removeAllCustomPrototypes()` 可清空当前自定义元件表。
+- `TCGameModel::registerNamedBuiltinAsCustom(kind, id, name, description)` 一步完成模板复制、命名和注册。
 - `TCGameModel::builtinPrototypeName(kind)`／`builtinPrototypeDescription(kind)` 直接返回内置元件的名称/描述。
 - `TCGameModel::builtinPrototypeShapeSvg(kind)` 直接返回内置元件的 SVG 形状。
 - `TCGameModel::builtinPrototypeAt(index, out)` 按枚举索引直接取出内置元件模板。

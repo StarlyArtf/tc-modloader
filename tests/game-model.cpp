@@ -723,6 +723,17 @@ int main() {
         std::cerr << "remove all custom prototypes mismatch\n";
         return 1;
     }
+    if (!model.registerNamedBuiltinAsCustom(0x52, 900, "My", "Desc") ||
+        !model.hasCustomPrototype(900) ||
+        model.customPrototypeCount() != 1) {
+        std::cerr << "named built-in registration mismatch\n";
+        return 1;
+    }
+    if (!model.removeCustomPrototype(900) ||
+        model.customPrototypeCount() != 0) {
+        std::cerr << "named built-in cleanup mismatch\n";
+        return 1;
+    }
 
     tc::TCPrototype builtin{};
     if (!model.getPrototype(kBuiltInKind, 0, builtin)) {
