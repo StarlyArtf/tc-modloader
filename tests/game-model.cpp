@@ -490,6 +490,7 @@ int main() {
     tc::TCSimulationModel sim;
     if (!sim.load(&host) || !sim.valid() || !sim.settingsReady() ||
         sim.cycle() != 100 || sim.commandSetting(2) != 7 ||
+        sim.settingsValue() != &gSimulationSettingsValue ||
         sim.inputReplay() != gSimInputReplay ||
         sim.outputHistoryPins() != gSimOutputHistory ||
         sim.keyboardCharacter() != gSimKeyboardCharacter ||

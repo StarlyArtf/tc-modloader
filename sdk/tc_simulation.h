@@ -60,6 +60,10 @@ struct TCSimulationModel {
         return settings != nullptr && *settings != nullptr;
     }
 
+    void* settingsValue() const {
+        return settingsReady() ? *settings : nullptr;
+    }
+
     int64_t cycle() const {
         return get_cycle ? get_cycle() : -1;
     }
