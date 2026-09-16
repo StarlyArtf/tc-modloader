@@ -53,4 +53,10 @@ try {
  if($LASTEXITCODE){throw 'Component model test build failed'}
  & .\build\component-model-test.exe
  if($LASTEXITCODE){throw 'Component model tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\and-component-fixture.cpp -o build\and-component-fixture.exe
+ if($LASTEXITCODE){throw 'AND component fixture build failed'}
+ & .\build\and-component-fixture.exe build\and2_component.data
+ if($LASTEXITCODE){throw 'AND component fixture generation failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\and-component-probe.cpp -o build\and-component-probe.dll
+ if($LASTEXITCODE){throw 'AND component probe build failed'}
 } finally { Pop-Location }

@@ -1,3 +1,17 @@
+# 电路封装元件验收（2026-09-16，步骤 1）
+
+- 新增电路格式分析工具 `tools/circuit_format.py`，可解码指定构建的 v13/v14
+  `circuit.data`：文件首字节为版本，其余为原始 Snappy 数据；解析器和编码器均保留
+  未命名字段，并区分 v13 与 v14 的组件字段布局。
+- 新增无第三方压缩依赖的 C++ fixture 生成器和真实游戏探针：
+  `tests/and-component-fixture.cpp`、`tests/and-component-probe.cpp`。
+- 生成的两输入一输出 AND 元件固定 ID 为 `0x414E44325F303031`。隔离游戏实测导入成功，
+  返回同一 64 位 ID；原型名称为 `AND2 Test`，输入数为 2、输出数为 1，三个引脚的
+  raw word size 均为 1。所有权快照释放后 Nim 错误状态仍为 0。
+- 该测试验证了电路文件导入、64 位 ID、自定义引脚数量和一位位宽。菜单位置、拖动放置、
+  真值表仿真、保存重载和有状态行为尚未验收。
+- 证据：`build/and-component-playtest-d5eb786ded044ff08b8ae278cbbc2ec9/game/tc-modloader-data/loader.log`。
+
 # 元件导入封装验证（2026-09-16，第二阶段）
 
 - 新组件模型测试通过：二进制字符串含 NUL、64 位返回 ID、临时分配释放平衡、目录参数、错线程拒绝、调用前后 Nim 错误状态及快照释放。
