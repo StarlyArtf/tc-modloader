@@ -63,4 +63,6 @@ try {
  if($LASTEXITCODE){throw 'AND component probe build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-placement-probe.cpp -o build\component-placement-probe.dll
  if($LASTEXITCODE){throw 'Component placement probe build failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-persistence-probe.cpp -o build\component-persistence-probe.dll
+ if($LASTEXITCODE){throw 'Component persistence probe build failed'}
 } finally { Pop-Location }

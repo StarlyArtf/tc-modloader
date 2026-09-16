@@ -162,6 +162,73 @@ void addWire(Writer& writer, int16_t x, int16_t y,
     for (uint16_t segment : segments) writer.u16(segment);
 }
 
+void addV13Pin(Writer& writer, uint16_t kind, int16_t x, int16_t y,
+               uint64_t identity, const char* name, int64_t bits) {
+    writer.u16(kind);
+    writer.i16(x);
+    writer.i16(y);
+    writer.u8(0);
+    writer.i64(static_cast<int64_t>(identity));
+    writer.string(name);
+    writer.u16(0);
+    writer.i64(0);
+    writer.i16(0);
+    writer.i64(bits);
+    writer.u8(0);
+    writer.u8(0);
+    writer.u8(0);
+    writer.u16(0);
+    writer.u16(0);
+}
+
+void addV13CustomInstance(Writer& writer) {
+    writer.u16(0x4E);
+    writer.i16(-5);
+    writer.i16(0);
+    writer.u8(0);
+    writer.i64(0x2222222222222222LL);
+    writer.string("");
+    writer.u16(0);
+    writer.i64(0);
+    writer.i16(0);
+    writer.i64(1);
+    writer.u8(0);
+    writer.u8(0);
+    writer.u8(0);
+    writer.u16(0);
+    writer.u16(0);
+    writer.i64(static_cast<int64_t>(kAndComponentId));
+    writer.u16(0);
+}
+
+std::vector<uint8_t> buildLevelPayload() {
+    Writer writer;
+    writer.i64(0x6f13c29bb2e19440LL);  // original and_gate seed
+    writer.u32(0);
+    writer.i64(0);
+    writer.i64(0);
+    writer.u8(1);
+    writer.i64(10000);
+    writer.sequence_i64({});
+    writer.string("");
+    writer.u8(0);
+    writer.u16(0);
+    writer.sequence_u8({});
+    writer.string("");
+    for (int i = 0; i < 512; ++i) writer.u8(0);
+
+    writer.i64(3);
+    addV13Pin(writer, 0x3F, -13, 0, 0x1111111111111111ULL, "Input", 8);
+    addV13CustomInstance(writer);
+    addV13Pin(writer, 0x44, 13, 0, 0x3333333333333333ULL, "Output", 8);
+
+    writer.i64(3);
+    addWire(writer, -13, -1, {0x0007, 0x0000});
+    addWire(writer, -13, 1, {0x0007, 0xC001, 0x0000});
+    addWire(writer, -3, -1, {0x000F, 0x4001, 0x0000});
+    return writer.bytes;
+}
+
 std::vector<uint8_t> buildPayload() {
     Writer writer;
     writer.i64(static_cast<int64_t>(kAndComponentId));
@@ -217,8 +284,22 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL write " << output.u8string() << "\n";
         return 1;
     }
+
+    const auto level_raw = buildLevelPayload();
+    std::vector<uint8_t> level_encoded;
+    level_encoded.push_back(13);  // level solution save-format version
+    writeLiteralSnappy(level_raw, level_encoded);
+    const auto level_output = output.parent_path() / "and2_solution.data";
+    std::ofstream level_file(level_output, std::ios::binary | std::ios::trunc);
+    level_file.write(reinterpret_cast<const char*>(level_encoded.data()),
+                     static_cast<std::streamsize>(level_encoded.size()));
+    if (!level_file) {
+        std::cerr << "FAIL write " << level_output.u8string() << "\n";
+        return 1;
+    }
     std::cout << "PASS AND fixture: id=" << kAndComponentId
               << " raw=" << raw.size() << " encoded=" << encoded.size()
-              << " path=" << output.u8string() << "\n";
+              << " path=" << output.u8string()
+              << " level=" << level_output.u8string() << "\n";
     return 0;
 }

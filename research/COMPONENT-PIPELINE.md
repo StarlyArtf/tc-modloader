@@ -285,3 +285,29 @@ board + 0x20 / +0x28   导线序列长度 / payload
 
 当前真值表验证的是序列化网表本身。真实游戏的关卡测试循环、每个周期输出读取和
 有状态时序验证仍待下一步完成。
+
+## 10. 第三阶段：保存路径与重载（步骤 4）
+
+保存目录中的 `levels.txt` 用
+
+```text
+"<level>",<bool>,"<schematic name>",
+```
+
+记录每个关卡当前选择的 schematic。电路文件位于
+`schematics/<level>/<schematic name>/circuit.data`，例如
+`schematics/and_gate/Default/circuit.data`。只把测试电路写到
+`schematics/<level>/circuit.data` 不会被当前关卡选择。
+
+fixture 生成器现在同时生成关卡电路 `and2_solution.data`：输入 `0x3f`、自定义实例
+`0x4e`、输出 `0x44`，三段导线分别连接两个输入引脚到自定义元件并连接输出。
+引脚偏移来自第 9 节，北向和南向导线使用修正后的 `0xC000` 和 `0x4000` 高位。
+
+`tests/component-persistence-playtest.ps1` 在同一个隔离 USERPROFILE 中连续启动两次：
+两次都由插件重新导入电路定义，并重新加载 and_gate 的保存文件。探针在 board 组件
+序列中找到 kind `0x4e`、ID `0x414E44325F303031`，并确认导线数为 3。保存文件
+SHA-256 在两次启动前后保持一致。
+
+边界：`save_level_data`、`save_all_design_changes` 和 `save_level_design` 的直接调用
+可以返回而不改写磁盘文件，说明它们仍依赖 UI 状态或脏标记。当前已验证的是“已保存电路
+重启后正确重载”；运行时修改经游戏 UI 保存落盘仍需继续研究。

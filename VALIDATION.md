@@ -38,6 +38,23 @@
 - 证据：`node tests/and-component-netlist.js build/and2_component.data` 输出
   `PASS AND fixture netlist: 00, 01, 10, 11 -> 0, 0, 0, 1`。
 
+# 元件保存与重载验收（2026-09-16，步骤 4）
+
+- fixture 生成器现在同时写出定义 `and2_component.data` 和关卡封装电路
+  `and2_solution.data`。后者包含 `0x3f` 输入、`0x4e` 自定义实例、`0x44` 输出和 3 条导线。
+- 保存路径已核对：游戏按 `levels.txt` 中的 schematic 名称读取
+  `schematics/<level>/<schematic>/circuit.data`。测试把 `and2_solution.data`
+  放入 `schematics/and_gate/Default/circuit.data`。
+- 新增 `tests/component-persistence-probe.cpp` 和
+  `tests/component-persistence-playtest.ps1`。同一隔离存档连续启动游戏两次：
+  每次都重新导入 AND 定义、加载 and_gate 保存电路，并确认 board 中存在
+  kind `0x4e`、ID `0x414E44325F303031` 的实例，同时导线数为 3。
+- 两次运行均通过，且保存电路 SHA-256 前后一致。测试同时调用了
+  `save_level_data`、`save_all_design_changes` 和 `save_level_design`，但这三个直接
+  调用在本轮没有改写磁盘文件；因此“重载保持正确”已验证，“通过游戏 UI 保存一次运行时
+  修改并落盘”仍待补做。
+- 证据：`build/component-persistence-playtest-800524032bcd40dbbb2765a37e3a46ea`。
+
 # 元件导入封装验证（2026-09-16，第二阶段）
 
 - 新组件模型测试通过：二进制字符串含 NUL、64 位返回 ID、临时分配释放平衡、目录参数、错线程拒绝、调用前后 Nim 错误状态及快照释放。
