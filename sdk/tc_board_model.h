@@ -7,6 +7,8 @@
 //
 //   selected_components__modelZboardZboard_u22
 //   selected_wires__modelZboardZboard_u30
+//   prev_selected_components__modelZboardZboard_u41
+//   prev_selected_wires__modelZboardZboard_u44
 //   contains__modelZboardZboard_u1842
 
 #include "tc_mod_api.h"
@@ -19,6 +21,8 @@ using TCBoardContainsFn = uint8_t (*)(const void* set, uint64_t id);
 struct TCBoardModel {
     const void* selected_components = nullptr;
     const void* selected_wires = nullptr;
+    const void* prev_selected_components = nullptr;
+    const void* prev_selected_wires = nullptr;
     TCBoardContainsFn contains = nullptr;
 
     bool load(const TCHost* host) {
@@ -27,6 +31,10 @@ struct TCBoardModel {
             host->context, "selected_components__modelZboardZboard_u22");
         selected_wires = host->resolve_symbol(
             host->context, "selected_wires__modelZboardZboard_u30");
+        prev_selected_components = host->resolve_symbol(
+            host->context, "prev_selected_components__modelZboardZboard_u41");
+        prev_selected_wires = host->resolve_symbol(
+            host->context, "prev_selected_wires__modelZboardZboard_u44");
         contains = reinterpret_cast<TCBoardContainsFn>(
             host->resolve_symbol(host->context,
                                  "contains__modelZboardZboard_u1842"));
@@ -44,6 +52,21 @@ struct TCBoardModel {
 
     bool isWireSelected(uint64_t wire_id) const {
         return valid() && contains(selected_wires, wire_id) != 0;
+    }
+
+    bool hasPreviousSelection() const {
+        return prev_selected_components != nullptr &&
+               prev_selected_wires != nullptr;
+    }
+
+    bool isComponentPreviouslySelected(uint64_t component_id) const {
+        return valid() && hasPreviousSelection() &&
+               contains(prev_selected_components, component_id) != 0;
+    }
+
+    bool isWirePreviouslySelected(uint64_t wire_id) const {
+        return valid() && hasPreviousSelection() &&
+               contains(prev_selected_wires, wire_id) != 0;
     }
 };
 

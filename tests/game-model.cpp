@@ -24,8 +24,12 @@ alignas(16) unsigned char gPrototypeTable[16]{};
 alignas(16) unsigned char gPrototypeBuckets[4 * tc::kPrototypeBucketStride]{};
 alignas(8) unsigned char gSelectedComponents[24]{};
 alignas(8) unsigned char gSelectedWires[24]{};
+alignas(8) unsigned char gPrevSelectedComponents[24]{};
+alignas(8) unsigned char gPrevSelectedWires[24]{};
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
+std::set<uint64_t> gPrevSelectedComponentIds;
+std::set<uint64_t> gPrevSelectedWireIds;
 
 void setupPrototypeTable() {
     uint64_t length = 4;
@@ -141,6 +145,8 @@ uint8_t fakeNotContainsCustomPrototype(uint64_t id) {
 uint8_t fakeBoardContains(const void* set, uint64_t id) {
     if (set == gSelectedComponents) return gSelectedComponentIds.count(id) ? 1 : 0;
     if (set == gSelectedWires) return gSelectedWireIds.count(id) ? 1 : 0;
+    if (set == gPrevSelectedComponents) return gPrevSelectedComponentIds.count(id) ? 1 : 0;
+    if (set == gPrevSelectedWires) return gPrevSelectedWireIds.count(id) ? 1 : 0;
     return 0;
 }
 
@@ -203,6 +209,12 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "selected_wires__modelZboardZboard_u30") {
         return gSelectedWires;
     }
+    if (symbol == "prev_selected_components__modelZboardZboard_u41") {
+        return gPrevSelectedComponents;
+    }
+    if (symbol == "prev_selected_wires__modelZboardZboard_u44") {
+        return gPrevSelectedWires;
+    }
     if (symbol == "contains__modelZboardZboard_u1842") {
         return reinterpret_cast<void*>(&fakeBoardContains);
     }
@@ -246,8 +258,14 @@ int main() {
     }
     gSelectedComponentIds.insert(42);
     gSelectedWireIds.insert(7);
+    gPrevSelectedComponentIds.insert(43);
+    gPrevSelectedWireIds.insert(8);
     if (!board.isComponentSelected(42) || board.isComponentSelected(1) ||
-        !board.isWireSelected(7) || board.isWireSelected(42)) {
+        !board.isWireSelected(7) || board.isWireSelected(42) ||
+        !board.isComponentPreviouslySelected(43) ||
+        board.isComponentPreviouslySelected(42) ||
+        !board.isWirePreviouslySelected(8) ||
+        board.isWirePreviouslySelected(7)) {
         std::cerr << "board selection query mismatch\n";
         return 1;
     }
