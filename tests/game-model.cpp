@@ -2,6 +2,7 @@
 #include "../sdk/tc_board_model.h"
 #include "../sdk/tc_game_state.h"
 #include "../sdk/tc_simulation.h"
+#include "../sdk/tc_wire_model.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
@@ -38,6 +39,12 @@ int64_t gSimCycle = 100;
 int64_t gSimSetting = 7;
 int64_t gSimObservedTarget = -1;
 uint8_t gSimObservedCommand = 255;
+int64_t gInvalidWireId = -12345;
+int64_t gWireAtResult = -12345;
+uint8_t gPipetteResult = 7;
+uint8_t gWireAddedColor = 255;
+uint32_t gWireAddedPoint = 0;
+bool gWireUpdated = false;
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
 std::set<uint64_t> gPrevSelectedComponentIds;
@@ -179,6 +186,27 @@ void fakeSimSetSetting(uint8_t, int64_t value) {
     gSimSetting = value;
 }
 
+uint8_t fakePipetteWire(void*, uint32_t) {
+    return gPipetteResult;
+}
+
+int64_t fakeWireAt(void*, uint32_t) {
+    return gWireAtResult;
+}
+
+void fakeAddWire(void*, uint32_t point, uint8_t color) {
+    gWireAddedPoint = point;
+    gWireAddedColor = color;
+}
+
+void fakePlaceWire(void*, void*, void*, void*, void*, void*) {
+}
+
+bool fakeUpdateWire(void*, void*, void*, uint32_t, uint8_t) {
+    gWireUpdated = true;
+    return true;
+}
+
 void* fakeResolve(void*, const char* name) {
     std::string symbol(name ? name : "");
     if (symbol ==
@@ -274,6 +302,24 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "set_command_setting__modelZsimulator95types_u131") {
         return reinterpret_cast<void*>(&fakeSimSetSetting);
     }
+    if (symbol == "pipette_wire__modelZutilities_u2289") {
+        return reinterpret_cast<void*>(&fakePipetteWire);
+    }
+    if (symbol == "get_wire__presenterZutilitiesZhelper95functions_u1916") {
+        return reinterpret_cast<void*>(&fakeWireAt);
+    }
+    if (symbol == "add_wire_from_pos__modelZboardZboard_u28435") {
+        return reinterpret_cast<void*>(&fakeAddWire);
+    }
+    if (symbol == "handle_place_wire__presenterZuser95inputZboard95ioZactionZplace95wire_u2") {
+        return reinterpret_cast<void*>(&fakePlaceWire);
+    }
+    if (symbol == "handle_update_wire__presenterZuser95inputZboard95ioZactionZnone_u5") {
+        return reinterpret_cast<void*>(&fakeUpdateWire);
+    }
+    if (symbol == "INVALID_WIRE_ID__modelZsave95mongerZcommon_u3578") {
+        return &gInvalidWireId;
+    }
     return nullptr;
 }
 
@@ -326,6 +372,25 @@ int main() {
     if (!sim.load(&host) || !sim.valid() || !sim.settingsReady() ||
         sim.cycle() != 100 || sim.commandSetting(2) != 7) {
         std::cerr << "simulation model mismatch\n";
+        return 1;
+    }
+
+    tc::TCWireModel wire;
+    if (!wire.load(&host) || !wire.valid() ||
+        wire.invalidId() != -12345 ||
+        wire.wireAt(nullptr, 1) != -12345 ||
+        wire.pipetteWire(nullptr, 1) != 7) {
+        std::cerr << "wire model mismatch\n";
+        return 1;
+    }
+    wire.addWire(nullptr, 42, 9);
+    if (gWireAddedPoint != 42 || gWireAddedColor != 9) {
+        std::cerr << "wire add mismatch\n";
+        return 1;
+    }
+    if (!wire.updateWire(nullptr, nullptr, nullptr, 0, 0) ||
+        !gWireUpdated) {
+        std::cerr << "wire update mismatch\n";
         return 1;
     }
     sim.run(nullptr, 250);
