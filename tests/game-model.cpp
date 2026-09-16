@@ -1,5 +1,6 @@
 #include "../sdk/tc_game_model.h"
 #include "../sdk/tc_board_model.h"
+#include "../sdk/tc_game_state.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
@@ -26,6 +27,10 @@ alignas(8) unsigned char gSelectedComponents[24]{};
 alignas(8) unsigned char gSelectedWires[24]{};
 alignas(8) unsigned char gPrevSelectedComponents[24]{};
 alignas(8) unsigned char gPrevSelectedWires[24]{};
+uint8_t gIsCampaign = 1;
+alignas(8) unsigned char gLevelProgress[16]{};
+alignas(8) unsigned char gCampaignName[16]{};
+alignas(8) unsigned char gSimulationCircuitState[16]{};
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
 std::set<uint64_t> gPrevSelectedComponentIds;
@@ -218,6 +223,18 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "contains__modelZboardZboard_u1842") {
         return reinterpret_cast<void*>(&fakeBoardContains);
     }
+    if (symbol == "is_campaign__modelZmodel95types_u739") {
+        return &gIsCampaign;
+    }
+    if (symbol == "level_progress__modelZmodel95types_u835") {
+        return gLevelProgress;
+    }
+    if (symbol == "campaign_name__modelZmodel95types_u836") {
+        return gCampaignName;
+    }
+    if (symbol == "simulation_circuit_state__modelZsimulator95types_u78") {
+        return gSimulationCircuitState;
+    }
     return nullptr;
 }
 
@@ -254,6 +271,15 @@ int main() {
     tc::TCBoardModel board;
     if (!board.load(&host) || !board.valid()) {
         std::cerr << "board model did not resolve\n";
+        return 1;
+    }
+
+    tc::TCGameStateModel state;
+    if (!state.load(&host) || !state.valid() || !state.isCampaign() ||
+        state.levelProgress() != gLevelProgress ||
+        state.campaignNamePtr() != gCampaignName ||
+        state.simulationCircuitState() != gSimulationCircuitState) {
+        std::cerr << "game state model mismatch\n";
         return 1;
     }
     gSelectedComponentIds.insert(42);
