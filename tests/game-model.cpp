@@ -285,6 +285,13 @@ int main() {
     builder.setOutputCount(1);
     tc::TCPin builderOutput[1]{};
     builder.setOutputPins(builderOutput);
+    builder.setCategoryRaw(0x12345678ULL);
+    builder.setFlagsRaw(0x9abcdef0ULL);
+    if (tc::prototypeCategoryRaw(builder.prototype()) != 0x12345678ULL ||
+        tc::prototypeFlagsRaw(builder.prototype()) != 0x9abcdef0ULL) {
+        std::cerr << "prototype builder raw field mismatch\n";
+        return 1;
+    }
     if (!builder.registerAsCustom(888) ||
         !model.hasCustomPrototype(888) ||
         model.customPrototypeCount() != 1) {

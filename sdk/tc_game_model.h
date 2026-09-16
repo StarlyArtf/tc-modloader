@@ -516,6 +516,14 @@ class TCPrototypeBuilder {
         prototypeSetOutputPins(prototype_, pins);
     }
 
+    void setCategoryRaw(uint64_t value) {
+        setRawField(kPrototypeCategoryRawOffset, &value, sizeof(value));
+    }
+
+    void setFlagsRaw(uint64_t value) {
+        setRawField(kPrototypeFlagsRawOffset, &value, sizeof(value));
+    }
+
     bool setName(const char* utf8) {
         return model_->setPrototypeName(prototype_, utf8);
     }
