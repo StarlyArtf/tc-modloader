@@ -8,7 +8,7 @@ static const TCHost* host;
 template<class T>T api(const char*n){return reinterpret_cast<T>(host->engine_proc(host->context,n));}
 template<class T>T sym(const char*n){return reinterpret_cast<T>(host->resolve_symbol(host->context,n));}
 static Palette palette;static std::filesystem::path file;static V4 table[256];static float gpu[256*3];static float edit[3]={0.85f,0.3f,0.65f};static std::string status;
-static unsigned char* context;static int seen=-100,selected=0,hoverId=-1;static bool visible=true,picking=false,dirty=true,pending=false,editing=false;
+static unsigned char* context;static int seen=-100,selected=0,hoverId=-1;static bool visible=false,picking=false,dirty=true,pending=false,editing=false,autoShown=false;
 using Update=bool(*)(void*,void*,void*,uint32_t,uint8_t);static Update originalUpdate;
 using AddWire=void(*)(void*,uint32_t,uint8_t);static AddWire originalAddWire;
 using PlaceWire=void(*)(void*,void*,void*,void*,void*,void*);static PlaceWire originalPlaceWire;
@@ -38,6 +38,7 @@ static void addWire(void* board,uint32_t point,uint8_t color){originalAddWire(bo
 static void placeWire(void* a,void* b,void* ctx,void* d,void* e,void* f){if(ctx)((unsigned char*)ctx)[0x2a]=(uint8_t)selected;originalPlaceWire(a,b,ctx,d,e,f);}
 static bool update(void* model,void* ctx,void* input,uint32_t point,uint8_t fifth){context=(unsigned char*)ctx;seen=api<int(*)()>("igGetFrameCount")();
  hoverId=wireAt(model,point)!=invalidWire?(int)pipette(model,point):-1;
+ if(!autoShown&&context){visible=true;autoShown=true;}
 #ifdef TC_WIRE_SELFTEST
  testModel=model;
 #endif
@@ -68,6 +69,7 @@ static void frame(void*,const TCFrame*f){
  static GLuint scanId=1;static int nextUpload=0;
  if(isProgram&&location&&useProgram&&uniform){int budget=programs.empty()?8192:1024;bool wrapped=false;while(budget-->0){if(scanId>65535u){scanId=1;wrapped=true;}GLuint p=scanId++;if(isProgram(p)){int l=location(p,"tc_custom_wire_colors");if(l>=0)rememberProgram(p,l);}}if(wrapped){programs.erase(std::remove_if(programs.begin(),programs.end(),[](const auto&e){return !isProgram(e.first);}),programs.end());}if(dirty||f->frame_number>=nextUpload){for(auto [p,l]:programs)if(isProgram(p))uploadUniform(p,l,256,gpu);dirty=false;nextUpload=f->frame_number+60;}}
  DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);static bool last=false;bool down=pid==GetCurrentProcessId()&&(GetAsyncKeyState(VK_F7)&0x8000);if(down&&!last)visible=!visible;last=down;if(pid==GetCurrentProcessId()&&(GetAsyncKeyState(VK_ESCAPE)&0x8000))picking=false;
+ if(visible)autoShown=true;
  if(!visible)return;api<void(*)(V2,int)>("igSetNextWindowSize")({510,800},2);api<void(*)(V2,int)>("igSetNextWindowPos")({660,110},2);
  if(api<bool(*)(const char*,bool*,int)>("igBegin")("导线调色盘###TCWirePalette",&visible,0)){
  api<void(*)(float)>("igSetWindowFontScale")(0.6f);text("F7 显示 / 隐藏 · RGB 精确取色");

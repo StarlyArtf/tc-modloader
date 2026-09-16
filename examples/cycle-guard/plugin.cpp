@@ -22,7 +22,7 @@ static void** settings;
 static std::atomic<int64_t> budget{100},hits{0},lastRequested{0},lastEffective{0};
 static std::atomic<bool> guard{true};
 static void* model;
-static bool show=true,keyWasDown=false;
+static bool show=false,keyWasDown=false,autoShown=false;
 #ifdef TC_GUARD_SELFTEST
 static bool (*originalButton)(const char*,V2,int);
 static uint64_t testStartTime;
@@ -58,8 +58,9 @@ static void frame(void*,const TCFrame* frameInfo){
   bool on=guard.load();if(proc<bool(*)(const char*,bool*)>("igCheckbox")("拦截游戏运行命令",&on))guard=on;
   text("每次最多运行："+std::to_string(budget.load())+" 个周期");
   for(auto n:{1,10,100,1000}){if(button(std::to_string(n).c_str()))budget=n;if(n!=1000)same();}
-  bool ready=settings&&*settings;auto now=ready?getCycle():0;
-  text("当前周期："+std::to_string(now)+"  |  已拦截："+std::to_string(hits.load())+" 次");
+ bool ready=settings&&*settings;auto now=ready?getCycle():0;
+ if(!autoShown&&ready&&model){show=true;autoShown=true;}
+ text("当前周期："+std::to_string(now)+"  |  已拦截："+std::to_string(hits.load())+" 次");
   proc<void(*)(bool)>("igBeginDisabled")(!ready||!model);
   if(button("运行 N 个周期")){auto n=budget.load();gameSim(model,0,now>INT64_MAX-n?INT64_MAX:now+n);}
   same();if(button("请求连续运行（验证拦截）"))gameSim(model,0,INT64_MAX);
