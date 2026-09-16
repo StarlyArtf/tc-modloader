@@ -58,6 +58,10 @@ struct TCWireModel {
         return invalid_wire_id ? *invalid_wire_id : -1;
     }
 
+    bool isValidWireId(int64_t id) const {
+        return id != invalidId();
+    }
+
     int64_t wireAt(void* model, uint32_t point) const {
         return wire_at ? wire_at(model, point) : invalidId();
     }

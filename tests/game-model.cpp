@@ -512,7 +512,8 @@ int main() {
     if (!wire.load(&host) || !wire.valid() ||
         wire.invalidId() != -12345 ||
         wire.wireAt(nullptr, 1) != -12345 ||
-        wire.pipetteWire(nullptr, 1) != 7) {
+        wire.pipetteWire(nullptr, 1) != 7 ||
+        !wire.isValidWireId(0) || wire.isValidWireId(-12345)) {
         std::cerr << "wire model mismatch\n";
         return 1;
     }
