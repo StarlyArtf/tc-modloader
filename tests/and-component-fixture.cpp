@@ -201,7 +201,7 @@ void addV13CustomInstance(Writer& writer) {
     writer.u16(0);
 }
 
-std::vector<uint8_t> buildLevelPayload() {
+std::vector<uint8_t> buildLevelPayload(bool builtin_and) {
     Writer writer;
     writer.i64(0x6f13c29bb2e19440LL);  // original and_gate seed
     writer.u32(0);
@@ -219,7 +219,10 @@ std::vector<uint8_t> buildLevelPayload() {
 
     writer.i64(3);
     addV13Pin(writer, 0x3F, -13, 0, 0x1111111111111111ULL, "Input", 8);
-    addV13CustomInstance(writer);
+    if (builtin_and)
+        addV13Pin(writer, kAndGate, -5, 0, 0x2222222222222222ULL, "", 1);
+    else
+        addV13CustomInstance(writer);
     addV13Pin(writer, 0x44, 13, 0, 0x3333333333333333ULL, "Output", 8);
 
     writer.i64(3);
@@ -285,17 +288,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const auto level_raw = buildLevelPayload();
-    std::vector<uint8_t> level_encoded;
-    level_encoded.push_back(13);  // level solution save-format version
-    writeLiteralSnappy(level_raw, level_encoded);
-    const auto level_output = output.parent_path() / "and2_solution.data";
-    std::ofstream level_file(level_output, std::ios::binary | std::ios::trunc);
-    level_file.write(reinterpret_cast<const char*>(level_encoded.data()),
-                     static_cast<std::streamsize>(level_encoded.size()));
-    if (!level_file) {
-        std::cerr << "FAIL write " << level_output.u8string() << "\n";
-        return 1;
+    std::filesystem::path level_output;
+    for (bool builtin_and : {false, true}) {
+        const auto level_raw = buildLevelPayload(builtin_and);
+        std::vector<uint8_t> level_encoded;
+        level_encoded.push_back(13);  // level solution save-format version
+        writeLiteralSnappy(level_raw, level_encoded);
+        level_output = output.parent_path() /
+                       (builtin_and ? "and2_solution_builtin.data"
+                                    : "and2_solution.data");
+        std::ofstream level_file(level_output,
+                                 std::ios::binary | std::ios::trunc);
+        level_file.write(reinterpret_cast<const char*>(level_encoded.data()),
+                         static_cast<std::streamsize>(level_encoded.size()));
+        if (!level_file) {
+            std::cerr << "FAIL write " << level_output.u8string() << "\n";
+            return 1;
+        }
     }
     std::cout << "PASS AND fixture: id=" << kAndComponentId
               << " raw=" << raw.size() << " encoded=" << encoded.size()

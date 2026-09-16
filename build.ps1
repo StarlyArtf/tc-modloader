@@ -52,6 +52,14 @@ try {
  Copy-Item examples\circuit-and\native\circuit-and.dll (Join-Path $taskCircuitAnd 'native') -Force
  if(Test-Path dist\example.circuit-and.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.circuit-and.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskCircuitAnd -Output (Join-Path $taskRoot 'dist\example.circuit-and.mod')
+ # Diagnostic observer for gate/delay score investigation (dev only).
+ $taskCostWatch=Join-Path $taskRoot 'build\cost-watch-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskCostWatch 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\cost-watch.cpp -o (Join-Path $taskCostWatch 'native\cost-watch.dll')
+ if($LASTEXITCODE){throw 'Cost watch mod build failed'}
+ '{"format":2,"id":"dev.cost-watch","name":"Gate and delay score observer","version":"0.1.0","native":{"api":1,"entry":"native/cost-watch.dll"}}' | Set-Content (Join-Path $taskCostWatch 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.cost-watch.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.cost-watch.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskCostWatch -Output (Join-Path $taskRoot 'dist\dev.cost-watch.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -Ivendor -Ivendor\minhook\include tests\native-host.cpp @taskObjects @taskHooks -lbcrypt -o build\native-host.exe
  if($LASTEXITCODE){throw 'Native host test build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -Wno-cast-function-type tests\game-model.cpp -o build\game-model-test.exe

@@ -311,3 +311,57 @@ SHA-256 在两次启动前后保持一致。
 边界：`save_level_data`、`save_all_design_changes` 和 `save_level_design` 的直接调用
 可以返回而不改写磁盘文件，说明它们仍依赖 UI 状态或脏标记。当前已验证的是“已保存电路
 重启后正确重载”；运行时修改经游戏 UI 保存落盘仍需继续研究。
+
+## 11. 延迟统计链路（进行中）
+
+用户实测：自定义 AND2 自身延迟为 2，但放进关卡／沙盒／元件工坊后，统计出的总延迟
+不包含它。本节记录已确认的链路和已排除的假设。
+
+新增只读工具 `tools/xref.js`：直接读 PE 节表 + COFF 符号表，扫描 `.text` 里的
+`E8/E9` 直接调用与常见 rip 相对内存引用，回答“谁调用了 X”“谁引用了全局表 X”。
+注意 objdump `-t` 打印的符号值是**节内偏移**，必须加上所在节的 VMA 才是真实 VA；
+反汇编注释里的地址才是可直接对比的 VA。
+
+已确认的代价函数分派（VA 为首选基址 `0x140000000`）：
+
+```text
+get_cost__modelZscores_u2321          0x140158d60   (component) -> (gates, delay)
+  ├─ get_gate_cost__modelZscores_u2304.part.0  0x140158630
+  └─ get_delay_cost__modelZscores_u2316        0x140158b40
+       ├─ kind 0x4f / 0x51 -> [component+0x130]
+       ├─ kind 0x4e        -> get_custom_prototype(id) 后读 [prototype+0x138]
+       └─ 其余 kind        -> get_delay_cost__modelZscores_u2270(按 size 的 log2 公式)
+```
+
+也就是说，**自定义元件实例的代价只能来自原型字段** `prototype+0x130`（门数）和
+`prototype+0x138`（延迟）。真实导入的测试元件这两个字段确实是 1 和 2（插件日志
+`inserted custom cost gate=1 delay=2` 与探针 `prototype gates=1 delay=2` 两次独立确认）。
+
+`add_cost__modelZscores_u2110(kind, pair)` 不是“写入某 kind 的门数/延迟”：
+它对不被 `0x140526840` 位图排除的 kind 调用 `insert_cost__modelZscores_u49`，
+在 `component_cost_buffer` 里插入一条表项，并把 `component_costs[k]`（k > kind）
+的起始下标整体右移。而 `get_delay_cost` 的 0x4e 分支只读原型字段，
+**所以这条插入对自定义实例的延迟没有影响**。这解释了此前“插入成功但总延迟不变”。
+
+总延迟的算法：`preorder__modelZsimulationZpreorder_u8749`（0x140180d00）在
+`0x140184905` 对每个元件调用 `get_cost`，把“入线延迟最大值 + 本元件延迟”写回
+端口项 `+0x38`，并在 `+0x20` 里维护最大值（0x1401848dc / 0x1401849ac）。
+这条链路上的延迟增量就是 `get_cost(...).delay`，对自定义元件即 `prototype+0x138`。
+
+界面上的分数不是实时求和：它来自编译/预排序结果。调用链是
+`main -> preorder_from_frontend__presenterZutilities_u17092`（0x140316750）
+→ 编译线程 → `await_build_result__modelZutilities_u6541`（0x1402ce2a0）
+→ `try_update_preorder_result__modelZsimulationZcompile95thread_u3045`（0x140262370），
+结果经响应通道回填。`build_scores__presenterZboard95uiZmenu95bar_u886`（0x14045b4f0）
+只负责显示：门数取 `[score+0]`、延迟取 `[score+8]`、`[score+0x20]` 是字节标志。
+
+旁证（已执行）：`tests/component-cost-playtest.ps1` 在隔离沙箱里直接调用
+`load_level` 装载关卡并跑 8 个周期，三种模式（内置 AND／自定义 plain／自定义 insert）
+的 `build_scores` 全部读到 `gates=0 delay=0`，连**内置 AND** 也是 0。
+说明脱离 UI 的 `load_level` 路径不会产生 build result，因此不能用来判定
+“总延迟是否计入自定义元件”。后续判定必须在真实 UI 流程里做。
+
+为此新增诊断 Mod `dist/dev.cost-watch.mod`（源码 `tests/cost-watch.cpp`，
+只挂钩子、不修改状态，日志前缀 `cost-watch:`）。它同时观测 `get_cost`、
+`get_delay_cost_u2316`、`get_gate_cost_u2560`、`preorder_u8749` 与 `build_scores`，
+并周期性打印界面正在显示的 `gates/delay`、各 kind 的代价返回值以及原型字段。
