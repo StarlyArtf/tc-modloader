@@ -112,6 +112,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `TCPrototypeBuilder` 封装“复制模板 → 调整已核实字段 → 注册为自定义元件”的工作流；未反推出的身份字段仍可通过 `setRawField` 写入。
 - `TCGameModel::removeAllCustomPrototypes()` 可清空当前自定义元件表。
 - `TCGameModel::builtinPrototypeName(kind)`／`builtinPrototypeDescription(kind)` 直接返回内置元件的名称/描述。
+- `TCGameModel::builtinPrototypeShapeSvg(kind)` 直接返回内置元件的 SVG 形状。
 - 已验证 `Prototype +0x10` 为名称、`+0x28` 为描述；`setPrototypeName`／`setPrototypeDescription` 以及 Builder 的 `setName`／`setDescription` 使用游戏 `rawNewString` 分配 Nim 字符串。
 - 已验证 `Prototype +0xb0` 为 SVG 形状/图标字符串，提供 `prototypeShapeSvg`／`setPrototypeShapeSvg`；`+0x40`、`+0x48` 作为分类/布局候选字段先以 `prototypeCategoryRaw`、`prototypeFlagsRaw` 暴露原始值。
 - 新增 `tc_board_model.h`：通过 `selected_components`／`selected_wires` 和游戏自身的 `contains__modelZboardZboard_u1842` 查询元件/导线是否被选中，避免手写解析 Nim HashSet。

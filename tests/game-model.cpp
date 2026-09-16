@@ -59,6 +59,7 @@ alignas(8) unsigned char gLevelPayload[16]{};
 alignas(8) unsigned char gSchematicPayload[16]{};
 alignas(8) unsigned char gFakeNamePayload[16]{};
 alignas(8) unsigned char gFakeDescPayload[16]{};
+alignas(8) unsigned char gFakeSvgPayload[32]{};
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
 std::set<uint64_t> gPrevSelectedComponentIds;
@@ -123,6 +124,11 @@ void fakeGetPrototype(const void* key, void* out) {
     desc.data = gFakeDescPayload;
     std::memcpy(gFakeDescPayload + 8, "Desc", 4);
     std::memcpy(prototype->bytes + tc::kPrototypeDescriptionOffset, &desc, sizeof(desc));
+    tc::TCNimString svg{};
+    svg.length = 4;
+    svg.data = gFakeSvgPayload;
+    std::memcpy(gFakeSvgPayload + 8, "<svg", 4);
+    std::memcpy(prototype->bytes + tc::kPrototypeShapeSvgOffset, &svg, sizeof(svg));
 }
 
 void fakeGetCustomPrototype(uint64_t custom_id, void* out) {
@@ -593,7 +599,8 @@ int main() {
         return 1;
     }
     if (std::strcmp(model.builtinPrototypeName(0x52), "Builtin") != 0 ||
-        std::strcmp(model.builtinPrototypeDescription(0x52), "Desc") != 0) {
+        std::strcmp(model.builtinPrototypeDescription(0x52), "Desc") != 0 ||
+        std::strcmp(model.builtinPrototypeShapeSvg(0x52), "<svg") != 0) {
         std::cerr << "built-in prototype name/description query mismatch\n";
         return 1;
     }
