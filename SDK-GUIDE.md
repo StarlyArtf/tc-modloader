@@ -106,6 +106,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - `TCPrototypeBuilder` 封装“复制模板 → 调整已核实字段 → 注册为自定义元件”的工作流；未反推出的身份字段仍可通过 `setRawField` 写入。
 - 已验证 `Prototype +0x10` 为名称、`+0x28` 为描述；`setPrototypeName`／`setPrototypeDescription` 以及 Builder 的 `setName`／`setDescription` 使用游戏 `rawNewString` 分配 Nim 字符串。
 - 已验证 `Prototype +0xb0` 为 SVG 形状/图标字符串，提供 `prototypeShapeSvg`／`setPrototypeShapeSvg`；`+0x40`、`+0x48` 作为分类/布局候选字段先以 `prototypeCategoryRaw`、`prototypeFlagsRaw` 暴露原始值。
+- 新增 `tc_board_model.h`：通过 `selected_components`／`selected_wires` 和游戏自身的 `contains__modelZboardZboard_u1842` 查询元件/导线是否被选中，避免手写解析 Nim HashSet。
 - `get_input_word_size`／`get_output_word_size` 只在提供合法内置 kind 时调用，封装默认传 `AUTO_SIZE` 对象地址作为期望宽度。
 - `custom_prototypes_set(id, prototype)`／`custom_prototypes_del(id)` 是已核实的低层注册原语，`in_custom_prototypes`／`notin_custom_prototypes` 用于查询，`customPrototypeCount()` 读取 `cc_length`，`customPrototypeIdAt(index)` 读取 `cc_live_values` 中的 ID。
 - `TCGameModel::setCustomPrototype` 会深拷贝传入的 `TCPrototype`，调用后原对象可以释放。

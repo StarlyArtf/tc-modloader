@@ -1,4 +1,5 @@
 #include "../sdk/tc_game_model.h"
+#include "../sdk/tc_board_model.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
@@ -21,6 +22,10 @@ std::vector<uint64_t> gCustomIds;
 alignas(16) unsigned char gCustomLiveValues[16 * 16]{};
 alignas(16) unsigned char gPrototypeTable[16]{};
 alignas(16) unsigned char gPrototypeBuckets[4 * tc::kPrototypeBucketStride]{};
+alignas(8) unsigned char gSelectedComponents[24]{};
+alignas(8) unsigned char gSelectedWires[24]{};
+std::set<uint64_t> gSelectedComponentIds;
+std::set<uint64_t> gSelectedWireIds;
 
 void setupPrototypeTable() {
     uint64_t length = 4;
@@ -133,6 +138,12 @@ uint8_t fakeNotContainsCustomPrototype(uint64_t id) {
     return gCustomPrototypes.count(id) ? 0 : 1;
 }
 
+uint8_t fakeBoardContains(const void* set, uint64_t id) {
+    if (set == gSelectedComponents) return gSelectedComponentIds.count(id) ? 1 : 0;
+    if (set == gSelectedWires) return gSelectedWireIds.count(id) ? 1 : 0;
+    return 0;
+}
+
 void* fakeResolve(void*, const char* name) {
     std::string symbol(name ? name : "");
     if (symbol ==
@@ -186,6 +197,15 @@ void* fakeResolve(void*, const char* name) {
         "cc_live_values__modelZboardZcustom95prototype95list_u7") {
         return gCustomLiveValues;
     }
+    if (symbol == "selected_components__modelZboardZboard_u22") {
+        return gSelectedComponents;
+    }
+    if (symbol == "selected_wires__modelZboardZboard_u30") {
+        return gSelectedWires;
+    }
+    if (symbol == "contains__modelZboardZboard_u1842") {
+        return reinterpret_cast<void*>(&fakeBoardContains);
+    }
     return nullptr;
 }
 
@@ -216,6 +236,19 @@ int main() {
     }
     if (!model.stringAllocValid()) {
         std::cerr << "model did not resolve rawNewString\n";
+        return 1;
+    }
+
+    tc::TCBoardModel board;
+    if (!board.load(&host) || !board.valid()) {
+        std::cerr << "board model did not resolve\n";
+        return 1;
+    }
+    gSelectedComponentIds.insert(42);
+    gSelectedWireIds.insert(7);
+    if (!board.isComponentSelected(42) || board.isComponentSelected(1) ||
+        !board.isWireSelected(7) || board.isWireSelected(42)) {
+        std::cerr << "board selection query mismatch\n";
         return 1;
     }
     if (!model.mutationValid()) {
