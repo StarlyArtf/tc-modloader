@@ -109,6 +109,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - 新增 `tc_board_model.h`：通过 `selected_components`／`selected_wires` 和游戏自身的 `contains__modelZboardZboard_u1842` 查询元件/导线是否被选中，避免手写解析 Nim HashSet。
 - `TCBoardModel` 同时接入 `prev_selected_components`／`prev_selected_wires`，可用于检测选中变化。
 - `TCBoardModel` 通过 `len__modelZboardZboard_u19087` 提供当前/上一帧选中元件和导线数量。
+- `TCBoardModel` 现在可以枚举当前/上一帧选中的元件 ID 和导线 ID。
 - 新增 `tc_game_state.h`：读取 `is_campaign`、`level_progress`、`campaign_name`、`simulation_circuit_state` 等全局游戏状态。
 - 新增 `tc_simulation.h`：封装 `sim_do`、`sim_get_cycle`、`simulation_settings`、`get/set_command_setting`，支持提交仿真命令、读取/修改命令设置。
 - 新增 `tc_wire_model.h`：封装导线读取、取色、添加、放置和更新函数，以及 `INVALID_WIRE_ID`。

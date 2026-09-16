@@ -13,6 +13,7 @@
 
 #include "tc_mod_api.h"
 #include <stdint.h>
+#include <string.h>
 
 namespace tc {
 
@@ -93,6 +94,49 @@ struct TCBoardModel {
         return valid() && hasPreviousSelection()
                    ? len(prev_selected_wires)
                    : 0;
+    }
+
+    uint64_t selectedComponentIdAt(uint64_t index) const {
+        return setIdAt(selected_components, index);
+    }
+
+    uint64_t selectedWireIdAt(uint64_t index) const {
+        return setIdAt(selected_wires, index);
+    }
+
+    uint64_t previousSelectedComponentIdAt(uint64_t index) const {
+        return setIdAt(prev_selected_components, index);
+    }
+
+    uint64_t previousSelectedWireIdAt(uint64_t index) const {
+        return setIdAt(prev_selected_wires, index);
+    }
+
+ private:
+    uint64_t setIdAt(const void* set, uint64_t index) const {
+        if (!set || !len || index >= len(set)) return 0;
+        uint64_t capacity = 0;
+        void* data = nullptr;
+        memcpy(&capacity, set, sizeof(capacity));
+        memcpy(&data, static_cast<const unsigned char*>(set) + 8,
+               sizeof(data));
+        if (!data || capacity > 4096) return 0;
+
+        uint64_t seen = 0;
+        for (uint64_t i = 0; i < capacity; ++i) {
+            const auto* bucket =
+                static_cast<const unsigned char*>(data) + i * 0x20;
+            uint64_t hash = 0;
+            memcpy(&hash, bucket + 0x08, sizeof(hash));
+            if (hash == 0) continue;
+            if (seen == index) {
+                uint64_t id = 0;
+                memcpy(&id, bucket + 0x10, sizeof(id));
+                return id;
+            }
+            ++seen;
+        }
+        return 0;
     }
 };
 

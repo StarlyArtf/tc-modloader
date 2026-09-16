@@ -30,6 +30,10 @@ alignas(8) unsigned char gSelectedComponents[24]{};
 alignas(8) unsigned char gSelectedWires[24]{};
 alignas(8) unsigned char gPrevSelectedComponents[24]{};
 alignas(8) unsigned char gPrevSelectedWires[24]{};
+alignas(8) unsigned char gSelectedComponentBuckets[4 * 0x20]{};
+alignas(8) unsigned char gSelectedWireBuckets[4 * 0x20]{};
+alignas(8) unsigned char gPrevSelectedComponentBuckets[4 * 0x20]{};
+alignas(8) unsigned char gPrevSelectedWireBuckets[4 * 0x20]{};
 uint8_t gIsCampaign = 1;
 alignas(8) unsigned char gLevelProgress[16]{};
 alignas(8) unsigned char gCampaignName[64]{};
@@ -133,6 +137,20 @@ uint64_t fakeOutputWordSize(uint8_t kind, uint16_t pin_index,
     assert(kind == kBuiltInKind);
     assert(expected == &gAutoSize);
     return static_cast<uint64_t>(kind) * 1000 + pin_index;
+}
+
+void setupBoardSet(unsigned char* object, unsigned char* buckets,
+                   const std::vector<uint64_t>& ids) {
+    uint64_t capacity = 4;
+    std::memcpy(object, &capacity, sizeof(capacity));
+    void* data = buckets;
+    std::memcpy(object + 8, &data, sizeof(data));
+    std::memset(buckets, 0, 4 * 0x20);
+    for (std::size_t i = 0; i < ids.size() && i < 4; ++i) {
+        uint64_t hash = i + 1;
+        std::memcpy(buckets + i * 0x20 + 0x08, &hash, sizeof(hash));
+        std::memcpy(buckets + i * 0x20 + 0x10, &ids[i], sizeof(ids[i]));
+    }
 }
 
 void fakeRawNewString(void* out, int64_t length) {
@@ -366,6 +384,10 @@ int main() {
                   "Prototype size changed");
     static_assert(sizeof(tc::TCPin) == 0x38, "Pin size changed");
     setupPrototypeTable();
+    setupBoardSet(gSelectedComponents, gSelectedComponentBuckets, {42});
+    setupBoardSet(gSelectedWires, gSelectedWireBuckets, {7});
+    setupBoardSet(gPrevSelectedComponents, gPrevSelectedComponentBuckets, {43});
+    setupBoardSet(gPrevSelectedWires, gPrevSelectedWireBuckets, {8});
     tc::TCNimString levelString{};
     levelString.length = 2;
     levelString.data = gLevelPayload;
@@ -476,8 +498,12 @@ int main() {
         board.isWirePreviouslySelected(7) ||
         board.selectedComponentCount() != 1 ||
         board.selectedWireCount() != 1 ||
+        board.selectedComponentIdAt(0) != 42 ||
+        board.selectedWireIdAt(0) != 7 ||
         board.previousSelectedComponentCount() != 1 ||
-        board.previousSelectedWireCount() != 1) {
+        board.previousSelectedWireCount() != 1 ||
+        board.previousSelectedComponentIdAt(0) != 43 ||
+        board.previousSelectedWireIdAt(0) != 8) {
         std::cerr << "board selection query mismatch\n";
         return 1;
     }
