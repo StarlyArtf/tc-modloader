@@ -160,6 +160,12 @@ void fakeGetCustomPrototype(uint64_t custom_id, void* out) {
     std::memcpy(gFakeDescPayload + 8, "Custom", 6);
     gFakeDescPayload[14] = 0;
     std::memcpy(prototype->bytes + tc::kPrototypeDescriptionOffset, &desc, sizeof(desc));
+    tc::TCNimString svg{};
+    svg.length = 4;
+    svg.data = gFakeSvgPayload;
+    std::memcpy(gFakeSvgPayload + 8, "<svg", 4);
+    gFakeSvgPayload[12] = 0;
+    std::memcpy(prototype->bytes + tc::kPrototypeShapeSvgOffset, &svg, sizeof(svg));
 }
 
 uint64_t fakeInputWordSize(uint8_t kind, uint16_t pin_index,
@@ -642,7 +648,8 @@ int main() {
         return 1;
     }
     if (std::strcmp(model.customPrototypeName(kCustomId), "Custom") != 0 ||
-        std::strcmp(model.customPrototypeDescription(kCustomId), "Custom") != 0) {
+        std::strcmp(model.customPrototypeDescription(kCustomId), "Custom") != 0 ||
+        std::strcmp(model.customPrototypeShapeSvg(kCustomId), "<svg") != 0) {
         std::cerr << "custom prototype name/description query mismatch\n";
         return 1;
     }
