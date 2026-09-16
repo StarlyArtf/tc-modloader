@@ -266,14 +266,17 @@ int main() {
         return 1;
     }
     if (!builder.setName("My Gate") ||
-        !builder.setDescription("Custom gate")) {
+        !builder.setDescription("Custom gate") ||
+        !builder.setShapeSvg("<svg viewBox=\"0 0 1 1\"/>")) {
         std::cerr << "prototype builder string assignment failed\n";
         return 1;
     }
     if (std::strcmp(tc::prototypeNameCStr(builder.prototype()), "My Gate") != 0 ||
         std::strcmp(tc::prototypeDescriptionCStr(builder.prototype()),
-                    "Custom gate") != 0) {
-        std::cerr << "prototype name/description mismatch\n";
+                    "Custom gate") != 0 ||
+        std::strcmp(tc::prototypeShapeSvgCStr(builder.prototype()),
+                    "<svg viewBox=\"0 0 1 1\"/>") != 0) {
+        std::cerr << "prototype string field mismatch\n";
         return 1;
     }
     tc::TCPin builderPins[2]{};

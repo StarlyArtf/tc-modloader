@@ -38,6 +38,13 @@ namespace tc {
 // custom-prototype branch and causes the uint16_t at +0x188 to be used as the
 // custom prototype ID.
 enum : uint8_t { kPrototypeKindCustom = 0x4e };
+enum : size_t {
+    kPrototypeNameOffset = 0x10,
+    kPrototypeDescriptionOffset = 0x28,
+    kPrototypeCategoryRawOffset = 0x40,
+    kPrototypeFlagsRawOffset = 0x48,
+    kPrototypeShapeSvgOffset = 0xb0
+};
 enum : uint64_t {
     kPrototypeBucketStride = 0x5b8,
     kPrototypeBucketHashOffset = 0x08,
@@ -345,7 +352,12 @@ struct TCGameModel {
 
     bool setPrototypeDescription(TCPrototype& prototype,
                                  const char* utf8) const {
-        return setPrototypeString(prototype, utf8, 0x28);
+        return setPrototypeString(prototype, utf8, kPrototypeDescriptionOffset);
+    }
+
+    bool setPrototypeShapeSvg(TCPrototype& prototype,
+                              const char* utf8) const {
+        return setPrototypeString(prototype, utf8, kPrototypeShapeSvgOffset);
     }
 
     bool setPrototypeString(TCPrototype& prototype, const char* utf8,
@@ -426,15 +438,34 @@ inline uint64_t pinWordSizeRaw(const TCPin& pin) {
 
 inline TCNimString prototypeName(const TCPrototype& p) {
     TCNimString value{};
-    memcpy(&value.length, p.bytes + 0x10, sizeof(value.length));
-    memcpy(&value.data, p.bytes + 0x18, sizeof(value.data));
+    memcpy(&value.length, p.bytes + kPrototypeNameOffset, sizeof(value.length));
+    memcpy(&value.data, p.bytes + kPrototypeNameOffset + 8, sizeof(value.data));
     return value;
 }
 
 inline TCNimString prototypeDescription(const TCPrototype& p) {
     TCNimString value{};
-    memcpy(&value.length, p.bytes + 0x28, sizeof(value.length));
-    memcpy(&value.data, p.bytes + 0x30, sizeof(value.data));
+    memcpy(&value.length, p.bytes + kPrototypeDescriptionOffset, sizeof(value.length));
+    memcpy(&value.data, p.bytes + kPrototypeDescriptionOffset + 8, sizeof(value.data));
+    return value;
+}
+
+inline TCNimString prototypeShapeSvg(const TCPrototype& p) {
+    TCNimString value{};
+    memcpy(&value.length, p.bytes + kPrototypeShapeSvgOffset, sizeof(value.length));
+    memcpy(&value.data, p.bytes + kPrototypeShapeSvgOffset + 8, sizeof(value.data));
+    return value;
+}
+
+inline uint64_t prototypeCategoryRaw(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeCategoryRawOffset, sizeof(value));
+    return value;
+}
+
+inline uint64_t prototypeFlagsRaw(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeFlagsRawOffset, sizeof(value));
     return value;
 }
 
@@ -445,6 +476,11 @@ inline const char* prototypeNameCStr(const TCPrototype& p) {
 
 inline const char* prototypeDescriptionCStr(const TCPrototype& p) {
     TCNimString value = prototypeDescription(p);
+    return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
+}
+
+inline const char* prototypeShapeSvgCStr(const TCPrototype& p) {
+    TCNimString value = prototypeShapeSvg(p);
     return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
 }
 
@@ -486,6 +522,10 @@ class TCPrototypeBuilder {
 
     bool setDescription(const char* utf8) {
         return model_->setPrototypeDescription(prototype_, utf8);
+    }
+
+    bool setShapeSvg(const char* utf8) {
+        return model_->setPrototypeShapeSvg(prototype_, utf8);
     }
 
     void setRawField(size_t offset, const void* data, size_t size) {
