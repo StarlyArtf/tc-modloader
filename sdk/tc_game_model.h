@@ -238,6 +238,18 @@ struct TCGameModel {
         return prototypeShapeSvgCStr(prototype);
     }
 
+    const char* customPrototypeName(uint64_t custom_id) const {
+        TCPrototype prototype{};
+        if (!getCustomPrototype(custom_id, prototype)) return nullptr;
+        return prototypeNameCStr(prototype);
+    }
+
+    const char* customPrototypeDescription(uint64_t custom_id) const {
+        TCPrototype prototype{};
+        if (!getCustomPrototype(custom_id, prototype)) return nullptr;
+        return prototypeDescriptionCStr(prototype);
+    }
+
     uint64_t inputWordSize(uint8_t kind, uint16_t pin_index) const {
         if (!wordSizeValid()) return 0;
         return get_input_word_size(kind, pin_index, auto_size);

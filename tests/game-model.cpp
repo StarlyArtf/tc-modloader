@@ -120,16 +120,19 @@ void fakeGetPrototype(const void* key, void* out) {
     name.length = 7;
     name.data = gFakeNamePayload;
     std::memcpy(gFakeNamePayload + 8, "Builtin", 7);
+    gFakeNamePayload[15] = 0;
     std::memcpy(prototype->bytes + tc::kPrototypeNameOffset, &name, sizeof(name));
     tc::TCNimString desc{};
     desc.length = 4;
     desc.data = gFakeDescPayload;
     std::memcpy(gFakeDescPayload + 8, "Desc", 4);
+    gFakeDescPayload[12] = 0;
     std::memcpy(prototype->bytes + tc::kPrototypeDescriptionOffset, &desc, sizeof(desc));
     tc::TCNimString svg{};
     svg.length = 4;
     svg.data = gFakeSvgPayload;
     std::memcpy(gFakeSvgPayload + 8, "<svg", 4);
+    gFakeSvgPayload[12] = 0;
     std::memcpy(prototype->bytes + tc::kPrototypeShapeSvgOffset, &svg, sizeof(svg));
 }
 
@@ -145,6 +148,18 @@ void fakeGetCustomPrototype(uint64_t custom_id, void* out) {
     writePtr(prototype->bytes + 0x68, inputs);
     writeU64(prototype->bytes + 0x80, 0);
     writePtr(prototype->bytes + 0x88, nullptr);
+    tc::TCNimString name{};
+    name.length = 6;
+    name.data = gFakeNamePayload;
+    std::memcpy(gFakeNamePayload + 8, "Custom", 6);
+    gFakeNamePayload[14] = 0;
+    std::memcpy(prototype->bytes + tc::kPrototypeNameOffset, &name, sizeof(name));
+    tc::TCNimString desc{};
+    desc.length = 6;
+    desc.data = gFakeDescPayload;
+    std::memcpy(gFakeDescPayload + 8, "Custom", 6);
+    gFakeDescPayload[14] = 0;
+    std::memcpy(prototype->bytes + tc::kPrototypeDescriptionOffset, &desc, sizeof(desc));
 }
 
 uint64_t fakeInputWordSize(uint8_t kind, uint16_t pin_index,
@@ -624,6 +639,11 @@ int main() {
         std::strcmp(model.builtinPrototypeDescription(0x52), "Desc") != 0 ||
         std::strcmp(model.builtinPrototypeShapeSvg(0x52), "<svg") != 0) {
         std::cerr << "built-in prototype name/description query mismatch\n";
+        return 1;
+    }
+    if (std::strcmp(model.customPrototypeName(kCustomId), "Custom") != 0 ||
+        std::strcmp(model.customPrototypeDescription(kCustomId), "Custom") != 0) {
+        std::cerr << "custom prototype name/description query mismatch\n";
         return 1;
     }
 
