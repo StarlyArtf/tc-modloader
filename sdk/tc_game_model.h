@@ -72,6 +72,10 @@ struct TCNimString {
     void* data;
 };
 
+inline const char* prototypeNameCStr(const TCPrototype& p);
+inline const char* prototypeDescriptionCStr(const TCPrototype& p);
+inline const char* prototypeShapeSvgCStr(const TCPrototype& p);
+
 // Input/output pin entries in a Prototype are each 0x38 bytes.  The raw word
 // size value is the 8 bytes at +0x10 (verified in get_input_word_size and
 // get_output_word_size).
@@ -208,6 +212,18 @@ struct TCGameModel {
                                  TCPrototype& out) const {
         if (!cloneBuiltinPrototype(kind, out)) return false;
         return setCustomPrototype(custom_id, out);
+    }
+
+    const char* builtinPrototypeName(uint8_t kind) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return nullptr;
+        return prototypeNameCStr(prototype);
+    }
+
+    const char* builtinPrototypeDescription(uint8_t kind) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return nullptr;
+        return prototypeDescriptionCStr(prototype);
     }
 
     uint64_t inputWordSize(uint8_t kind, uint16_t pin_index) const {

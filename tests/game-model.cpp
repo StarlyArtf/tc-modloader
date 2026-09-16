@@ -55,6 +55,8 @@ alignas(8) unsigned char gLevelTls[16]{};
 alignas(8) unsigned char gSchematicTls[16]{};
 alignas(8) unsigned char gLevelPayload[16]{};
 alignas(8) unsigned char gSchematicPayload[16]{};
+alignas(8) unsigned char gFakeNamePayload[16]{};
+alignas(8) unsigned char gFakeDescPayload[16]{};
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
 std::set<uint64_t> gPrevSelectedComponentIds;
@@ -109,6 +111,16 @@ void fakeGetPrototype(const void* key, void* out) {
     writePtr(prototype->bytes + 0x68, inputs);
     writeU64(prototype->bytes + 0x80, 1);
     writePtr(prototype->bytes + 0x88, outputs);
+    tc::TCNimString name{};
+    name.length = 7;
+    name.data = gFakeNamePayload;
+    std::memcpy(gFakeNamePayload + 8, "Builtin", 7);
+    std::memcpy(prototype->bytes + tc::kPrototypeNameOffset, &name, sizeof(name));
+    tc::TCNimString desc{};
+    desc.length = 4;
+    desc.data = gFakeDescPayload;
+    std::memcpy(gFakeDescPayload + 8, "Desc", 4);
+    std::memcpy(prototype->bytes + tc::kPrototypeDescriptionOffset, &desc, sizeof(desc));
 }
 
 void fakeGetCustomPrototype(uint64_t custom_id, void* out) {
@@ -567,6 +579,11 @@ int main() {
     }
     if (model.cloneBuiltinPrototype(0x99, cloned)) {
         std::cerr << "unknown built-in prototype was accepted\n";
+        return 1;
+    }
+    if (std::strcmp(model.builtinPrototypeName(0x52), "Builtin") != 0 ||
+        std::strcmp(model.builtinPrototypeDescription(0x52), "Desc") != 0) {
+        std::cerr << "built-in prototype name/description query mismatch\n";
         return 1;
     }
 
