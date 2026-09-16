@@ -1,6 +1,14 @@
-# TC Mod Loader 0.3.0
+# TC Mod Loader 0.4.0
 
 这是支持修改游戏逻辑的原生代码 Mod 加载器，适用于 Windows x64《Turing Complete》2.1.334 的指定构建。
+
+## 0.4.0 新增
+
+- 电路封装元件的**声明延迟**现在会参与游戏的编译期时序统计：串联相加、并联取最长路径，嵌套在有声明延迟的外层元件内只计一次；元件内部逻辑照常展开执行。
+- 反馈环、多驱动、收缩后成环、非法数据或溢出时**保留游戏原生统计**，并写入 `Component timing: native timing retained...` 日志；未经验证的形状不会被套用规则。
+- SDK 新增 `setPrototypeGateCost` / `setPrototypeDelay` 与 `TCPrototypeBuilder::setDesignCost`，用于写入定义头里的 `(门数, 延迟)`。游戏解析时会重算门数，但**原样保留延迟**，所以定义文件必须携带真实关键路径。
+- 新增诊断与工具：`dev.cost-watch.mod`（只挂钩子、把代价/延迟写入日志）、示例 Mod 的 `design-stats.txt` 覆盖开关、`python tools/circuit_format.py <circuit.data> --analyze` 设计期预检。
+- 回归：`tests/component-timing-playtest.ps1` 在隔离游戏副本中覆盖单件／串联／并联／声明 0／内置元件／嵌套／沙盒／元件工坊／多驱动共 9 个真机用例。
 
 ## 玩家使用
 
@@ -48,6 +56,15 @@ example.menu-demo.mod 是保留的旧版资源示例。
 example.circuit-and.mod 是电路封装元件示例。启动时注册一个两输入一输出、位宽为 1
 的 `AND2 Test` 自定义元件，并复用内置 AND 的外观图标。正常启动后，在 Sandbox 或
 Foundry 打开元件列表即可放置；在部分战役关卡中游戏会按自身规则禁止自定义元件。
+
+该示例同时写入定义头里的设计统计 `(1 门, 1 延迟)`。元件的"延迟"就是设计自身的关键
+路径，放置后整板延迟按声明值计入编译统计（本例与内置与门一致）。想对照验证，可把
+`tc-modloader-data/plugin-data/example.circuit-and/design-stats.txt` 写成 `1 5` 再重启：
+元件信息显示 5，单件板子的总延迟也是 5。
+
+dev.cost-watch.mod 是只读诊断包：挂钩游戏的代价与分数函数，把界面实际显示的
+`gates/delay`、各 kind 的返回值与原型字段周期性写进加载器日志（前缀 `cost-watch:`），
+不修改任何游戏状态。排查"延迟没被计入"一类问题时使用。
 
 ## 开发能力
 
@@ -111,7 +128,7 @@ Turing Complete.exe：
 
 Windows x64 + MinGW-w64，默认 C:\msys64\ucrt64\bin，可通过 TC_MINGW_BIN 指定。
 
-修改和构建加载器时，先解压分发包中的 TCModLoader-0.3.0-source.zip；完整示例源码也在该源码包中。
+修改和构建加载器时，先解压分发包中的 TCModLoader-0.4.0-source.zip；完整示例源码也在该源码包中。
 
 依次执行 build.ps1、node tests/run.js、tests/native.ps1、tests/saves.ps1、tests/setup.ps1、package.ps1。验证电路封装 AND fixture 时，在 build.ps1 后执行 tests/and-component-playtest.ps1；验证元件菜单放置路径时执行 tests/component-placement-playtest.ps1；验证保存电路重启重载时执行 tests/component-persistence-playtest.ps1。
 

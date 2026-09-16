@@ -22,7 +22,7 @@ static void init(){if(attempted)return;attempted=true;wchar_t buf[32768];GetModu
  compatible=tc::hash(tc::read(buf))==TC_EXE_SHA && tc::hash(tc::read(gameRoot/L"tc_game_engine.dll"))==TC_ENGINE_SHA;
  if(!compatible)throw std::runtime_error("Unsupported game build. Reinstall a compatible loader.");
  saves=std::make_unique<tc::SaveProfiles>(gameRoot);
- core=std::make_unique<tc::Core>(gameRoot);core->scan();selected=core->enabled_set();nativeRuntime=std::make_unique<tc::NativeRuntime>(*core,engine,[](const std::string& s){log(s);});log(std::string("TC Mod Loader 0.3.0; ImGui ")+api<const char*(*)()>("igGetVersion")());log("Isolated save directory: "+saves->path(tc_save_boot::profile).u8string());
+ core=std::make_unique<tc::Core>(gameRoot);core->scan();selected=core->enabled_set();nativeRuntime=std::make_unique<tc::NativeRuntime>(*core,engine,[](const std::string& s){log(s);});log(std::string("TC Mod Loader 0.4.0; ImGui ")+api<const char*(*)()>("igGetVersion")());log("Isolated save directory: "+saves->path(tc_save_boot::profile).u8string());
  }catch(const std::exception& e){error=e.what();log(error);}}
 static void text(const std::string& s){api<void(*)(const char*,const char*)>("igTextUnformatted")(s.c_str(),nullptr);}
 static bool button(const char* label,V2 size={0,0}){return api<bool(*)(const char*,V2)>("igButton")(label,size);}
@@ -45,7 +45,7 @@ static void draw(){
  if(!open)managerOpen=false;
  if(visible) {
   api<void(*)(float)>("igSetWindowFontScale")(0.64f*scale);
-  text("TC MOD LOADER  /  0.3.0  /  NATIVE API 1");
+ text("TC MOD LOADER  /  0.4.0  /  NATIVE API 1");
   text("将 .mod 文件放入游戏目录的 mods 文件夹，重新打开此页即可识别。");
   text("支持原生代码 Mod：函数 Hook、游戏接口调用、每帧逻辑与自定义面板。");
   text("勾选后点击“应用更改”，重启游戏后完整生效。同一文件的冲突会被拦截。");

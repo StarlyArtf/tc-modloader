@@ -218,6 +218,17 @@ Nim 静态字符串：游戏可能共享而不是复制这种内存。原 `setPr
 示例 `design-stats.txt` 的 `1 5` 可保留作为对照：单个 AND2 应显示 1 门、总延迟 5；
 两个串联应为 2 门、10；两个并联应为 2 门、5。
 
+真机回归见 `tests/component-timing-playtest.ps1`（单件／串联／并联／声明 0／内置元件／
+嵌套／沙盒／元件工坊／多驱动，共 9 例）。设计期预检用
+`python tools/circuit_format.py <circuit.data> --analyze`：可计算时报
+`POLICY=verified gates=<n> delay=<n>`，遇到未验证的 kind、多驱动或环时报
+`POLICY=keep_native`。诊断观察包 `dev.cost-watch.mod` 会把界面实际显示的分数、
+各 kind 的代价与原型字段写进加载器日志（前缀 `cost-watch:`）。
+
+注意：定义头里的两个 i64 是设计自身的缓存 `(门数, 延迟)`。游戏解析时会重算门数、
+但原样保留延迟，因此必须写入真实关键路径；对照值可参考游戏自带工坊元件
+（`4or=(3,2)`、`8or=(7,3)`、`1and8=(8,1)`、`half-add=(4,2)`）。
+
 ## 编译和打包
 
 使用 MSVC 或 MinGW-w64 构建 x64 DLL，建议静态链接编译器运行库，或将依赖 DLL 放在入口 DLL 同目录。
