@@ -42,7 +42,9 @@ static void text(const std::string&s){proc<void(*)(const char*,const char*)>("ig
 static bool button(const char* s){return proc<bool(*)(const char*,V2)>("igButton")(s,{0,0});}
 static void same(){proc<void(*)(float,float)>("igSameLine")(0,-1);}
 static void drawToolbar(int64_t now,bool ready){
- proc<void(*)(V2,int)>("igSetNextWindowPos")({12,12},1);
+ float w=proc<float(*)()>("igGetWindowWidth")();
+ proc<void(*)(V2,int)>("igSetNextWindowSize")({240,0},1);
+ proc<void(*)(V2,int)>("igSetNextWindowPos")({w-250,54},1);
  bool open=true;
  if(proc<bool(*)(const char*,bool*,int)>("igBegin")("周期运行守卫 · 工具条###TCCycleGuardToolbar",&open,kToolbarFlags)){
   proc<void(*)(float)>("igSetWindowFontScale")(0.62f);
@@ -87,7 +89,7 @@ static void frame(void*,const TCFrame* frameInfo){
 extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h,TCPlugin* out){
  if(!h||h->api_version!=1||h->size<sizeof(TCHost)||!out||out->size<sizeof(TCPlugin))return 1;host=h;
  gameSim=symbol<SimDo>("sim_do__modelZsimulationZcompile95thread_u3036");getCycle=symbol<int64_t(*)()>("sim_get_cycle__modelZsimulationZcompile95thread_u3041");settings=symbol<void**>("simulation_settings__modelZsimulator95types_u83");if(!gameSim||!getCycle||!settings)return 2;
- for(auto n:{"igBegin","igEnd","igSetNextWindowPos","igSetNextWindowSize","igSetWindowFontScale","igTextUnformatted","igButton","igSameLine","igCheckbox","igBeginDisabled","igEndDisabled","igPushTextWrapPos","igPopTextWrapPos"})if(!h->engine_proc(h->context,n))return 3;
+ for(auto n:{"igBegin","igEnd","igSetNextWindowPos","igSetNextWindowSize","igSetWindowFontScale","igGetWindowWidth","igTextUnformatted","igButton","igSameLine","igCheckbox","igBeginDisabled","igEndDisabled","igPushTextWrapPos","igPopTextWrapPos"})if(!h->engine_proc(h->context,n))return 3;
  if(h->create_hook(h->context,(void*)gameSim,(void*)intercepted,(void**)&original))return 4;
 #ifdef TC_GUARD_SELFTEST
  testStartTime=GetTickCount64();auto buttonTarget=h->resolve_symbol(h->context,"igInvisibleButton");if(h->create_hook(h->context,buttonTarget,(void*)testButton,(void**)&originalButton))return 5;
