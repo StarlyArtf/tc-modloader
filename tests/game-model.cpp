@@ -31,6 +31,8 @@ alignas(8) unsigned char gPrevSelectedComponentBuckets[4 * 0x20]{};
 alignas(8) unsigned char gPrevSelectedWireBuckets[4 * 0x20]{};
 uint8_t gIsCampaign = 1;
 uint64_t gCurrentWordSize = 8;
+uint64_t gLevelUsedInput = 3;
+uint64_t gLevelUsedOutputs = 4;
 alignas(8) unsigned char gLevelProgress[16]{};
 alignas(8) unsigned char gCampaignName[64]{};
 alignas(8) unsigned char gSimulationCircuitState[16]{};
@@ -342,6 +344,12 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "current_word_size__modelZmodel95types_u741") {
         return &gCurrentWordSize;
     }
+    if (symbol == "level_used_input__modelZsimulationZcontroller_u3") {
+        return &gLevelUsedInput;
+    }
+    if (symbol == "level_used_outputs__modelZsimulationZcontroller_u4") {
+        return &gLevelUsedOutputs;
+    }
     if (symbol == "sim_do__modelZsimulationZcompile95thread_u3036") {
         return reinterpret_cast<void*>(&fakeSimSubmit);
     }
@@ -466,7 +474,9 @@ int main() {
         state.campaignNamePtr() != gCampaignName ||
         std::strcmp(state.campaignNameCStr(), "Campaign") != 0 ||
         state.simulationCircuitState() != gSimulationCircuitState ||
-        state.currentWordSize() != 8) {
+        state.currentWordSize() != 8 ||
+        state.levelUsedInput() != 3 ||
+        state.levelUsedOutputs() != 4) {
         std::cerr << "game state model mismatch\n";
         return 1;
     }
