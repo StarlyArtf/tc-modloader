@@ -507,6 +507,16 @@ int main() {
         std::cerr << "simulation run command mismatch\n";
         return 1;
     }
+    sim.pause(nullptr);
+    if (gSimObservedCommand != 1) {
+        std::cerr << "simulation pause command mismatch\n";
+        return 1;
+    }
+    sim.reset(nullptr);
+    if (gSimObservedCommand != 2 || gSimObservedTarget != -1) {
+        std::cerr << "simulation reset command mismatch\n";
+        return 1;
+    }
     sim.setCommandSetting(2, 99);
     if (gSimSetting != 99) {
         std::cerr << "simulation setting update mismatch\n";

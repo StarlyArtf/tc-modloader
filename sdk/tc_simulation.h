@@ -72,6 +72,14 @@ struct TCSimulationModel {
         submitCommand(model, 0, target);
     }
 
+    void pause(void* model) const {
+        submitCommand(model, 1, 0);
+    }
+
+    void reset(void* model) const {
+        submitCommand(model, 2, -1);
+    }
+
     int64_t commandSetting(uint8_t key) const {
         return get_setting ? get_setting(key) : 0;
     }
