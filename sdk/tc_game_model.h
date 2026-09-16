@@ -43,7 +43,9 @@ enum : size_t {
     kPrototypeDescriptionOffset = 0x28,
     kPrototypeCategoryRawOffset = 0x40,
     kPrototypeFlagsRawOffset = 0x48,
-    kPrototypeShapeSvgOffset = 0xb0
+    kPrototypeShapeSvgOffset = 0xb0,
+    kPrototypeGateCostOffset = 0x130,
+    kPrototypeDelayOffset = 0x138
 };
 enum : uint64_t {
     kPrototypeBucketStride = 0x5b8,
@@ -97,6 +99,7 @@ using TCCustomPrototypeSetFn = void (*)(uint64_t custom_id,
                                         const void* prototype);
 using TCCustomPrototypeDelFn = void (*)(uint64_t custom_id);
 using TCCustomPrototypeContainsFn = uint8_t (*)(uint64_t custom_id);
+using TCAddCostFn = void (*)(uint8_t kind, const void* costs);
 
 struct TCGameModel {
     TCGetPrototypeFn get_prototype = nullptr;
@@ -113,6 +116,7 @@ struct TCGameModel {
     TCCustomPrototypeContainsFn notin_custom_prototypes = nullptr;
     const uint64_t* custom_prototype_count = nullptr;
     const void* custom_prototype_live_values = nullptr;
+    TCAddCostFn add_cost = nullptr;
 
     // Returns true when the essential prototype lookup functions resolved.
     bool valid() const {
@@ -165,6 +169,8 @@ struct TCGameModel {
             resolve("cc_length__modelZboardZcustom95prototype95list_u8"));
         custom_prototype_live_values =
             resolve("cc_live_values__modelZboardZcustom95prototype95list_u7");
+        add_cost = reinterpret_cast<TCAddCostFn>(
+            resolve("add_cost__modelZscores_u2110"));
         return true;
     }
 
@@ -410,6 +416,17 @@ struct TCGameModel {
         return true;
     }
 
+    // Insert a gate-cost/delay pair for a prototype kind.  The game builds
+    // this score table before native plugins load, so kinds registered by
+    // plugins (notably custom kind 0x4e) otherwise stay out of totals.
+    bool addComponentCost(uint8_t kind, uint64_t gate_cost,
+                          uint64_t delay_cost) const {
+        if (!add_cost) return false;
+        const uint64_t pair[2] = {gate_cost, delay_cost};
+        add_cost(kind, pair);
+        return true;
+    }
+
     void removeAllCustomPrototypes() const {
         while (customPrototypeCount() > 0) {
             removeCustomPrototype(customPrototypeIdAt(0));
@@ -541,6 +558,18 @@ inline uint64_t prototypeCategoryRaw(const TCPrototype& p) {
 inline uint64_t prototypeFlagsRaw(const TCPrototype& p) {
     uint64_t value = 0;
     memcpy(&value, p.bytes + kPrototypeFlagsRawOffset, sizeof(value));
+    return value;
+}
+
+inline uint64_t prototypeGateCost(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeGateCostOffset, sizeof(value));
+    return value;
+}
+
+inline uint64_t prototypeDelay(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeDelayOffset, sizeof(value));
     return value;
 }
 

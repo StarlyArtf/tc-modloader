@@ -1,5 +1,6 @@
 #include "../../sdk/tc_mod.h"
 #include "and_fixture.hpp"
+#include <cstring>
 #include <string>
 
 static const TCHost* host;
@@ -51,6 +52,8 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         log("circuit-and: shape update failed");
         return 7;
     }
+    const uint64_t gate_cost = tc::prototypeGateCost(prototype);
+    const uint64_t delay_cost = tc::prototypeDelay(prototype);
     if (!game.setCustomPrototype(imported.custom_id, prototype)) {
         log("circuit-and: prototype write failed");
         return 8;
@@ -58,6 +61,16 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     if (components.releasePrototype(prototype) != tc::TCComponentStatus::Ok) {
         log("circuit-and: snapshot release failed");
         return 9;
+    }
+
+    // Custom components share kind 0x4e, but the static score table built at
+    // game startup has no entry for it. Insert the prototype's verified
+    // gate-cost/delay pair so the UI's gate/delay totals include instances.
+    if ((gate_cost || delay_cost) &&
+        game.addComponentCost(0x4E, gate_cost, delay_cost)) {
+        log("circuit-and: inserted custom cost gate=" +
+            std::to_string(gate_cost) + " delay=" +
+            std::to_string(delay_cost));
     }
 
     log("circuit-and: registered AND2 Test id=" +

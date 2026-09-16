@@ -15,6 +15,9 @@ constexpr uint8_t kBuiltInKind = 7;
 constexpr uint64_t kCustomId = 0x123456789abc007bULL;
 
 uint64_t gAutoSize = 0x1020304050607080ULL;
+uint8_t gAddedCostKind = 0;
+uint64_t gAddedCostGate = 0;
+uint64_t gAddedCostDelay = 0;
 uint64_t gCustomCount = 0;
 std::map<uint64_t, tc::TCPrototype> gCustomPrototypes;
 std::vector<uint64_t> gCustomIds;
@@ -117,6 +120,8 @@ void fakeGetPrototype(const void* key, void* out) {
     writePtr(prototype->bytes + 0x68, inputs);
     writeU64(prototype->bytes + 0x80, 1);
     writePtr(prototype->bytes + 0x88, outputs);
+    writeU64(prototype->bytes + 0x130, 0x130);
+    writeU64(prototype->bytes + 0x138, 0x138);
     tc::TCNimString name{};
     name.length = 7;
     name.data = gFakeNamePayload;
@@ -149,6 +154,8 @@ void fakeGetCustomPrototype(uint64_t custom_id, void* out) {
     writePtr(prototype->bytes + 0x68, inputs);
     writeU64(prototype->bytes + 0x80, 0);
     writePtr(prototype->bytes + 0x88, nullptr);
+    writeU64(prototype->bytes + 0x130, 0x2130);
+    writeU64(prototype->bytes + 0x138, 0x2138);
     tc::TCNimString name{};
     name.length = 6;
     name.data = gFakeNamePayload;
@@ -227,6 +234,13 @@ uint8_t fakeContainsCustomPrototype(uint64_t id) {
 
 uint8_t fakeNotContainsCustomPrototype(uint64_t id) {
     return gCustomPrototypes.count(id) ? 0 : 1;
+}
+
+void fakeAddCost(uint8_t kind, const void* costs) {
+    const auto* pair = static_cast<const uint64_t*>(costs);
+    gAddedCostKind = kind;
+    gAddedCostGate = pair[0];
+    gAddedCostDelay = pair[1];
 }
 
 uint8_t fakeBoardContains(const void* set, uint64_t id) {
@@ -333,6 +347,9 @@ void* fakeResolve(void*, const char* name) {
     if (symbol ==
         "notin_custom_prototypes__modelZboardZcustom95prototype95list_u189") {
         return reinterpret_cast<void*>(&fakeNotContainsCustomPrototype);
+    }
+    if (symbol == "add_cost__modelZscores_u2110") {
+        return reinterpret_cast<void*>(&fakeAddCost);
     }
     if (symbol == "cc_length__modelZboardZcustom95prototype95list_u8") {
         return &gCustomCount;
@@ -771,6 +788,11 @@ int main() {
         std::cerr << "pin raw word size mismatch\n";
         return 1;
     }
+    if (tc::prototypeGateCost(builtin) != 0x130 ||
+        tc::prototypeDelay(builtin) != 0x138) {
+        std::cerr << "builtin cost/delay fields mismatch\n";
+        return 1;
+    }
     if (model.inputWordSize(kBuiltInKind, 4) != 704 ||
         model.outputWordSize(kBuiltInKind, 4) != 7004) {
         std::cerr << "word size wrapper mismatch\n";
@@ -786,6 +808,17 @@ int main() {
         tc::prototypeOutputCount(custom) != 0 ||
         tc::prototypeOutputPin(custom, 0) != nullptr) {
         std::cerr << "custom prototype fields mismatch\n";
+        return 1;
+    }
+    if (tc::prototypeGateCost(custom) != 0x2130 ||
+        tc::prototypeDelay(custom) != 0x2138) {
+        std::cerr << "custom cost/delay fields mismatch\n";
+        return 1;
+    }
+    if (!model.addComponentCost(0x4e, 11, 22) ||
+        gAddedCostKind != 0x4e || gAddedCostGate != 11 ||
+        gAddedCostDelay != 22) {
+        std::cerr << "component cost insertion mismatch\n";
         return 1;
     }
 
