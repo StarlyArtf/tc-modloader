@@ -109,6 +109,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - 新增 `tc_board_model.h`：通过 `selected_components`／`selected_wires` 和游戏自身的 `contains__modelZboardZboard_u1842` 查询元件/导线是否被选中，避免手写解析 Nim HashSet。
 - `TCBoardModel` 同时接入 `prev_selected_components`／`prev_selected_wires`，可用于检测选中变化。
 - 新增 `tc_game_state.h`：读取 `is_campaign`、`level_progress`、`campaign_name`、`simulation_circuit_state` 等全局游戏状态。
+- 新增 `tc_simulation.h`：封装 `sim_do`、`sim_get_cycle`、`simulation_settings`、`get/set_command_setting`，支持提交仿真命令、读取/修改命令设置。
 - `get_input_word_size`／`get_output_word_size` 只在提供合法内置 kind 时调用，封装默认传 `AUTO_SIZE` 对象地址作为期望宽度。
 - `custom_prototypes_set(id, prototype)`／`custom_prototypes_del(id)` 是已核实的低层注册原语，`in_custom_prototypes`／`notin_custom_prototypes` 用于查询，`customPrototypeCount()` 读取 `cc_length`，`customPrototypeIdAt(index)` 读取 `cc_live_values` 中的 ID。
 - `TCGameModel::setCustomPrototype` 会深拷贝传入的 `TCPrototype`，调用后原对象可以释放。

@@ -1,6 +1,7 @@
 #include "../sdk/tc_game_model.h"
 #include "../sdk/tc_board_model.h"
 #include "../sdk/tc_game_state.h"
+#include "../sdk/tc_simulation.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
@@ -31,6 +32,12 @@ uint8_t gIsCampaign = 1;
 alignas(8) unsigned char gLevelProgress[16]{};
 alignas(8) unsigned char gCampaignName[16]{};
 alignas(8) unsigned char gSimulationCircuitState[16]{};
+void* gSimulationSettingsValue = reinterpret_cast<void*>(1);
+void* gSimulationSettingsPointer = &gSimulationSettingsValue;
+int64_t gSimCycle = 100;
+int64_t gSimSetting = 7;
+int64_t gSimObservedTarget = -1;
+uint8_t gSimObservedCommand = 255;
 std::set<uint64_t> gSelectedComponentIds;
 std::set<uint64_t> gSelectedWireIds;
 std::set<uint64_t> gPrevSelectedComponentIds;
@@ -155,6 +162,23 @@ uint8_t fakeBoardContains(const void* set, uint64_t id) {
     return 0;
 }
 
+void fakeSimSubmit(void*, uint8_t command, int64_t target) {
+    gSimObservedCommand = command;
+    gSimObservedTarget = target;
+}
+
+int64_t fakeSimGetCycle() {
+    return gSimCycle;
+}
+
+int64_t fakeSimGetSetting(uint8_t) {
+    return gSimSetting;
+}
+
+void fakeSimSetSetting(uint8_t, int64_t value) {
+    gSimSetting = value;
+}
+
 void* fakeResolve(void*, const char* name) {
     std::string symbol(name ? name : "");
     if (symbol ==
@@ -235,6 +259,21 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "simulation_circuit_state__modelZsimulator95types_u78") {
         return gSimulationCircuitState;
     }
+    if (symbol == "sim_do__modelZsimulationZcompile95thread_u3036") {
+        return reinterpret_cast<void*>(&fakeSimSubmit);
+    }
+    if (symbol == "sim_get_cycle__modelZsimulationZcompile95thread_u3041") {
+        return reinterpret_cast<void*>(&fakeSimGetCycle);
+    }
+    if (symbol == "simulation_settings__modelZsimulator95types_u83") {
+        return &gSimulationSettingsPointer;
+    }
+    if (symbol == "get_command_setting__modelZsimulator95types_u124") {
+        return reinterpret_cast<void*>(&fakeSimGetSetting);
+    }
+    if (symbol == "set_command_setting__modelZsimulator95types_u131") {
+        return reinterpret_cast<void*>(&fakeSimSetSetting);
+    }
     return nullptr;
 }
 
@@ -280,6 +319,23 @@ int main() {
         state.campaignNamePtr() != gCampaignName ||
         state.simulationCircuitState() != gSimulationCircuitState) {
         std::cerr << "game state model mismatch\n";
+        return 1;
+    }
+
+    tc::TCSimulationModel sim;
+    if (!sim.load(&host) || !sim.valid() || !sim.settingsReady() ||
+        sim.cycle() != 100 || sim.commandSetting(2) != 7) {
+        std::cerr << "simulation model mismatch\n";
+        return 1;
+    }
+    sim.run(nullptr, 250);
+    if (gSimObservedCommand != 0 || gSimObservedTarget != 250) {
+        std::cerr << "simulation run command mismatch\n";
+        return 1;
+    }
+    sim.setCommandSetting(2, 99);
+    if (gSimSetting != 99) {
+        std::cerr << "simulation setting update mismatch\n";
         return 1;
     }
     gSelectedComponentIds.insert(42);
