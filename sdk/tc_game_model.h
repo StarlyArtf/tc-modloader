@@ -170,6 +170,24 @@ struct TCGameModel {
         return true;
     }
 
+    // Copy a verified built-in prototype into out.  This is the safe base for
+    // a programmatic custom component: copy it, adjust input/output pins and
+    // any other raw fields, then call setCustomPrototype().
+    bool cloneBuiltinPrototype(uint8_t kind, TCPrototype& out) const {
+        if (!isBuiltinPrototypeKind(kind)) return false;
+        return getPrototype(kind, 0, out);
+    }
+
+    // Convenience helper for the common template workflow.  The copied
+    // prototype is registered under custom_id; the caller should keep the
+    // returned out alive only as a working copy, since setCustomPrototype
+    // deep-copies it into the game's custom prototype table.
+    bool registerBuiltinAsCustom(uint8_t kind, uint64_t custom_id,
+                                 TCPrototype& out) const {
+        if (!cloneBuiltinPrototype(kind, out)) return false;
+        return setCustomPrototype(custom_id, out);
+    }
+
     uint64_t inputWordSize(uint8_t kind, uint16_t pin_index) const {
         if (!wordSizeValid()) return 0;
         return get_input_word_size(kind, pin_index, auto_size);

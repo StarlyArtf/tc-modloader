@@ -102,6 +102,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 - 每个引脚条目为 `0x38` 字节，原始 WordSize 在 `+0x10`。
 - `get_prototype(kind_ptr, out)` 和 `get_custom_prototype(custom_id, out)` 由 `TCGameModel::getPrototype` 封装。
 - `builtinPrototypeCount()`、`builtinPrototypeKindAt()`、`isBuiltinPrototypeKind()` 从 `PROTOTYPES` 哈希表安全枚举内置 kind，避免向 `getPrototype` 传入未知 key。
+- `cloneBuiltinPrototype(kind, out)` 复制一个已验证的内置元件模板；`registerBuiltinAsCustom(kind, custom_id, out)` 进一步把它写入自定义元件表。
 - `get_input_word_size`／`get_output_word_size` 只在提供合法内置 kind 时调用，封装默认传 `AUTO_SIZE` 对象地址作为期望宽度。
 - `custom_prototypes_set(id, prototype)`／`custom_prototypes_del(id)` 是已核实的低层注册原语，`in_custom_prototypes`／`notin_custom_prototypes` 用于查询，`customPrototypeCount()` 读取 `cc_length`，`customPrototypeIdAt(index)` 读取 `cc_live_values` 中的 ID。
 - `TCGameModel::setCustomPrototype` 会深拷贝传入的 `TCPrototype`，调用后原对象可以释放。

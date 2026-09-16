@@ -56,7 +56,7 @@ void writePtr(unsigned char* dst, void* value) {
 
 void fakeGetPrototype(const void* key, void* out) {
     const auto* kind = static_cast<const tc::TCPrototypeKind*>(key);
-    assert(kind->tag == kBuiltInKind);
+    assert(kind->tag != tc::kPrototypeKindCustom);
     assert(kind->custom_id == 0);
 
     static tc::TCPin inputs[2]{};
@@ -216,6 +216,32 @@ int main() {
         model.isBuiltinPrototypeKind(0x99) ||
         model.builtinPrototypeIndexForKind(0x5f) != 2) {
         std::cerr << "built-in prototype enumeration mismatch\n";
+        return 1;
+    }
+
+    tc::TCPrototype cloned{};
+    if (!model.cloneBuiltinPrototype(0x52, cloned) ||
+        tc::prototypeInputCount(cloned) != 2 ||
+        tc::prototypeOutputCount(cloned) != 1) {
+        std::cerr << "built-in prototype clone mismatch\n";
+        return 1;
+    }
+    if (model.cloneBuiltinPrototype(0x99, cloned)) {
+        std::cerr << "unknown built-in prototype was accepted\n";
+        return 1;
+    }
+
+    tc::TCPrototype registered{};
+    if (!model.registerBuiltinAsCustom(0x52, 777, registered) ||
+        !model.hasCustomPrototype(777) ||
+        model.customPrototypeCount() != 1) {
+        std::cerr << "built-in to custom registration mismatch\n";
+        return 1;
+    }
+    if (!model.removeCustomPrototype(777) ||
+        model.hasCustomPrototype(777) ||
+        model.customPrototypeCount() != 0) {
+        std::cerr << "template registration cleanup mismatch\n";
         return 1;
     }
 
