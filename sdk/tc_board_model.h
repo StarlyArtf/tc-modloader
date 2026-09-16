@@ -96,6 +96,15 @@ struct TCBoardModel {
                    : 0;
     }
 
+    bool selectionEmpty() const {
+        return selectedComponentCount() == 0 && selectedWireCount() == 0;
+    }
+
+    bool previousSelectionEmpty() const {
+        return previousSelectedComponentCount() == 0 &&
+               previousSelectedWireCount() == 0;
+    }
+
     uint64_t selectedComponentIdAt(uint64_t index) const {
         return setIdAt(selected_components, index);
     }
