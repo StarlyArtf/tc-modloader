@@ -68,6 +68,14 @@ try {
  '{"format":2,"id":"dev.kind-list","name":"Built-in prototype table dump","version":"0.1.0","native":{"api":1,"entry":"native/kind-list.dll"}}' | Set-Content (Join-Path $taskKindList 'mod.json') -Encoding utf8
  if(Test-Path dist\dev.kind-list.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.kind-list.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskKindList -Output (Join-Path $taskRoot 'dist\dev.kind-list.mod')
+ # Simulation state mapping probe (route 1, dev only).
+ $taskSimState=Join-Path $taskRoot 'build\sim-state-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskSimState 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\sim-state-probe.cpp -o (Join-Path $taskSimState 'native\sim-state.dll')
+ if($LASTEXITCODE){throw 'Simulation state probe build failed'}
+ '{"format":2,"id":"dev.sim-state","name":"Simulation state mapping probe","version":"0.1.0","native":{"api":1,"entry":"native/sim-state.dll"}}' | Set-Content (Join-Path $taskSimState 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.sim-state.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.sim-state.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskSimState -Output (Join-Path $taskRoot 'dist\dev.sim-state.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -Ivendor -Ivendor\minhook\include tests\native-host.cpp @taskObjects @taskHooks -lbcrypt -o build\native-host.exe
  if($LASTEXITCODE){throw 'Native host test build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -Wno-cast-function-type tests\game-model.cpp -o build\game-model-test.exe
