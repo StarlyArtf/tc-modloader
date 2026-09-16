@@ -343,6 +343,12 @@ struct TCGameModel {
         return true;
     }
 
+    void removeAllCustomPrototypes() const {
+        while (customPrototypeCount() > 0) {
+            removeCustomPrototype(customPrototypeIdAt(0));
+        }
+    }
+
     // Replace the verified name/description fields with a newly allocated
     // Nim string.  The old template string is not freed; use this only on a
     // working copy before registering it, never on a live table entry.

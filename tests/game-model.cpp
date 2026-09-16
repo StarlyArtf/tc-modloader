@@ -629,6 +629,16 @@ int main() {
         return 1;
     }
 
+    tc::TCPrototype bulk{};
+    tc::prototypeSetInputCount(bulk, 2);
+    model.setCustomPrototype(1000, bulk);
+    model.setCustomPrototype(1001, bulk);
+    model.removeAllCustomPrototypes();
+    if (model.customPrototypeCount() != 0) {
+        std::cerr << "remove all custom prototypes mismatch\n";
+        return 1;
+    }
+
     tc::TCPrototype builtin{};
     if (!model.getPrototype(kBuiltInKind, 0, builtin)) {
         std::cerr << "getPrototype builtin failed\n";
