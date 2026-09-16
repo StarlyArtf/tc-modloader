@@ -1,9 +1,4 @@
-#include "../sdk/tc_game_model.h"
-#include "../sdk/tc_board_model.h"
-#include "../sdk/tc_game_state.h"
-#include "../sdk/tc_simulation.h"
-#include "../sdk/tc_wire_model.h"
-#include "../sdk/tc_save_model.h"
+#include "../sdk/tc_mod.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
