@@ -480,13 +480,34 @@ RAM 等 36 个 kind 共用同一个分支 `0x140227e30`**（结构型分支）�
 
 | 符号 | VA | 用途 |
 |---|---|---|
-| `simulation_state__modelZsimulator95types_u81` | `0x1406f1e10` | 仿真状态序列全局（长度 + payload） |
+| `simulation_state__modelZsimulator95types_u81` | `0x1406f1e10` | 仿真状态缓冲区指针；`c_alloc(0x9c4000)`，不是序列对象 |
 | `sim_state_read_u64__modelZsimulator95types_u159` | `0x14010f2e0` | 按下标读状态字 |
 | `jit_function__modelZsimulationZsimulator95functions_u84` | `0x14021cd40` | 每周期执行的 JIT 包装（hook 点） |
 | `sim_do__modelZsimulationZcompile95thread_u3036` | `0x140261850` | 运行/暂停/重置命令入口 |
 | `set_sim_test__modelZutilities_u6840` | `0x1402ccea0` | 启动关卡自带测试 |
 | `sim_get_test_state__modelZsimulationZcontroller_u26` | `0x1401758b0` | 读测试状态（win/fail） |
 | `simulation_output_history_pins__modelZsimulator95types_u85` | `0x1406f1df0` | 输出引脚历史（备选读取路径） |
+
+已执行修正（commit `d750f61`）：旧探针把 `simulation_state` 当 Nim 序列读是
+错误的。它实际保存 `c_alloc(0x9c4000)` 返回的裸指针，必须解引用一次，缓冲区
+固定为 `0x9c4000` 字节。`load_level` 之后还要调用
+`preorder__modelZsimulationZcompile95thread_u3523` 请求异步编译，`sim_do` 才会
+真正跑电路。当前 `tests/sim-state-probe.cpp` 同时捕获 model（经 `sim_do`）、
+`simulation_state`、`simulation_input_replay` 和
+`simulation_output_history_pins`，并用 `build/and2_solution_builtin.data` 做
+关卡保存电路。
+
+当前实测映射（四份快照，cycle 序列 `-1 1 2 3`）：
+
+- `simulation_input_replay` 偏移 `0` 与 `8` 都是 2 位输入值 `0,1,2,3`。
+- `simulation_output_history_pins` 偏移 `55` 与 `64` 都是输出位 `0,0,0,1`。
+- `simulation_state` 本轮只在偏移 `258/259/263` 出现稳定变化，序列为
+  `0,0,1,1`，对应 2 位输入的高 bit；低 bit 与输出位不在这个缓冲区里。
+
+因此关卡级输入/输出不要只盯 `simulation_state`；输入在 `simulation_input_replay`，
+输出在 `simulation_output_history_pins`。路线 1 要读写插件元件内部网表时，
+还需再用自定义元件 fixture 跑一遍，才能确认内部 `0x4f/0x51` 引脚对应的
+`simulation_state` 槽位。
 
 实验步骤（下一轮执行）：
 
