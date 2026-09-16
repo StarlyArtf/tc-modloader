@@ -15,7 +15,8 @@ $taskPatterns = @(
   'installer-test-*',
   'installer-verify*',
   'release-*',
-  'native-test-*'
+  'native-test-*',
+  'kind-list-playtest-*'
 )
 $taskRemoved = @()
 foreach($taskPattern in $taskPatterns) {
