@@ -10,7 +10,8 @@ $taskTest = Join-Path $taskRepo ('build\sim-state-playtest-' + [guid]::NewGuid()
 $taskRoot = Join-Path $taskTest 'game'
 $taskProfile = Join-Path $taskTest 'home'
 $taskData = Join-Path $taskRoot 'tc-modloader-data\plugin-data\dev.sim-state'
-New-Item -ItemType Directory -Force $taskRoot,$taskProfile,(Join-Path $taskRoot 'mods'),$taskData | Out-Null
+$taskSchema = Join-Path $taskProfile 'AppData\Roaming\Turing Complete Mods\profiles\default\schematics\and_gate\Default'
+New-Item -ItemType Directory -Force $taskRoot,$taskProfile,(Join-Path $taskRoot 'mods'),$taskData,$taskSchema | Out-Null
 foreach($taskDir in @('asset','campaign','translations')) {
   Copy-Item -LiteralPath (Join-Path $taskGame $taskDir) -Destination $taskRoot -Recurse
 }
@@ -19,6 +20,7 @@ foreach($taskFile in @('Turing Complete.exe','compile.dll','tc_game_engine.dll',
 }
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\tc-loader.dll') -Destination (Join-Path $taskRoot 'game_engine.dll')
 Copy-Item -LiteralPath $taskMod -Destination (Join-Path $taskRoot 'mods\dev.sim-state.mod')
+Copy-Item -LiteralPath (Join-Path $taskRepo 'build\and2_solution_builtin.data') -Destination (Join-Path $taskSchema 'circuit.data')
 & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply dev.sim-state
 if($LASTEXITCODE){throw 'Sim state package apply failed'}
 
@@ -41,8 +43,20 @@ try {
 $taskOut = Join-Path $taskRepo 'build\state-map.txt'
 if(Test-Path -LiteralPath (Join-Path $taskData 'state-map.txt')) {
   Copy-Item -LiteralPath (Join-Path $taskData 'state-map.txt') -Destination $taskOut -Force
-  Get-Content $taskOut | Select-Object -First 6
-  (Get-Content $taskOut | Select-Object -Last 1)
+  $taskMap = Get-Content -LiteralPath $taskOut -Raw
+  $taskRequired = @(
+    'input_replay slot 0 seq=0,1,2,3,',
+    'input_replay slot 8 seq=0,1,2,3,',
+    'output_history slot 55 seq=0,0,0,1,',
+    'output_history slot 64 seq=0,0,0,1,'
+  )
+  foreach($taskPattern in $taskRequired) {
+    if($taskMap -notmatch [regex]::Escape($taskPattern)) {
+      throw "Sim state mapping assertion failed: missing /$taskPattern/ in $taskOut"
+    }
+  }
+  Select-String -LiteralPath $taskOut -Pattern '^state_buffer=','^input_replay slot (0|8) ','^output_history slot (55|64) ','^input_replay changed_slots=','^output_history changed_slots=' |
+    ForEach-Object { $_.Line }
   "Saved: $taskOut"
 } else {
   "No state-map.txt; loader log:"; Get-Content (Join-Path $taskRoot 'tc-modloader-data\loader.log') -Tail 8
