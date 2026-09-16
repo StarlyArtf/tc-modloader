@@ -196,6 +196,11 @@ struct TCGameModel {
         return true;
     }
 
+    bool customPrototypeAt(uint64_t occupied_index, TCPrototype& out) const {
+        if (occupied_index >= customPrototypeCount()) return false;
+        return getCustomPrototype(customPrototypeIdAt(occupied_index), out);
+    }
+
     // Copy a verified built-in prototype into out.  This is the safe base for
     // a programmatic custom component: copy it, adjust input/output pins and
     // any other raw fields, then call setCustomPrototype().

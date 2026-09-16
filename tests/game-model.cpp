@@ -769,6 +769,12 @@ int main() {
         std::cerr << "custom prototype set/has/count mismatch\n";
         return 1;
     }
+    tc::TCPrototype customAt{};
+    if (!model.customPrototypeAt(0, customAt) ||
+        tc::prototypeInputCount(customAt) != 3) {
+        std::cerr << "custom prototype index access mismatch\n";
+        return 1;
+    }
     if (!model.removeCustomPrototype(kCustomId) ||
         model.hasCustomPrototype(kCustomId) ||
         model.customPrototypeCount() != 0) {
