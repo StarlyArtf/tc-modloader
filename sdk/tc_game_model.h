@@ -204,6 +204,12 @@ struct TCGameModel {
         return getPrototype(kind, 0, out);
     }
 
+    bool builtinPrototypeAt(uint64_t occupied_index, TCPrototype& out) const {
+        if (occupied_index >= builtinPrototypeCount()) return false;
+        return cloneBuiltinPrototype(builtinPrototypeKindAt(occupied_index),
+                                     out);
+    }
+
     // Convenience helper for the common template workflow.  The copied
     // prototype is registered under custom_id; the caller should keep the
     // returned out alive only as a working copy, since setCustomPrototype

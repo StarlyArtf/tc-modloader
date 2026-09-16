@@ -598,6 +598,13 @@ int main() {
         std::cerr << "unknown built-in prototype was accepted\n";
         return 1;
     }
+    tc::TCPrototype indexed{};
+    if (!model.builtinPrototypeAt(1, indexed) ||
+        tc::prototypeInputCount(indexed) != 2 ||
+        model.builtinPrototypeAt(99, indexed)) {
+        std::cerr << "built-in prototype index access mismatch\n";
+        return 1;
+    }
     if (std::strcmp(model.builtinPrototypeName(0x52), "Builtin") != 0 ||
         std::strcmp(model.builtinPrototypeDescription(0x52), "Desc") != 0 ||
         std::strcmp(model.builtinPrototypeShapeSvg(0x52), "<svg") != 0) {
