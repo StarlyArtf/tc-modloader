@@ -4,7 +4,7 @@ try {
  $taskStage=Join-Path $PSScriptRoot ('build\release-'+[guid]::NewGuid().ToString('N'))
  New-Item -ItemType Directory -Force $taskStage,(Join-Path $taskStage 'licenses'),(Join-Path $taskStage 'tools') | Out-Null
  Compress-Archive -Path src,vendor,sdk,tools,tests,examples,build.ps1,package.ps1,README.md,MOD-FORMAT.md,SDK-GUIDE.md,VALIDATION.md,LICENSE -DestinationPath dist\TCModLoader-0.3.0-source.zip -Force
- Copy-Item dist\TCModLoader-Setup.exe,dist\example.menu-demo.mod,dist\example.cycle-guard.mod,dist\TCModLoader-0.3.0-source.zip,README.md,MOD-FORMAT.md,SDK-GUIDE.md,VALIDATION.md,LICENSE $taskStage
+ Copy-Item dist\TCModLoader-Setup.exe,dist\example.menu-demo.mod,dist\example.cycle-guard.mod,dist\example.circuit-and.mod,dist\TCModLoader-0.3.0-source.zip,README.md,MOD-FORMAT.md,SDK-GUIDE.md,VALIDATION.md,LICENSE $taskStage
  Copy-Item dist\tcmod-cli.exe,tools\Pack-Mod.ps1 (Join-Path $taskStage 'tools')
  Copy-Item sdk $taskStage -Recurse
  Copy-Item vendor\LICENSE (Join-Path $taskStage 'licenses\MINIZ-LICENSE.txt')

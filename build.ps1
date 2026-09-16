@@ -43,6 +43,15 @@ try {
  Copy-Item examples\mod-inspector\native\mod-inspector.dll (Join-Path $taskInspector 'native') -Force
  if(Test-Path dist\tcmod.mod-inspector.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\tcmod.mod-inspector.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskInspector -Output (Join-Path $taskRoot 'dist\tcmod.mod-inspector.mod')
+ New-Item -ItemType Directory -Force examples\circuit-and\native | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk examples\circuit-and\plugin.cpp -o examples\circuit-and\native\circuit-and.dll
+ if($LASTEXITCODE){throw 'Circuit AND example build failed'}
+ $taskCircuitAnd=Join-Path $taskRoot 'build\circuit-and-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskCircuitAnd 'native') | Out-Null
+ Copy-Item examples\circuit-and\mod.json $taskCircuitAnd -Force
+ Copy-Item examples\circuit-and\native\circuit-and.dll (Join-Path $taskCircuitAnd 'native') -Force
+ if(Test-Path dist\example.circuit-and.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.circuit-and.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskCircuitAnd -Output (Join-Path $taskRoot 'dist\example.circuit-and.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -Ivendor -Ivendor\minhook\include tests\native-host.cpp @taskObjects @taskHooks -lbcrypt -o build\native-host.exe
  if($LASTEXITCODE){throw 'Native host test build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -Wno-cast-function-type tests\game-model.cpp -o build\game-model-test.exe

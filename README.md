@@ -45,6 +45,10 @@ example.cycle-guard.mod 是“周期运行守卫”，包含独立的 C++ DLL：
 
 example.menu-demo.mod 是保留的旧版资源示例。
 
+example.circuit-and.mod 是电路封装元件示例。启动时注册一个两输入一输出、位宽为 1
+的 `AND2 Test` 自定义元件，并复用内置 AND 的外观图标。正常启动后，在 Sandbox 或
+Foundry 打开元件列表即可放置；在部分战役关卡中游戏会按自身规则禁止自定义元件。
+
 ## 开发能力
 
 SDK 定义：sdk/tc_mod_api.h。开发指南：SDK-GUIDE.md。

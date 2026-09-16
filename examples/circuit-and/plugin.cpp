@@ -1,0 +1,66 @@
+#include "../../sdk/tc_mod.h"
+#include "and_fixture.hpp"
+#include <string>
+
+static const TCHost* host;
+static tc::TCGameModel game;
+static tc::TCComponentModel components;
+
+static void log(const std::string& message) {
+    if (host) host->log(host->context, message.c_str());
+}
+
+extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
+    if (!h || !plugin || h->api_version != TC_MOD_API_VERSION ||
+        h->size < sizeof(TCHost) || plugin->size < sizeof(TCPlugin)) {
+        return 1;
+    }
+    host = h;
+    if (!game.load(h) || !game.valid()) return 2;
+    if (!components.load(h) || !components.valid()) return 3;
+
+    const auto bytes = tc_example::buildAndCircuitFile();
+    // importCircuit requires a valid trailing directory, but the definition is
+    // fully contained in the byte string; the game only uses it for errors.
+    auto imported = components.importCircuit(
+        "AND2 Test", bytes.data(), bytes.size(), "D:/tc-modloader/");
+    if (!imported.ok() || imported.custom_id != tc_example::kAndComponentId) {
+        log("circuit-and: import failed");
+        return 4;
+    }
+
+    tc::TCPrototype prototype{};
+    if (!game.getCustomPrototype(imported.custom_id, prototype)) {
+        log("circuit-and: prototype lookup failed");
+        return 5;
+    }
+    if (!game.setPrototypeName(prototype, "AND2 Test") ||
+        !game.setPrototypeDescription(
+            prototype, "Two-input AND gate registered by example.circuit-and")) {
+        log("circuit-and: metadata update failed");
+        return 6;
+    }
+
+    std::string shape;
+    tc::TCPrototype builtin{};
+    if (game.cloneBuiltinPrototype(0x04, builtin)) {
+        const char* svg = tc::prototypeShapeSvgCStr(builtin);
+        if (svg) shape = svg;
+    }
+    if (!shape.empty() && !game.setPrototypeShapeSvg(prototype, shape.c_str())) {
+        log("circuit-and: shape update failed");
+        return 7;
+    }
+    if (!game.setCustomPrototype(imported.custom_id, prototype)) {
+        log("circuit-and: prototype write failed");
+        return 8;
+    }
+    if (components.releasePrototype(prototype) != tc::TCComponentStatus::Ok) {
+        log("circuit-and: snapshot release failed");
+        return 9;
+    }
+
+    log("circuit-and: registered AND2 Test id=" +
+        std::to_string(imported.custom_id));
+    return 0;
+}
