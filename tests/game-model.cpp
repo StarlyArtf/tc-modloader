@@ -600,7 +600,8 @@ int main() {
         board.previousSelectedWireCount() != 1 ||
         board.previousSelectedComponentIdAt(0) != 43 ||
         board.previousSelectedWireIdAt(0) != 8 ||
-        board.selectionEmpty() || board.previousSelectionEmpty()) {
+        board.selectionEmpty() || board.previousSelectionEmpty() ||
+        board.selectionChanged()) {
         std::cerr << "board selection query mismatch\n";
         return 1;
     }

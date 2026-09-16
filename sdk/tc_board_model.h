@@ -108,6 +108,11 @@ struct TCBoardModel {
                previousSelectedWireCount() == 0;
     }
 
+    bool selectionChanged() const {
+        return selectedComponentCount() != previousSelectedComponentCount() ||
+               selectedWireCount() != previousSelectedWireCount();
+    }
+
     const void* selectionKindCache() const {
         return selection_kind_cache;
     }
