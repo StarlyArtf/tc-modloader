@@ -474,6 +474,36 @@ RAM 等 36 个 kind 共用同一个分支 `0x140227e30`**（结构型分支）�
 得到稳定的引脚↔状态索引映射；拿到映射后第 5 步（状态保持/暂停/重置）与路线 1
 可以同时推进。
 
+### 12.1 路线 1 的执行清单（已核对符号）
+
+所需符号在该构建中都存在，可直接 `resolve_symbol`：
+
+| 符号 | VA | 用途 |
+|---|---|---|
+| `simulation_state__modelZsimulator95types_u81` | `0x1406f1e10` | 仿真状态序列全局（长度 + payload） |
+| `sim_state_read_u64__modelZsimulator95types_u159` | `0x14010f2e0` | 按下标读状态字 |
+| `jit_function__modelZsimulationZsimulator95functions_u84` | `0x14021cd40` | 每周期执行的 JIT 包装（hook 点） |
+| `sim_do__modelZsimulationZcompile95thread_u3036` | `0x140261850` | 运行/暂停/重置命令入口 |
+| `set_sim_test__modelZutilities_u6840` | `0x1402ccea0` | 启动关卡自带测试 |
+| `sim_get_test_state__modelZsimulationZcontroller_u26` | `0x1401758b0` | 读测试状态（win/fail） |
+| `simulation_output_history_pins__modelZsimulator95types_u85` | `0x1406f1df0` | 输出引脚历史（备选读取路径） |
+
+实验步骤（下一轮执行）：
+
+1. 新建 `tests/sim-state-probe.cpp`：导入一个自定义元件 → 载入 `and_gate` 关卡 →
+   用 `set_sim_test` + `sim_do(model,0,N)` 逐步跑 4 个周期。
+2. Hook `jit_function`。每个周期结束后把 `simulation_state` 全部**按字节**快照
+   （上一轮只按 8 字节步长扫，可能漏掉字节级布局），只保留"跨周期发生变化"的下标。
+3. 用关卡测试已知的期望序列（`and_gate` 的 `0,0,0,1`）与输入序列做相关，找出
+   匹配的下标 → 即输入/输出引脚对应的状态槽位。
+4. 用同一方法验证**有状态**元件（Delay Line 设计）：输出应比输入晚一个周期，
+   从而确认状态槽位在跨周期保持、暂停、重置时的行为。
+
+拿到稳定映射后：
+
+- 第 5 步：状态保持/暂停/重置直接用"读引脚值 + 差分"验证；
+- 路线 1：在 JIT 包装里为插件的元件读写这些槽位，从"改统计"升级为"改行为"。
+
 ### 11.2 当前安装的调试覆盖排查（2026-09-16）
 
 再次检查安装目录发现 `tc-modloader-data/plugin-data/example.circuit-and/design-stats.txt`
