@@ -1,0 +1,33 @@
+{
+  "version": "1.0.1",
+  "id": "local.wire-palette",
+  "native": {
+    "entry": "native/wire-palette.dll",
+    "api": 1
+  },
+  "description": "RGB 调色盘、导线精确取色，自动保存最近 5 色。F7 打开。",
+  "patches": [
+    {
+      "replace": "uniform vec3 tc_custom_wire_colors[256];\nvec3[2] raw_colors() {\n    uint custom_id = color_group();\n    if (custom_id >= 11u && custom_id < 255u) {\n        vec3 c = tc_custom_wire_colors[custom_id];\n        return vec3[2](c * 0.65, c);\n    }",
+      "find": "vec3[2] raw_colors() {",
+      "path": "asset/shader/wire_segment.vert"
+    },
+    {
+      "replace": "uniform vec3 tc_custom_wire_colors[256];\nvec3[2] raw_colors() {\n    uint custom_id = color_group();\n    if (custom_id >= 11u && custom_id < 255u) {\n        vec3 c = tc_custom_wire_colors[custom_id];\n        return vec3[2](c * 0.65, c);\n    }",
+      "find": "vec3[2] raw_colors() {",
+      "path": "asset/shader/wire_head.vert"
+    },
+    {
+      "replace": "        case WS_HIDDEN:\n            if (color_group() >= 11u && color_group() < 255u) {\n                vec3 c = tc_custom_wire_colors[color_group()];\n                ret[0] = vec4(c * 0.45, 1.0);\n                ret[1] = vec4(c * 0.80, 1.0);\n                return ret;\n            }",
+      "find": "        case WS_HIDDEN:",
+      "path": "asset/shader/wire_segment.vert"
+    },
+    {
+      "replace": "        case WS_HIDDEN:\n            if (color_group() >= 11u && color_group() < 255u) {\n                vec3 c = tc_custom_wire_colors[color_group()];\n                ret[0] = vec4(c * 0.45, 1.0);\n                ret[1] = vec4(c * 0.80, 1.0);\n                return ret;\n            }",
+      "find": "        case WS_HIDDEN:",
+      "path": "asset/shader/wire_head.vert"
+    }
+  ],
+  "name": "导线调色盘",
+  "format": 2
+}

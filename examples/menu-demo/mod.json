@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "id": "example.menu-demo",
+  "name": "菜单标记示例",
+  "version": "1.0.0",
+  "author": "TC Mod Loader",
+  "description": "在简体中文的“沙盒模式”菜单文字后添加 [MOD]。启用后重启游戏可见；停用后自动恢复。仅用于验证安装，不改动存档。",
+  "patches": [
+    {
+      "path": "translations/Chinese (Simplified).txt",
+      "find": "$16857608955464* 沙盒模式",
+      "replace": "$16857608955464* 沙盒模式 [MOD]"
+    }
+  ]
+}

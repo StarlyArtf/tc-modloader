@@ -1,0 +1,250 @@
+#include "../sdk/tc_game_model.h"
+#include <algorithm>
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr uint8_t kBuiltInKind = 7;
+constexpr uint16_t kCustomId = 123;
+
+uint64_t gAutoSize = 0x1020304050607080ULL;
+uint64_t gCustomCount = 0;
+std::map<uint64_t, tc::TCPrototype> gCustomPrototypes;
+std::vector<uint64_t> gCustomIds;
+alignas(16) unsigned char gCustomLiveValues[16 * 16]{};
+
+void rebuildLiveValues() {
+    std::memset(gCustomLiveValues, 0, sizeof(gCustomLiveValues));
+    for (std::size_t i = 0; i < gCustomIds.size(); ++i) {
+        std::memcpy(gCustomLiveValues + i * 16, &gCustomIds[i], 8);
+        uint16_t low = static_cast<uint16_t>(gCustomIds[i]);
+        std::memcpy(gCustomLiveValues + i * 16 + 8, &low, 2);
+    }
+    gCustomCount = gCustomIds.size();
+}
+
+void writeU64(unsigned char* dst, uint64_t value) {
+    std::memcpy(dst, &value, sizeof(value));
+}
+
+void writePtr(unsigned char* dst, void* value) {
+    std::memcpy(dst, &value, sizeof(value));
+}
+
+void fakeGetPrototype(const void* key, void* out) {
+    const auto* kind = static_cast<const tc::TCPrototypeKind*>(key);
+    assert(kind->tag == kBuiltInKind);
+    assert(kind->custom_id == 0);
+
+    static tc::TCPin inputs[2]{};
+    static tc::TCPin outputs[1]{};
+    writeU64(inputs[0].bytes + 0x10, 0x11);
+    writeU64(inputs[1].bytes + 0x10, 0x22);
+    writeU64(outputs[0].bytes + 0x10, 0x33);
+
+    auto* prototype = static_cast<tc::TCPrototype*>(out);
+    writeU64(prototype->bytes + 0x60, 2);
+    writePtr(prototype->bytes + 0x68, inputs);
+    writeU64(prototype->bytes + 0x80, 1);
+    writePtr(prototype->bytes + 0x88, outputs);
+}
+
+void fakeGetCustomPrototype(uint64_t custom_id, void* out) {
+    assert(custom_id == kCustomId);
+    static tc::TCPin inputs[3]{};
+    writeU64(inputs[0].bytes + 0x10, 0x44);
+    writeU64(inputs[1].bytes + 0x10, 0x55);
+    writeU64(inputs[2].bytes + 0x10, 0x66);
+
+    auto* prototype = static_cast<tc::TCPrototype*>(out);
+    writeU64(prototype->bytes + 0x60, 3);
+    writePtr(prototype->bytes + 0x68, inputs);
+    writeU64(prototype->bytes + 0x80, 0);
+    writePtr(prototype->bytes + 0x88, nullptr);
+}
+
+uint64_t fakeInputWordSize(uint8_t kind, uint16_t pin_index,
+                           const void* expected) {
+    assert(kind == kBuiltInKind);
+    assert(expected == &gAutoSize);
+    return static_cast<uint64_t>(kind) * 100 + pin_index;
+}
+
+uint64_t fakeOutputWordSize(uint8_t kind, uint16_t pin_index,
+                            const void* expected) {
+    assert(kind == kBuiltInKind);
+    assert(expected == &gAutoSize);
+    return static_cast<uint64_t>(kind) * 1000 + pin_index;
+}
+
+void fakeSetCustomPrototype(uint64_t id, const void* prototype) {
+    const auto* proto = static_cast<const tc::TCPrototype*>(prototype);
+    assert(tc::prototypeInputCount(*proto) == 2);
+    gCustomPrototypes[id] = *proto;
+    if (std::find(gCustomIds.begin(), gCustomIds.end(), id) ==
+        gCustomIds.end()) {
+        gCustomIds.push_back(id);
+    }
+    rebuildLiveValues();
+}
+
+void fakeDelCustomPrototype(uint64_t id) {
+    gCustomPrototypes.erase(id);
+    gCustomIds.erase(std::remove(gCustomIds.begin(), gCustomIds.end(), id),
+                     gCustomIds.end());
+    rebuildLiveValues();
+}
+
+uint8_t fakeContainsCustomPrototype(uint64_t id) {
+    return gCustomPrototypes.count(id) ? 1 : 0;
+}
+
+uint8_t fakeNotContainsCustomPrototype(uint64_t id) {
+    return gCustomPrototypes.count(id) ? 0 : 1;
+}
+
+void* fakeResolve(void*, const char* name) {
+    std::string symbol(name ? name : "");
+    if (symbol ==
+        "get_prototype__modelZboardZcustom95prototype95list_u502") {
+        return reinterpret_cast<void*>(&fakeGetPrototype);
+    }
+    if (symbol ==
+        "get_custom_prototype__modelZboardZcustom95prototype95list_u451") {
+        return reinterpret_cast<void*>(&fakeGetCustomPrototype);
+    }
+    if (symbol ==
+        "get_input_word_size__modelZboardZprototype95list_u4196") {
+        return reinterpret_cast<void*>(&fakeInputWordSize);
+    }
+    if (symbol ==
+        "get_output_word_size__modelZboardZprototype95list_u4353") {
+        return reinterpret_cast<void*>(&fakeOutputWordSize);
+    }
+    if (symbol == "AUTO_SIZE__modelZmodel95types_u54") {
+        return &gAutoSize;
+    }
+    if (symbol == "PROTOTYPES__modelZboardZprototype95list_u3772") {
+        return reinterpret_cast<void*>(0x2000);
+    }
+    if (symbol == "CATEGORY_ORDER__modelZboardZprototype95list_u21") {
+        return reinterpret_cast<void*>(0x3000);
+    }
+    if (symbol ==
+        "custom_prototypes_set__modelZboardZcustom95prototype95list_u192") {
+        return reinterpret_cast<void*>(&fakeSetCustomPrototype);
+    }
+    if (symbol ==
+        "custom_prototypes_del__modelZboardZcustom95prototype95list_u291") {
+        return reinterpret_cast<void*>(&fakeDelCustomPrototype);
+    }
+    if (symbol ==
+        "in_custom_prototypes__modelZboardZcustom95prototype95list_u9") {
+        return reinterpret_cast<void*>(&fakeContainsCustomPrototype);
+    }
+    if (symbol ==
+        "notin_custom_prototypes__modelZboardZcustom95prototype95list_u189") {
+        return reinterpret_cast<void*>(&fakeNotContainsCustomPrototype);
+    }
+    if (symbol == "cc_length__modelZboardZcustom95prototype95list_u8") {
+        return &gCustomCount;
+    }
+    if (symbol ==
+        "cc_live_values__modelZboardZcustom95prototype95list_u7") {
+        return gCustomLiveValues;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+int main() {
+    static_assert(offsetof(tc::TCPrototypeKind, custom_id) == 0x188,
+                  "custom_id offset changed");
+    static_assert(sizeof(tc::TCPrototype) == 0x5a8,
+                  "Prototype size changed");
+    static_assert(sizeof(tc::TCPin) == 0x38, "Pin size changed");
+
+    TCHost host{};
+    host.api_version = TC_MOD_API_VERSION;
+    host.size = sizeof(host);
+    host.context = nullptr;
+    host.resolve_symbol = fakeResolve;
+
+    tc::TCGameModel model;
+    if (!model.load(&host)) {
+        std::cerr << "model.load failed\n";
+        return 1;
+    }
+    if (!model.valid() || !model.wordSizeValid()) {
+        std::cerr << "model did not resolve required symbols\n";
+        return 1;
+    }
+    if (!model.mutationValid()) {
+        std::cerr << "model did not resolve mutation symbols\n";
+        return 1;
+    }
+
+    tc::TCPrototype builtin{};
+    if (!model.getPrototype(kBuiltInKind, 0, builtin)) {
+        std::cerr << "getPrototype builtin failed\n";
+        return 1;
+    }
+    if (tc::prototypeInputCount(builtin) != 2 ||
+        tc::prototypeOutputCount(builtin) != 1) {
+        std::cerr << "prototype counts mismatch\n";
+        return 1;
+    }
+    if (tc::pinWordSizeRaw(*tc::prototypeInputPin(builtin, 1)) != 0x22 ||
+        tc::pinWordSizeRaw(*tc::prototypeOutputPin(builtin, 0)) != 0x33) {
+        std::cerr << "pin raw word size mismatch\n";
+        return 1;
+    }
+    if (model.inputWordSize(kBuiltInKind, 4) != 704 ||
+        model.outputWordSize(kBuiltInKind, 4) != 7004) {
+        std::cerr << "word size wrapper mismatch\n";
+        return 1;
+    }
+
+    tc::TCPrototype custom{};
+    if (!model.getPrototype(tc::kPrototypeKindCustom, kCustomId, custom)) {
+        std::cerr << "getPrototype custom failed\n";
+        return 1;
+    }
+    if (tc::prototypeInputCount(custom) != 3 ||
+        tc::prototypeOutputCount(custom) != 0 ||
+        tc::prototypeOutputPin(custom, 0) != nullptr) {
+        std::cerr << "custom prototype fields mismatch\n";
+        return 1;
+    }
+
+    tc::TCPrototype toRegister{};
+    tc::TCPin registerPins[2]{};
+    tc::prototypeSetInputCount(toRegister, 2);
+    tc::prototypeSetInputPins(toRegister, registerPins);
+    tc::prototypeSetOutputCount(toRegister, 0);
+    tc::prototypeSetOutputPins(toRegister, nullptr);
+    if (!model.setCustomPrototype(kCustomId, toRegister) ||
+        !model.hasCustomPrototype(kCustomId) ||
+        model.customPrototypeCount() != 1 ||
+        model.customPrototypeIdAt(0) != kCustomId) {
+        std::cerr << "custom prototype set/has/count mismatch\n";
+        return 1;
+    }
+    if (!model.removeCustomPrototype(kCustomId) ||
+        model.hasCustomPrototype(kCustomId) ||
+        model.customPrototypeCount() != 0) {
+        std::cerr << "custom prototype remove mismatch\n";
+        return 1;
+    }
+
+    std::cout << "PASS game object model header: offsets, resolution, "
+                 "prototype, pin and custom registration access\n";
+    return 0;
+}
