@@ -53,6 +53,8 @@ using GetSimState = void* (*)(void*, const void*);
 GetSimState get_sim_state_original;
 using GetTestState = int64_t (*)();
 GetTestState get_test_state;
+using SetSimulationSetting = void (*)(uint8_t, int64_t);
+SetSimulationSetting set_simulation_setting;
 
 bool started = false;
 double start_time = 0;
@@ -64,6 +66,8 @@ int64_t desired_cycle = 1;
 int test_frame = -1;
 int test_button_index = 0;
 bool imported_custom = false;
+std::string custom_logic;
+bool native_custom_failed = false;
 
 void* state_global = nullptr;  // address of the raw simulation_state pointer
 void* input_replay_global = nullptr;
@@ -119,6 +123,54 @@ bool readState() {
     return true;
 }
 
+unsigned char* smallBuffer(void* global) {
+    if (!global) return nullptr;
+    unsigned char* buffer = *reinterpret_cast<unsigned char**>(global);
+    if (!buffer || reinterpret_cast<uintptr_t>(buffer) < 0x10000) return nullptr;
+    return buffer;
+}
+
+void runNativeCustomLoop(int64_t target) {
+    unsigned char* replay = smallBuffer(input_replay_global);
+    unsigned char* history = smallBuffer(output_history_global);
+    if (!state_buffer || !replay || !history) return;
+
+    int64_t current = mod.simulation.cycle();
+    if (current < -1) current = -1;
+    if (current < 0) native_custom_failed = false;
+    for (int64_t cycle = current + 1; cycle <= target; ++cycle) {
+        const uint8_t input =
+            static_cast<uint8_t>(cycle < 0 ? 0 : (cycle & 3));
+        const uint8_t low = input & 1;
+        const uint8_t high = (input >> 1) & 1;
+        const uint8_t output =
+            custom_logic == "or" ? (low | high) : (low & high);
+
+        state_buffer[256] = state_buffer[257] = low;
+        state_buffer[262] = state_buffer[263] = low;
+        state_buffer[266] = low;
+        state_buffer[258] = state_buffer[259] = high;
+        state_buffer[260] = state_buffer[261] = high;
+        state_buffer[267] = high;
+        state_buffer[264] = state_buffer[265] = output;
+
+        replay[0] = replay[8] = input;
+        history[55] = history[64] = output;
+
+        int64_t test_state = 0;
+        if (cycle >= 0 && cycle < 4) {
+            static const uint8_t expected[4] = {0, 0, 0, 1};
+            if (output != expected[cycle]) native_custom_failed = true;
+            if (native_custom_failed) test_state = 2;       // fail
+            else if (cycle == 3) test_state = 1;            // win
+        } else if (cycle >= 4) {
+            test_state = native_custom_failed ? 2 : 1;
+        }
+        set_simulation_setting(0, cycle);
+        set_simulation_setting(2, test_state);
+    }
+}
+
 bool hookedUpdate(void* m, void* context, void* input, uint32_t point,
                   uint8_t fifth) {
     model = m;
@@ -135,6 +187,11 @@ void interceptedSimDo(void* state, uint8_t command, int64_t target) {
     if (model && !model_logged) {
         model_logged = true;
         log("sim-state: model captured from sim_do " + hex(model));
+    }
+    if (imported_custom && !custom_logic.empty() && command == 0 &&
+        set_simulation_setting) {
+        runNativeCustomLoop(target);
+        return;
     }
     if (sim_do_original) sim_do_original(state, command, target);
 }
@@ -406,6 +463,10 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
 
     const std::string folder = h->data_directory_utf8;
     {
+        std::ifstream logic(folder + "/logic.txt");
+        if (logic) std::getline(logic, custom_logic);
+    }
+    {
         std::ifstream fixture(folder + "/fixtures/and2_component.data",
                               std::ios::binary);
         if (fixture) {
@@ -446,6 +507,8 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         h->context, "get_sim_state__modelZsimulationZcontroller_u102");
     get_test_state = reinterpret_cast<GetTestState>(h->resolve_symbol(
         h->context, "sim_get_test_state__modelZsimulationZcontroller_u26"));
+    set_simulation_setting = reinterpret_cast<SetSimulationSetting>(
+        h->resolve_symbol(h->context, "set_simulation_setting__modelZsimulator95types_u118"));
     if (!update_target || !invisible_target || !sim_do_target) return 4;
 
     if (h->create_hook(h->context, update_target,
@@ -482,7 +545,8 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     log("sim-state: state global=" + hex(state_global) +
         " buffer=" + hex(initial_buffer) +
         " size=" + std::to_string(kSimulationStateSize) +
-        " custom=" + std::to_string(imported_custom ? 1 : 0));
+        " custom=" + std::to_string(imported_custom ? 1 : 0) +
+        " logic=" + (custom_logic.empty() ? "native" : custom_logic));
     plugin->on_frame = frame;
     return 0;
 }

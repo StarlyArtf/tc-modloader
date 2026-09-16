@@ -531,6 +531,38 @@ RAM 等 36 个 kind 共用同一个分支 `0x140227e30`**（结构型分支）�
 下一步必须进入仿真线程的每周期路径（`jit_function`/`jit` 包装或生成的
 状态写入点），在测试判定读取输出之前写入插件算出的状态。
 
+### 12.3 最小原生自定义逻辑已跑通（2026-09-17）
+
+继续排查发现 `sim_get_cycle` 和 `sim_get_test_state` 都直接读
+`simulation_settings`：
+
+- `sim_get_cycle()` → `get_simulation_setting(0)`
+- `sim_get_test_state()` → `get_simulation_setting(2)`
+
+`set_simulation_setting__modelZsimulator95types_u118` 可以直接写回这两个值。
+于是 `tests/sim-state-probe.cpp` 增加了一个最小原生仿真模式：插件在
+`sim_do` 的 run 命令里不调用游戏 JIT，而是自己按周期做：
+
+1. 从 cycle 推出 `and_gate` 测试输入 `U2 cycle`。
+2. 用 C++ 计算自定义逻辑（实验用 OR）。
+3. 写 `simulation_input_replay`（偏移 0/8）、`simulation_output_history_pins`
+   （偏移 55/64）和 `simulation_state`（256/258/264 等映射槽）。
+4. 写 `set_simulation_setting(0, cycle)` 和
+   `set_simulation_setting(2, win/fail)`。
+
+真机沙箱结果（`TC_SIM_STATE_LOGIC=or`）：
+
+| 观测 | 结果 |
+|---|---|
+| 输入值 | `0,1,2,3` |
+| 输出值 | `0,1,1,1`（OR 真值表） |
+| 测试状态 | cycle 1/2/3 都是 `2`（fail） |
+
+对照原生 AND 输出 `0,0,0,1`，这条路径已经能在最小关卡里实现真正的
+插件自定义逻辑，而不是只改统计数字。当前范围仍是最小 `and_gate` 板型和
+两级电平 IO；下一步需要把“读板子拓扑、计算每周期输入、写回输出”抽成
+稳定接口，并扩展到更多元件 kind 与更复杂的连线。
+
 实验步骤（下一轮执行）：
 
 1. 新建 `tests/sim-state-probe.cpp`：导入一个自定义元件 → 载入 `and_gate` 关卡 →
