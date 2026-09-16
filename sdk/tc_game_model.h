@@ -35,8 +35,8 @@
 namespace tc {
 
 // get_prototype() checks this discriminator first.  0x4e ('N') selects the
-// custom-prototype branch and causes the uint16_t at +0x188 to be used as the
-// custom prototype ID.
+// custom-prototype branch and loads the uint64_t at +0x188 as the custom ID.
+// Only the initial hash-table slot is truncated to 16 bits, not the identity.
 enum : uint8_t { kPrototypeKindCustom = 0x4e };
 enum : size_t {
     kPrototypeNameOffset = 0x10,
@@ -56,8 +56,13 @@ enum : uint64_t {
 struct TCPrototypeKind {
     uint8_t tag;
     uint8_t reserved[0x187];
-    uint16_t custom_id;  // offset 0x188
+    uint64_t custom_id;  // offset 0x188; full identity, not a hash slot
 };
+
+static_assert(offsetof(TCPrototypeKind, custom_id) == 0x188,
+              "Pinned component kind ID offset changed");
+static_assert(sizeof(TCPrototypeKind) == 0x190,
+              "Lookup key must include the complete 64-bit custom ID");
 
 // Verified output size of get_prototype()/get_custom_prototype().  The actual
 // object is a Nim Prototype; only the offsets below are currently exposed.
@@ -115,9 +120,9 @@ struct TCGameModel {
     }
 
     // Registration/list primitives.  set/del are the low-level verified
-    // mutation APIs; add_custom_prototype (file/parse based) is intentionally
-    // not wrapped yet because its full stack-argument layout is still being
-    // verified.
+    // mutation APIs. add_custom_prototype parses a circuit and has a hidden
+    // result pointer (see research/COMPONENT-PIPELINE.md). Its runtime ownership
+    // and error contract are not yet verified, so it is not wrapped here.
     bool mutationValid() const {
         return custom_prototypes_set != nullptr &&
                custom_prototypes_del != nullptr &&
@@ -202,8 +207,9 @@ struct TCGameModel {
     }
 
     // Copy a verified built-in prototype into out.  This is the safe base for
-    // a programmatic custom component: copy it, adjust input/output pins and
-    // any other raw fields, then call setCustomPrototype().
+    // prototype-table experiment: copy it, adjust verified fields, then call
+    // setCustomPrototype(). This does not register new simulation behavior or
+    // construct the embedded circuit expected by the custom-component path.
     bool cloneBuiltinPrototype(uint8_t kind, TCPrototype& out) const {
         if (!isBuiltinPrototypeKind(kind)) return false;
         return getPrototype(kind, 0, out);

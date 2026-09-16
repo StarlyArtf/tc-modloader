@@ -12,7 +12,7 @@
 namespace {
 
 constexpr uint8_t kBuiltInKind = 7;
-constexpr uint16_t kCustomId = 123;
+constexpr uint64_t kCustomId = 0x123456789abc007bULL;
 
 uint64_t gAutoSize = 0x1020304050607080ULL;
 uint64_t gCustomCount = 0;
@@ -454,6 +454,16 @@ void* fakeResolve(void*, const char* name) {
 int main() {
     static_assert(offsetof(tc::TCPrototypeKind, custom_id) == 0x188,
                   "custom_id offset changed");
+    static_assert(sizeof(tc::TCPrototypeKind::custom_id) == 8,
+                  "custom_id is a full 64-bit identity, not a 16-bit slot");
+    tc::TCPrototypeKind wideKey{};
+    wideKey.tag = tc::kPrototypeKindCustom;
+    wideKey.custom_id = kCustomId;
+    uint64_t binaryId = 0;
+    // The real get_prototype uses a QWORD load at this offset.
+    std::memcpy(&binaryId,
+                reinterpret_cast<const unsigned char*>(&wideKey) + 0x188, 8);
+    assert(binaryId == kCustomId);
     static_assert(sizeof(tc::TCPrototype) == 0x5a8,
                   "Prototype size changed");
     static_assert(sizeof(tc::TCPin) == 0x38, "Pin size changed");
