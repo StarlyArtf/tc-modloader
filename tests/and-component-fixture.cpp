@@ -18,6 +18,7 @@ constexpr uint64_t kInnerComponentId = 0x414E44325F303032ULL;
 constexpr uint16_t kInputPin = 0x4F;
 constexpr uint16_t kOutputPin = 0x51;
 constexpr uint16_t kAndGate = 0x04;
+constexpr uint16_t kDelayLine = 0x0D;  // 1-bit Delay Line (stateful)
 
 // The definition header carries the design's cached (gate count, delay) pair.
 // The game recomputes the gate count when the definition is parsed, but it
@@ -166,6 +167,30 @@ void addAndGate(Writer& writer, bool nested=false) {
     if(nested) { writer.i64(static_cast<int64_t>(kInnerComponentId));writer.u16(0); }
 }
 
+// 1-bit Delay Line.  Its ports are not declared in the prototype's input list,
+// so the geometry comes from the shipped campaign solution
+// (campaign/double_buffer/hint_solution.data): input at (-3,0), output at
+// (+3,0) relative to the component position.
+void addDelayLine(Writer& writer, int16_t x, int16_t y) {
+    writer.u16(kDelayLine);
+    writer.i16(x);
+    writer.i16(y);
+    writer.u8(0);
+    writer.i64(0x2000000000000002LL);
+    writer.string("");
+    writer.u16(0);
+    writer.i64(0);
+    writer.i16(0);
+    writer.i64(1);
+    writer.u8(0);
+    writer.u8(0);
+    writer.i64(-1);
+    writer.i64(0);
+    writer.u8(0);
+    writer.u16(0);
+    writer.u16(0);
+}
+
 void addWire(Writer& writer, int16_t x, int16_t y,
              std::initializer_list<uint16_t> segments) {
     writer.u8(0);
@@ -275,6 +300,7 @@ std::vector<uint8_t> buildLevelPayload(bool builtin_and) {
 std::vector<uint8_t> buildPayload(bool inner=false) {
     Writer writer;
     const bool nested=topology=="nested" && !inner;
+    const bool stateful=topology=="delay";
     writer.i64(static_cast<int64_t>(inner?kInnerComponentId:kAndComponentId));
     writer.u32(0);
     // These two fields are carried in the serialized definition.  Their exact
@@ -295,10 +321,17 @@ std::vector<uint8_t> buildPayload(bool inner=false) {
     writer.i64(4);  // components
     addPin(writer, kInputPin, -11, -13, 0x1000000000000000ULL, "A", -2, 1);
     addPin(writer, kInputPin, -11, -7, 0x1000000000000001ULL, "B", -4, 1);
-    addAndGate(writer,nested);
+    if (stateful) addDelayLine(writer, 0, 0);
+    else addAndGate(writer,nested);
     addPin(writer, kOutputPin, 14, -10, 0x1000000000000003ULL, "Out", -2, 1);
 
-    writer.i64(3);  // wires
+    writer.i64(stateful?2:3);  // wires
+    if(stateful) {
+        // A -> delay input (-3,0); delay output (3,0) -> Out pin input (11,-10).
+        addWire(writer, -8, -13, {0x0005, 0x400D, 0x0000});
+        addWire(writer, 3, 0, {0x0008, 0xC00A, 0x0000});
+        return writer.bytes;
+    }
     addWire(writer, -8, -13, {0x000B, 0x4002, 0x0000});
     if(nested) addWire(writer,-8,-7,{0x000B,0xC003,0x0000});
     else addWire(writer, -8, -7, {0x000B, 0xC002, 0x0000});

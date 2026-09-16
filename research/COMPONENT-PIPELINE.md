@@ -410,6 +410,30 @@ get_cost__modelZscores_u2321          0x140158d60   (component) -> (gates, delay
 沙箱复验：导入修复后的定义，探针读到 `prototype gates=1 delay=1`，与真机整板
 `delay=1` 一致；内置与门对照同样为 1。
 
+### 11.2 内置原型表与有状态元件（步骤 5 起点）
+
+新增只读探测包 `dev.kind-list.mod`（源码 `tests/kind-list-probe.cpp`，
+回归 `tests/kind-list-playtest.ps1`）：枚举 `PROTOTYPES` 表，输出 125 个内置元件的
+kind、名称、输入/输出引脚数与引脚偏移。完整表在 `build/kinds.txt`。要点：
+
+- 名称齐全：`0x03 NOT`、`0x04 AND`、`0x0d Delay Line`、`0x0e Register`、
+  `0x26/0x27 Counter/Register`、`0x29 Level And Delay Component`、`0x37 Delay Line`、
+  `0x77 Auto Delay Line`、`0x76 RAM`、`0x4d Counter` 等。
+- 有状态元件（0x0d/0x0e/0x26/0x27/0x37）在原型里**不声明输入引脚**
+  （`+0x60 = 0`，`+0x68 = 0`），只有输出。它们的输入位置取自游戏自带的解题电路：
+  `campaign/double_buffer/hint_solution.data` 里两个 Delay Line 的连线端点显示
+  **输入 `(-3,0)`、输出 `(+3,0)`**（相对元件坐标）。
+- 游戏自己的代价函数对 Delay Line 返回 **5 门 / 4 延迟**（真机日志
+  `cost[kind=0xd] gates=5 delay=4`），因此以它为基础的有状态封装应声明 `(5,4)`。
+
+新增 fixture 拓扑 `delay`（`tests/and-component-fixture.cpp`）：把 AND2 定义里的
+与门换成 Delay Line，接线为 A → `(-3,0)`，`(3,0)` → 输出引脚；关卡侧沿用既有
+单件电路。真机结果：导入成功、原型读到 `(5,4)`、编译与界面都是 4 延迟 5 门，
+`tests/component-timing-playtest.ps1` 的 `stateful` 用例通过。
+
+尚未验证：跨周期的状态保持、暂停与重置（需要能读取引脚值或以游戏自带关卡测试
+作为判定；计划用 `set_sim_test` + 测试状态或 `odd_ticks`/`double_buffer` 关卡做差分验证）。
+
 ### 11.2 当前安装的调试覆盖排查（2026-09-16）
 
 再次检查安装目录发现 `tc-modloader-data/plugin-data/example.circuit-and/design-stats.txt`

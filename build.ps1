@@ -60,6 +60,14 @@ try {
  '{"format":2,"id":"dev.cost-watch","name":"Gate and delay score observer","version":"0.1.0","native":{"api":1,"entry":"native/cost-watch.dll"}}' | Set-Content (Join-Path $taskCostWatch 'mod.json') -Encoding utf8
  if(Test-Path dist\dev.cost-watch.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.cost-watch.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskCostWatch -Output (Join-Path $taskRoot 'dist\dev.cost-watch.mod')
+ # Built-in prototype table dump (dev only).
+ $taskKindList=Join-Path $taskRoot 'build\kind-list-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskKindList 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\kind-list-probe.cpp -o (Join-Path $taskKindList 'native\kind-list.dll')
+ if($LASTEXITCODE){throw 'Kind list probe build failed'}
+ '{"format":2,"id":"dev.kind-list","name":"Built-in prototype table dump","version":"0.1.0","native":{"api":1,"entry":"native/kind-list.dll"}}' | Set-Content (Join-Path $taskKindList 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.kind-list.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.kind-list.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskKindList -Output (Join-Path $taskRoot 'dist\dev.kind-list.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -Ivendor -Ivendor\minhook\include tests\native-host.cpp @taskObjects @taskHooks -lbcrypt -o build\native-host.exe
  if($LASTEXITCODE){throw 'Native host test build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -Wno-cast-function-type tests\game-model.cpp -o build\game-model-test.exe

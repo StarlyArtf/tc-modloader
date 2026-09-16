@@ -229,6 +229,20 @@ Nim 静态字符串：游戏可能共享而不是复制这种内存。原 `setPr
 但原样保留延迟，因此必须写入真实关键路径；对照值可参考游戏自带工坊元件
 （`4or=(3,2)`、`8or=(7,3)`、`1and8=(8,1)`、`half-add=(4,2)`）。
 
+## 内置元件表与有状态元件
+
+`dev.kind-list.mod`（源码 `tests/kind-list-probe.cpp`）是只读探测包：启动后枚举
+`PROTOTYPES`，把 125 个内置元件的 kind、名称、引脚数与引脚偏移写进
+`tc-modloader-data/plugin-data/dev.kind-list/kinds.txt` 和加载器日志；
+`tests/kind-list-playtest.ps1` 在隔离副本里跑一遍并把结果存到 `build/kinds.txt`。
+
+有状态元件（`0x0d Delay Line`、`0x0e Register`、`0x26/0x27`、`0x37`）**不声明输入
+引脚**，只有输出；输入位置要从游戏自带电路反推，例如
+`campaign/double_buffer/hint_solution.data` 给出 Delay Line 的输入 `(-3,0)`、
+输出 `(+3,0)`。Delay Line 的代价是 **5 门／4 延迟**（游戏自身 `get_cost` 返回值），
+所以以它为基础封装的有状态元件应声明 `(5,4)`；fixture 拓扑 `delay`
+（`tests/and-component-fixture.cpp`）就是这么做的，并用 `stateful` 用例回归。
+
 ## 编译和打包
 
 使用 MSVC 或 MinGW-w64 构建 x64 DLL，建议静态链接编译器运行库，或将依赖 DLL 放在入口 DLL 同目录。

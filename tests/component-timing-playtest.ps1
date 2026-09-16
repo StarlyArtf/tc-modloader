@@ -12,6 +12,9 @@ try {
     @{Name='single0';Topology='single';Delay=0;Expected=0;Gates=1;Mode='plain'},
     @{Name='builtin';Topology='single';Delay=5;Expected=1;Gates=1;Mode='builtin'},
     @{Name='nested';Topology='nested';Delay=7;Expected=7;Gates=1;Mode='plain'},
+    # Stateful design: the inner Delay Line (kind 0x0d) costs 5 gates / 4 delay
+    # according to the game's own cost function, so the declared pair must match.
+    @{Name='stateful';Topology='delay';Delay=4;Expected=4;Gates=5;Mode='plain';DesignGates=5},
     # Multiple drivers on one net keep the game's native timing and say so in
     # the loader log: the verified rules do not cover that shape.
     @{Name='multidriver';Topology='multidriver';Delay=5;Expected=1;Gates=2;Mode='plain';ExpectLog='native timing retained'},
@@ -20,7 +23,8 @@ try {
   )) {
     $taskDir=Join-Path $taskRepo ('build\timing-'+$taskCase.Name)
     $env:TC_FIXTURE=Join-Path $taskDir 'and2_component.data'
-    & (Join-Path $taskRepo 'build\and-component-fixture.exe') $env:TC_FIXTURE 1 $taskCase.Delay $taskCase.Topology
+    $taskDesignGates = if($taskCase.DesignGates) { $taskCase.DesignGates } else { 1 }
+    & (Join-Path $taskRepo 'build\and-component-fixture.exe') $env:TC_FIXTURE $taskDesignGates $taskCase.Delay $taskCase.Topology
     if($LASTEXITCODE){throw 'Timing fixture generation failed'}
     $env:TC_SOLUTION=Join-Path $taskDir 'and2_solution.data'
     $env:TC_COST_MODES=$taskCase.Mode
