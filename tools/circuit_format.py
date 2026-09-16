@@ -451,13 +451,199 @@ def summarize(circuit: Circuit) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Design statistics policy
+#
+# A definition header caches the design's (gate count, delay).  The game
+# recomputes the gate count while parsing but keeps the stored delay verbatim,
+# and both values are what the UI reports for the component, so a definition
+# must carry its real critical path.
+#
+# The rules below only cover what has been measured on the pinned build.  When
+# a design cannot be reduced by those rules it keeps its native statistics
+# instead of receiving an invented pair: that is the safe default for feedback
+# loops, multiple drivers, unknown kinds and nested custom components.
+# ---------------------------------------------------------------------------
+
+# (gates, delay) contributed by a component, limited to kinds the fixtures
+# exercise directly.  Anything outside this table keeps its native statistics:
+# the runtime timing shim asks the game for each node's own cost instead of
+# relying on a table, so this is only the design-time check for our fixtures.
+KIND_COST: dict[int, tuple[int, int]] = {
+    0x03: (1, 1),  # NOT
+    0x04: (1, 1),  # AND
+    0x3F: (0, 0),  # level input pin
+    0x44: (0, 0),  # level output pin
+    0x46: (0, 0),
+    0x4F: (0, 0),  # custom input pin
+    0x50: (0, 0),
+    0x51: (0, 0),  # custom output pin
+}
+
+# Verified pin offsets relative to the component origin: (inputs, outputs).
+KIND_PINS: dict[int, tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]] = {
+    0x03: (((-1, 0),), ((2, 0),)),
+    0x04: (((-1, -1), (-1, 1)), ((2, 0),)),
+    0x3F: ((), ((0, -1), (0, 1))),
+    0x44: (((-1, 0),), ()),
+    0x4F: ((), ((3, 0),)),
+    0x51: (((-3, 0),), ()),
+}
+
+# 0=East, 1=South-East, 2=South, 3=South-West, 4=West, 5=North-West, 6=North, 7=North-East
+WIRE_DIRECTIONS = ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))
+
+
+def wire_endpoints(wire: Wire) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Returns the two ends of a wire path in schematic grid coordinates."""
+    x, y = wire.x, wire.y
+    for segment in wire.segments:
+        length = segment & 0x1FFF
+        if length == 0:
+            break
+        dx, dy = WIRE_DIRECTIONS[(segment >> 13) & 0x7]
+        x += dx * length
+        y += dy * length
+    return (wire.x, wire.y), (x, y)
+
+
+def analyze_design(circuit: Circuit) -> dict[str, Any]:
+    """Decides whether the verified rules apply to a design.
+
+    Returns a report with either the verified (gates, delay) pair or the
+    instruction to keep the native statistics, together with the reason.
+    """
+    report: dict[str, Any] = {
+        "components": len(circuit.components),
+        "wires": len(circuit.wires),
+        "verified": False,
+        "reason": "",
+        "native_gates": circuit.header_i64_a,
+        "native_delay": circuit.header_i64_b,
+    }
+
+    unknown = sorted(
+        {
+            component.kind
+            for component in circuit.components
+            if component.kind not in KIND_COST or component.kind not in KIND_PINS
+        }
+    )
+    if unknown:
+        kinds = ", ".join(f"0x{kind:02x}" for kind in unknown)
+        report["reason"] = f"unverified component kind(s) {kinds}"
+        return report
+
+    pin_map: dict[tuple[int, int], list[tuple[int, str]]] = {}
+    for index, component in enumerate(circuit.components):
+        inputs, outputs = KIND_PINS[component.kind]
+        for dx, dy in inputs:
+            pin_map.setdefault((component.x + dx, component.y + dy), []).append((index, "in"))
+        for dx, dy in outputs:
+            pin_map.setdefault((component.x + dx, component.y + dy), []).append((index, "out"))
+
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def find(point: tuple[int, int]) -> tuple[int, int]:
+        parent.setdefault(point, point)
+        while parent[point] != point:
+            parent[point] = parent[parent[point]]
+            point = parent[point]
+        return point
+
+    def union(a: tuple[int, int], b: tuple[int, int]) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for wire in circuit.wires:
+        start, end = wire_endpoints(wire)
+        union(start, end)
+
+    nets: dict[tuple[int, int], list[tuple[int, str]]] = {}
+    for point in parent:
+        if point in pin_map:
+            nets.setdefault(find(point), []).extend(pin_map[point])
+
+    drivers: dict[int, list[int]] = {}
+    for pins in nets.values():
+        sources = [index for index, role in pins if role == "out"]
+        sinks = [index for index, role in pins if role == "in"]
+        if len(sources) > 1:
+            report["reason"] = (
+                f"multiple drivers on one net ({len(sources)} outputs)"
+            )
+            return report
+        for source in sources:
+            drivers.setdefault(source, []).extend(sinks)
+
+    # Longest combinational path; a cycle means the design keeps native stats.
+    state = [0] * len(circuit.components)
+    delay = [0] * len(circuit.components)
+
+    def visit(index: int) -> int:
+        if state[index] == 1:
+            raise CircuitError("feedback loop detected")
+        if state[index] == 2:
+            return delay[index]
+        state[index] = 1
+        best = 0
+        for source, sinks in drivers.items():
+            if index in sinks:
+                best = max(best, visit(source))
+        state[index] = 2
+        delay[index] = best + KIND_COST[circuit.components[index].kind][1]
+        return delay[index]
+
+    try:
+        total_delay = 0
+        for index in range(len(circuit.components)):
+            total_delay = max(total_delay, visit(index))
+    except CircuitError as exc:
+        report["reason"] = str(exc)
+        return report
+
+    gates = sum(KIND_COST[component.kind][0] for component in circuit.components)
+    report.update(
+        {
+            "verified": True,
+            "gates": gates,
+            "delay": total_delay,
+            "reason": "verified component kinds, single driver per net, acyclic",
+            "native_gates": circuit.header_i64_a,
+            "native_delay": circuit.header_i64_b,
+        }
+    )
+    return report
+
+
+def policy_line(report: dict[str, Any]) -> str:
+    if report["verified"]:
+        return (
+            f"POLICY=verified gates={report['gates']} delay={report['delay']} "
+            f"native=({report['native_gates']},{report['native_delay']}) "
+            f"reason=\"{report['reason']}\""
+        )
+    return (
+        f"POLICY=keep_native reason=\"{report['reason']}\" "
+        f"native=({report['native_gates']},{report['native_delay']})"
+    )
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, help="circuit.data to inspect")
     parser.add_argument("--json", action="store_true", help="print full decoded JSON")
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="report whether the verified design-statistic rules apply",
+    )
     args = parser.parse_args(argv)
     circuit = read_circuit(args.path)
-    if args.json:
+    if args.analyze:
+        print(policy_line(analyze_design(circuit)))
+    elif args.json:
         print(json.dumps(circuit_to_dict(circuit), indent=2, ensure_ascii=False))
     else:
         print(summarize(circuit))

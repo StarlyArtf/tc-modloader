@@ -455,8 +455,10 @@ struct TCGameModel {
 
     // Cached design statistics of a circuit-backed prototype.  The game
     // recomputes the gate count while parsing a definition but keeps the
-    // stored delay verbatim, and both values feed the gate/delay cost that
-    // every UI surface reports for the component.  A definition therefore has
+    // stored delay verbatim. For prototypes registered during native Mod
+    // initialization, the loader also uses this declared delay in acyclic
+    // board timing: serial components add, parallel paths take the maximum.
+    // Gate totals still use the game's recursive circuit count. A definition has
     // to carry its real critical path; patch it here when the serialized header
     // cannot be prepared ahead of time.
     bool setPrototypeGateCost(TCPrototype& prototype, uint64_t value) const {
@@ -669,6 +671,9 @@ class TCPrototypeBuilder {
 
     // Circuit-backed components: store the design's own gate count and
     // critical-path delay so the reported cost matches the design.
+    // The loader honors declared delays for Mod prototypes registered during
+    // initialization. This does not change their logical behavior. Feedback or
+    // multiple-driver graphs retain native timing and emit a loader diagnostic.
     bool setDesignCost(uint64_t gates, uint64_t delay) {
         return model_->setPrototypeGateCost(prototype_, gates) &&
                model_->setPrototypeDelay(prototype_, delay);

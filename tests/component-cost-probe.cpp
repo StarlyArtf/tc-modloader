@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -39,6 +40,7 @@ double start_time;
 double stage_time;
 double current_time;
 std::string mode = "plain";
+std::string level_name = "and_gate";
 bool (*invisible_original)(const char*, V2, int);
 int test_frame = -1;
 int test_button_index;
@@ -51,10 +53,11 @@ LoadLevel load_level;
 
 using GetCostFn = void* (*)(void* result, const void* component);
 using GetDelayCostFn = int64_t (*)(const void* component, int64_t fallback);
-using BuildScoresFn = void (*)(void* score, void* a1, void* a2, double scale);
+using BuildScoresFn = void (*)(void* score, void* a1, float a2, double scale);
 using AddCostFn = void (*)(uint64_t kind, const uint64_t* pair);
 
 GetCostFn get_cost_original;
+std::recursive_mutex stats_mutex;
 GetDelayCostFn get_delay_cost_original;
 BuildScoresFn build_scores_original;
 AddCostFn add_cost;
@@ -80,6 +83,7 @@ void log(const std::string& message) {
 }
 
 void* hookedGetCost(void* result, const void* component) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     void* out = get_cost_original(result, component);
     const auto kind = *static_cast<const uint8_t*>(component);
     int64_t gates = 0;
@@ -92,6 +96,7 @@ void* hookedGetCost(void* result, const void* component) {
 }
 
 int64_t hookedGetDelayCost(const void* component, int64_t fallback) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     const int64_t value = get_delay_cost_original(component, fallback);
     const auto kind = *static_cast<const uint8_t*>(component);
     ++delay_calls[kind];
@@ -99,7 +104,7 @@ int64_t hookedGetDelayCost(const void* component, int64_t fallback) {
     return value;
 }
 
-void hookedBuildScores(void* score, void* a1, void* a2, double scale) {
+void hookedBuildScores(void* score, void* a1, float a2, double scale) {
     build_scores_original(score, a1, a2, scale);
     if (!score) return;
     std::memcpy(&score_gates, static_cast<unsigned char*>(score), 8);
@@ -173,7 +178,7 @@ static void frame(void*, const TCFrame* value) {
     current_time = value->time_seconds - start_time;
     if (done || !model || current_time < 5.0) return;
     if (stage == 0) {
-        const char* text = "and_gate";
+        const char* text = level_name.c_str();
         const size_t length = std::strlen(text);
         tc::TCNimString name{};
         mod.game.raw_new_string(&name, static_cast<int64_t>(length));
@@ -181,6 +186,13 @@ static void frame(void*, const TCFrame* value) {
         std::memcpy(static_cast<unsigned char*>(name.data) + 8, text, length);
         static_cast<unsigned char*>(name.data)[8 + length] = 0;
         load_level(model, &name);
+        // Request the same asynchronous compilation consumed by the board UI.
+        // load_level alone never refreshes its cached statistics.
+        tc::TCNimString progress{};
+        auto request=reinterpret_cast<void(*)(void*,const tc::TCNimString*,uint8_t)>(
+            host->resolve_symbol(host->context,
+                "preorder__modelZsimulationZcompile95thread_u3523"));
+        request(model,&progress,0);
         loaded_level = true;
         stage_time = current_time;
         stage = 1;
@@ -202,6 +214,7 @@ static void frame(void*, const TCFrame* value) {
     cycle_after = mod.simulation.cycle();
 
     const auto folder = std::filesystem::u8path(host->data_directory_utf8);
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     std::ostringstream report;
     auto finish = [&](const std::string& text) {
         log(text);
@@ -218,7 +231,22 @@ static void frame(void*, const TCFrame* value) {
     if (have_prototype) mod.components.releasePrototype(prototype);
 
     const auto board = readBoard(model);
+    // Compile the actual board through the game's synchronous wrapper. The
+    // direct load_level path does not refresh the UI score, so that stale
+    // display must never be used as the assertion for this test.
+    alignas(16) unsigned char compiled[0xc0]{};
+    auto preorder = reinterpret_cast<void(*)(const void*,const void*,void*)>(
+        host->resolve_symbol(host->context,
+            "preorder__modelZsimulationZpreorder_u31266"));
+    preorder(static_cast<char*>(model)+0x78,static_cast<char*>(model)+0x98,compiled);
+    int64_t compiled_delay=0;
+    std::memcpy(&compiled_delay,compiled+0x20,8);
+    report << "compiled delay=" << compiled_delay << "\n";
+    auto gateCost=reinterpret_cast<uint64_t(*)(const void*,uint8_t)>(
+        host->resolve_symbol(host->context,"get_gate_cost__modelZscores_u2560"));
+    report << "compiled gates=" << gateCost(static_cast<char*>(model)+0x78,0) << "\n";
     report << "mode=" << mode << "\n";
+    report << "level=" << level_name << "\n";
     report << "prototype gates=" << prototype_gates
            << " delay=" << prototype_delay << "\n";
     report << "board components=" << board.size() << "\n";
@@ -257,6 +285,15 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     if (!mod.load(h) || !mod.valid() || !mod.components.valid()) return 2;
 
     const auto folder = std::filesystem::u8path(h->data_directory_utf8);
+    {std::ifstream f(folder/"level.txt");std::string s;if(f>>s) level_name=s;}
+    {
+        std::ifstream f(folder/"fixtures"/"inner_component.data",std::ios::binary);
+        if(f) {
+            std::string bytes((std::istreambuf_iterator<char>(f)),{});
+            auto result=mod.components.importCircuit("Inner AND",bytes.data(),bytes.size(),"D:/timing/");
+            if(!result.ok()) return 12;
+        }
+    }
     {
         std::ifstream mode_file(folder / "mode.txt");
         std::string text;
@@ -281,6 +318,8 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         if (!mod.game.getCustomPrototype(kAndComponentId, prototype)) return 5;
         const uint64_t gate_cost = tc::prototypeGateCost(prototype);
         const uint64_t delay_cost = tc::prototypeDelay(prototype);
+        // Register explicitly through the same SDK path used by native mods.
+        mod.game.setCustomPrototype(kAndComponentId, prototype);
         mod.components.releasePrototype(prototype);
 
         if (mode == "insert") {

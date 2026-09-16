@@ -4,6 +4,7 @@
 #include "MinHook.h"
 #include <memory>
 #include <functional>
+#include "component_timing.hpp"
 namespace tc {
 struct Symbols {
  std::map<std::string,void*> values;std::set<void*> functions;
@@ -29,6 +30,7 @@ public:
  void boot(){if(started)return;started=true;try{
   if(GetAsyncKeyState(VK_SHIFT)&0x8000){logger("Native safe mode: Shift held; plugins skipped");for(auto& id:core.enabled_set())statuses[id]="安全模式：本次未加载";return;}
   symbols=std::make_unique<Symbols>(core.root/L"Turing Complete.exe");auto mh=MH_Initialize();if(mh!=MH_OK&&mh!=MH_ERROR_ALREADY_INITIALIZED)throw std::runtime_error("MinHook initialization failed");
+  timing::install(symbols->values,ownedHooks,logger);
   std::map<std::string,Mod*> mods;for(auto& m:core.mods)if(m.error.empty())mods[m.id]=&m;
   std::set<std::string> visiting,done,failed;std::function<void(const std::string&)> load=[&](const std::string& id){if(done.count(id))return;if(!visiting.insert(id).second){failed.insert(id);statuses[id]="依赖循环";return;}if(!mods.count(id)){failed.insert(id);statuses[id]="Mod 缺失或无效";done.insert(id);return;}auto& m=*mods.at(id);
    for(auto& dep:m.dependencies){if(!core.enabled(dep)){failed.insert(dep);}else load(dep);if(failed.count(dep))failed.insert(id);}
@@ -37,8 +39,8 @@ public:
     try {if(!core.state.contains("native")||core.state["native"].value(id,"")!=m.digest)throw std::runtime_error("包内容已改变，请在 Mods 页面重新应用后重启");
      auto cache=core.dir/L"plugins"/fs::u8path(id)/m.digest;no_links(core.root,cache);fs::create_directories(cache);for(auto& [rel,bytes]:m.native){auto out=cache/fs::u8path(rel);no_links(core.root,out);auto tmp=out;tmp+=L".tc-tmp";no_links(core.root,tmp);if(!fs::exists(out)||hash(read(out))!=hash(bytes))atomic(out,bytes);}
      auto data=core.dir/L"plugin-data"/fs::u8path(id);no_links(core.root,data);fs::create_directories(data);p->folder=data.u8string();p->host={sizeof(TCHost),TC_MOD_API_VERSION,p.get(),"2.1.334 / native-api-1",p->id.c_str(),p->folder.c_str(),log_api,resolve,engine_api,hook_api};p->plugin.size=sizeof(TCPlugin);
-     p->dll=LoadLibraryExW((cache/fs::u8path(m.entry)).c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);if(!p->dll)throw std::runtime_error("LoadLibrary failed: "+std::to_string(GetLastError()));auto entry=(TCModLoad)GetProcAddress(p->dll,"tc_mod_load");if(!entry)throw std::runtime_error("Missing tc_mod_load export");if(entry(&p->host,&p->plugin)!=0||p->plugin.size!=sizeof(TCPlugin))throw std::runtime_error("Plugin rejected API / initialization failed");
-     p->accepting=false;for(auto h:p->hooks)if(MH_EnableHook(h)!=MH_OK)throw std::runtime_error("Cannot enable hook");p->active=true;statuses[id]="运行中（原生代码）";logger("Native loaded: "+id+"; hooks="+std::to_string(p->hooks.size()));
+     p->dll=LoadLibraryExW((cache/fs::u8path(m.entry)).c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);if(!p->dll)throw std::runtime_error("LoadLibrary failed: "+std::to_string(GetLastError()));auto entry=(TCModLoad)GetProcAddress(p->dll,"tc_mod_load");if(!entry)throw std::runtime_error("Missing tc_mod_load export");timing::Registration registration;if(entry(&p->host,&p->plugin)!=0||p->plugin.size!=sizeof(TCPlugin))throw std::runtime_error("Plugin rejected API / initialization failed");
+     p->accepting=false;for(auto h:p->hooks)if(MH_EnableHook(h)!=MH_OK)throw std::runtime_error("Cannot enable hook");timing::commit(registration.ids);p->active=true;statuses[id]="运行中（原生代码）";logger("Native loaded: "+id+"; hooks="+std::to_string(p->hooks.size()));
     }catch(const std::exception&e){statuses[id]=e.what();failed.insert(id);logger("Native failed: "+id+": "+e.what());reject(*p);}loaded.push_back(std::move(p));
    }
    visiting.erase(id);done.insert(id);

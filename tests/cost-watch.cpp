@@ -12,19 +12,24 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 
 namespace {
 
 const TCHost* host;
+std::recursive_mutex stats_mutex;
 tc::TCMod mod;
 
 using GetCostFn = void* (*)(void* result, const void* component);
 using GetDelayCostFn = int64_t (*)(const void* component, int64_t fallback);
-using GetGateCostFn = uint64_t (*)(const void* components, uint8_t recursive);
+using GetGateCostFn = uint64_t (*)(const void* components, uint8_t skip_custom);
 using BuildScoresFn = void (*)(void* score, void* a1, float a2, double scale);
-using PreorderFn = void (*)(void* model, void* level, void* solution);
+// Eight machine-level arguments, including the result buffer in argument 8.
+// A three-argument trampoline loses r9 and the four stack arguments.
+using PreorderFn = void (*)(void*, void*, void*, void*, void*, void*,
+                           uint64_t, void*);
 using UpdateWireFn = bool (*)(void* context, void* a1, void* a2, uint32_t point,
                               uint8_t fifth);
 
@@ -64,6 +69,7 @@ void log(const std::string& message) {
 }
 
 void* hookedGetCost(void* result, const void* component) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     void* out = get_cost_original(result, component);
     const auto kind = *static_cast<const uint8_t*>(component);
     KindStat& stat = cost_stats[kind];
@@ -85,6 +91,7 @@ void* hookedGetCost(void* result, const void* component) {
 }
 
 int64_t hookedGetDelayCost(const void* component, int64_t fallback) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     const int64_t value = get_delay_cost_original(component, fallback);
     const auto kind = *static_cast<const uint8_t*>(component);
     auto& entry = delay_stats[kind];
@@ -94,8 +101,9 @@ int64_t hookedGetDelayCost(const void* component, int64_t fallback) {
     return value;
 }
 
-uint64_t hookedGetGateCost(const void* components, uint8_t recursive) {
-    const uint64_t value = get_gate_cost_original(components, recursive);
+uint64_t hookedGetGateCost(const void* components, uint8_t skip_custom) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
+    const uint64_t value = get_gate_cost_original(components, skip_custom);
     ++gate_cost_calls;
     gate_cost_last = static_cast<int64_t>(value);
     dirty = true;
@@ -103,6 +111,7 @@ uint64_t hookedGetGateCost(const void* components, uint8_t recursive) {
 }
 
 void hookedBuildScores(void* score, void* a1, float a2, double scale) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     build_scores_original(score, a1, a2, scale);
     if (!score) return;
     int64_t gates = 0;
@@ -120,10 +129,11 @@ void hookedBuildScores(void* score, void* a1, float a2, double scale) {
     }
 }
 
-void hookedPreorder(void* model, void* level, void* solution) {
+void hookedPreorder(void* settings, void* components, void* wires, void* memory,
+                   void* a5, void* a6, uint64_t a7, void* result) {
     preorder_calls.fetch_add(1, std::memory_order_relaxed);
-    dirty = true;
-    preorder_original(model, level, solution);
+    { std::lock_guard<std::recursive_mutex> lock(stats_mutex); dirty = true; }
+    preorder_original(settings, components, wires, memory, a5, a6, a7, result);
 }
 
 bool hookedUpdateWire(void* context, void* a1, void* a2, uint32_t point,
@@ -168,6 +178,7 @@ std::string describeBoard() {
 }
 
 void report(double time) {
+    std::lock_guard<std::recursive_mutex> lock(stats_mutex);
     if (time - last_report < 1.5) return;
     const std::string board = describeBoard();
     const bool board_changed = board != last_board;
@@ -262,15 +273,18 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         h->create_hook(h->context, build_scores_target,
                        reinterpret_cast<void*>(hookedBuildScores),
                        reinterpret_cast<void**>(&build_scores_original)) != 0 ||
-        h->create_hook(h->context, preorder_target,
-                       reinterpret_cast<void*>(hookedPreorder),
-                       reinterpret_cast<void**>(&preorder_original)) != 0 ||
         h->create_hook(h->context, update_target,
                        reinterpret_cast<void*>(hookedUpdateWire),
                        reinterpret_cast<void**>(&update_wire_original)) != 0) {
         log("cost-watch: hook install failed");
         return 4;
     }
+    // The loader now owns this hook. It is optional for an observer; continue
+    // observing the UI and cost functions when that target is already owned.
+    if(h->create_hook(h->context, preorder_target,
+                      reinterpret_cast<void*>(hookedPreorder),
+                      reinterpret_cast<void**>(&preorder_original)) != 0)
+        log("cost-watch: preorder counter unavailable (hook owned by loader)");
     plugin->on_frame = frame;
     log("cost-watch: observing get_cost, get_delay_cost, get_gate_cost, "
         "build_scores, preorder, board");

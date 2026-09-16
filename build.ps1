@@ -70,6 +70,12 @@ try {
  if($LASTEXITCODE){throw 'Component model test build failed'}
  & .\build\component-model-test.exe
  if($LASTEXITCODE){throw 'Component model tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-timing.cpp -o build\component-timing-test.exe
+ if($LASTEXITCODE){throw 'Component timing test build failed'}
+ & .\build\component-timing-test.exe
+ if($LASTEXITCODE){throw 'Component timing tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared tests\component-cost-probe.cpp -o build\component-cost-probe.dll
+ if($LASTEXITCODE){throw 'Component cost probe build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\and-component-fixture.cpp -o build\and-component-fixture.exe
  if($LASTEXITCODE){throw 'AND component fixture build failed'}
  & .\build\and-component-fixture.exe build\and2_component.data

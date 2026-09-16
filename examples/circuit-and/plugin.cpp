@@ -94,10 +94,9 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         return 10;
     }
 
-    // Kind 0x4e instances read their cost straight from the prototype fields
-    // above, so no entry in the per-kind score table is needed.  A board's
-    // critical path is computed from the inlined design, which for this
-    // fixture is the same single gate delay.
+    // No entry in the per-kind score table is needed. The loader recognizes
+    // this native registration and uses its declared delay on the board's
+    // critical path, while the internal AND still supplies the logic.
     log("circuit-and: registered AND2 Test id=" +
         std::to_string(imported.custom_id) + " design gates=" +
         std::to_string(gate_cost) + " delay=" + std::to_string(delay_cost));

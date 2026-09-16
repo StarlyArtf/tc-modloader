@@ -14,6 +14,7 @@
 namespace {
 
 constexpr uint64_t kAndComponentId = 0x414E44325F303031ULL;
+constexpr uint64_t kInnerComponentId = 0x414E44325F303032ULL;
 constexpr uint16_t kInputPin = 0x4F;
 constexpr uint16_t kOutputPin = 0x51;
 constexpr uint16_t kAndGate = 0x04;
@@ -144,8 +145,8 @@ void addPin(Writer& writer, uint16_t kind, int16_t x, int16_t y,
     writer.u16(0);  // settings
 }
 
-void addAndGate(Writer& writer) {
-    writer.u16(kAndGate);
+void addAndGate(Writer& writer, bool nested=false) {
+    writer.u16(nested?0x4e:kAndGate);
     writer.i16(4);
     writer.i16(-10);
     writer.u8(0);
@@ -162,6 +163,7 @@ void addAndGate(Writer& writer) {
     writer.u8(0);
     writer.u16(0);
     writer.u16(0);
+    if(nested) { writer.i64(static_cast<int64_t>(kInnerComponentId));writer.u16(0); }
 }
 
 void addWire(Writer& writer, int16_t x, int16_t y,
@@ -192,12 +194,13 @@ void addV13Pin(Writer& writer, uint16_t kind, int16_t x, int16_t y,
     writer.u16(0);
 }
 
-void addV13CustomInstance(Writer& writer) {
+void addV13CustomInstance(Writer& writer, int16_t x=-5, int16_t y=0,
+                         uint64_t identity=0x2222222222222222ULL) {
     writer.u16(0x4E);
-    writer.i16(-5);
-    writer.i16(0);
+    writer.i16(x);
+    writer.i16(y);
     writer.u8(0);
-    writer.i64(0x2222222222222222LL);
+    writer.i64(static_cast<int64_t>(identity));
     writer.string("");
     writer.u16(0);
     writer.i64(0);
@@ -212,6 +215,7 @@ void addV13CustomInstance(Writer& writer) {
     writer.u16(0);
 }
 
+std::string topology="single";
 std::vector<uint8_t> buildLevelPayload(bool builtin_and) {
     Writer writer;
     writer.i64(0x6f13c29bb2e19440LL);  // original and_gate seed
@@ -228,30 +232,56 @@ std::vector<uint8_t> buildLevelPayload(bool builtin_and) {
     writer.string("");
     for (int i = 0; i < 512; ++i) writer.u8(0);
 
-    writer.i64(3);
+    const bool series=!builtin_and && topology=="series";
+    const bool parallel=!builtin_and && topology=="parallel";
+    const bool multidriver=!builtin_and && topology=="multidriver";
+    writer.i64(parallel?5:(series||multidriver)?4:3);
     addV13Pin(writer, 0x3F, -13, 0, 0x1111111111111111ULL, "Input", 8);
     if (builtin_and)
         addV13Pin(writer, kAndGate, -5, 0, 0x2222222222222222ULL, "", 1);
     else
         addV13CustomInstance(writer);
     addV13Pin(writer, 0x44, 13, 0, 0x3333333333333333ULL, "Output", 8);
+    if(series) addV13CustomInstance(writer,3,0,0x5555555555555555ULL);
+    if(parallel) {
+        addV13CustomInstance(writer,-5,6,0x5555555555555555ULL);
+        addV13Pin(writer,0x44,13,6,0x6666666666666666ULL,"Output 2",8);
+    }
+    // Two component outputs driving the same net: the verified rules do not
+    // cover it, so the modded timing must fall back to the native statistics.
+    if(multidriver) addV13CustomInstance(writer,-5,6,0x5555555555555555ULL);
 
-    writer.i64(3);
+    writer.i64(parallel?6:series?5:multidriver?4:3);
     addWire(writer, -13, -1, {0x0007, 0x0000});
-    addWire(writer, -13, 1, {0x0007, 0xC001, 0x0000});
-    addWire(writer, -3, -1, {0x000F, 0x4001, 0x0000});
+    if(builtin_and) addWire(writer,-13,1,{0x0007,0x0000});
+    else addWire(writer, -13, 1, {0x0007, 0xC001, 0x0000});
+    if(series) {
+        addWire(writer,-3,-1,{0x0005,0x0000});
+        addWire(writer,-3,-1,{0x4001,0x0005,0x0000});
+        addWire(writer,5,-1,{0x0007,0x4001,0x0000});
+    } else if(builtin_and) addWire(writer,-3,0,{0x000F,0x0000});
+    else addWire(writer, -3, -1, {0x000F, 0x4001, 0x0000});
+    if(parallel) {
+        addWire(writer,-13,-1,{0x4006,0x0007,0x0000});
+        addWire(writer,-13,1,{0x4005,0x0007,0x0000});
+        addWire(writer,-3,5,{0x000F,0x4001,0x0000});
+    }
+    // Custom instance pin offsets are (2,-1) for the output, so the second
+    // driver starts at (-3,5) and lands on the same net end as the first one.
+    if(multidriver) addWire(writer,-3,5,{0x000F,0xC005,0x0000});
     return writer.bytes;
 }
 
-std::vector<uint8_t> buildPayload() {
+std::vector<uint8_t> buildPayload(bool inner=false) {
     Writer writer;
-    writer.i64(static_cast<int64_t>(kAndComponentId));
+    const bool nested=topology=="nested" && !inner;
+    writer.i64(static_cast<int64_t>(inner?kInnerComponentId:kAndComponentId));
     writer.u32(0);
     // These two fields are carried in the serialized definition.  Their exact
     // meaning is under investigation (see research/COMPONENT-PIPELINE.md);
     // the generator lets callers vary them for controlled experiments.
     writer.i64(kMetaGates);  // copied from the verified Not ZR component
-    writer.i64(kMetaDelay);  // copied from the verified Not ZR component
+    writer.i64(inner?1:kMetaDelay);
     writer.u8(1);        // simulation settings are present
     writer.i64(10000);   // maximum cycle count
     writer.sequence_i64({});
@@ -265,13 +295,15 @@ std::vector<uint8_t> buildPayload() {
     writer.i64(4);  // components
     addPin(writer, kInputPin, -11, -13, 0x1000000000000000ULL, "A", -2, 1);
     addPin(writer, kInputPin, -11, -7, 0x1000000000000001ULL, "B", -4, 1);
-    addAndGate(writer);
+    addAndGate(writer,nested);
     addPin(writer, kOutputPin, 14, -10, 0x1000000000000003ULL, "Out", -2, 1);
 
     writer.i64(3);  // wires
     addWire(writer, -8, -13, {0x000B, 0x4002, 0x0000});
-    addWire(writer, -8, -7, {0x000B, 0xC002, 0x0000});
-    addWire(writer, 6, -10, {0x0005, 0x0000});
+    if(nested) addWire(writer,-8,-7,{0x000B,0xC003,0x0000});
+    else addWire(writer, -8, -7, {0x000B, 0xC002, 0x0000});
+    if(nested) addWire(writer,6,-11,{0x0005,0x4001,0x0000});
+    else addWire(writer, 6, -10, {0x0005, 0x0000});
     return writer.bytes;
 }
 
@@ -283,6 +315,7 @@ int main(int argc, char** argv) {
                  : std::filesystem::path("build/and2_component.data");
     if (argc > 2) kMetaGates = std::stoll(argv[2]);
     if (argc > 3) kMetaDelay = std::stoll(argv[3]);
+    if (argc > 4) topology=argv[4];
     const auto raw = buildPayload();
     std::vector<uint8_t> encoded;
     encoded.push_back(14);  // save-format version
@@ -296,6 +329,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::filesystem::create_directories(output.parent_path());
+    if(topology=="nested") {
+        std::vector<uint8_t> inner{14};writeLiteralSnappy(buildPayload(true),inner);
+        std::ofstream dependency(output.parent_path()/"inner_component.data",std::ios::binary);
+        dependency.write(reinterpret_cast<const char*>(inner.data()),inner.size());
+        if(!dependency) return 1;
+    }
     std::ofstream file(output, std::ios::binary | std::ios::trunc);
     file.write(reinterpret_cast<const char*>(encoded.data()),
                static_cast<std::streamsize>(encoded.size()));
