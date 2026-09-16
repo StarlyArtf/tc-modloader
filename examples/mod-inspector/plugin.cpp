@@ -30,6 +30,8 @@ static void frame(void*, const TCFrame*) {
         text("campaign name: " + std::string(model.state.campaignNameCStr() ? model.state.campaignNameCStr() : ""));
         text("save count: " + std::to_string(model.save.saveCount()));
         text("cycle: " + std::to_string(model.simulation.cycle()));
+        text("built-in prototypes: " + std::to_string(model.game.builtinPrototypeCount()));
+        text("custom prototypes: " + std::to_string(model.game.customPrototypeCount()));
         text("selected components: " + std::to_string(model.board.selectedComponentCount()));
         text("selected wires: " + std::to_string(model.board.selectedWireCount()));
         text("level path: " + std::string(model.save.levelPathCStr() ? model.save.levelPathCStr() : ""));
