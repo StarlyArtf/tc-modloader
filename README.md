@@ -59,7 +59,7 @@ SDK 定义：sdk/tc_mod_api.h。开发指南：SDK-GUIDE.md。
 - 导线：读取、取色、添加、放置、更新。
 - 存档：保存次数和当前 level/schematic 路径。
 
-元件接口现提供实验性的电路文件导入、目录更新和原型快照释放（`tc_component_model.h`），已在隔离游戏实例验证；也已修正 64 位自定义 ID 和字符串长度。现已用两输入一输出 AND 元件验证自定义引脚数量、名称和一位位宽，但菜单注册、拖动放置、连线、保存重载和新元件仿真仍未验收，不能等同于任意新逻辑元件支持。证据与复现方法见 [元件链路研究](research/COMPONENT-PIPELINE.md)。
+元件接口现提供实验性的电路文件导入、目录更新和原型快照释放（`tc_component_model.h`），已在隔离游戏实例验证；也已修正 64 位自定义 ID 和字符串长度。现已用两输入一输出 AND 元件验证自定义引脚数量、名称、一位位宽，并通过组件菜单使用的同一放置 helper 把实例落到 sandbox board。实际鼠标拖动、连线、保存重载和新元件仿真仍未验收，不能等同于任意新逻辑元件支持。证据与复现方法见 [元件链路研究](research/COMPONENT-PIPELINE.md)。
 
 ## 启停、更新和恢复
 
@@ -109,7 +109,7 @@ Windows x64 + MinGW-w64，默认 C:\msys64\ucrt64\bin，可通过 TC_MINGW_BIN �
 
 修改和构建加载器时，先解压分发包中的 TCModLoader-0.3.0-source.zip；完整示例源码也在该源码包中。
 
-依次执行 build.ps1、node tests/run.js、tests/native.ps1、tests/saves.ps1、tests/setup.ps1、package.ps1。验证电路封装 AND fixture 时，在 build.ps1 后执行 tests/and-component-playtest.ps1。
+依次执行 build.ps1、node tests/run.js、tests/native.ps1、tests/saves.ps1、tests/setup.ps1、package.ps1。验证电路封装 AND fixture 时，在 build.ps1 后执行 tests/and-component-playtest.ps1；验证元件菜单放置路径时执行 tests/component-placement-playtest.ps1。
 
 依赖源码 miniz 3.0.2、nlohmann/json 3.11.3、MinHook 1.3.4 已固定并随源码提供，不需联网构建。Node.js 只用于开发测试及导出表维护。
 

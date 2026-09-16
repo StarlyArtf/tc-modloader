@@ -12,6 +12,18 @@
   真值表仿真、保存重载和有状态行为尚未验收。
 - 证据：`build/and-component-playtest-d5eb786ded044ff08b8ae278cbbc2ec9/game/tc-modloader-data/loader.log`。
 
+# 元件菜单与放置验收（2026-09-16，步骤 2）
+
+- 新增 `tests/component-placement-probe.cpp`，在隔离游戏中导入 AND fixture，进入 sandbox，
+  调用组件菜单使用的同一 `add_component` helper，把自定义 kind `0x4e` 和 64 位 ID 放入
+  菜单放置模板。
+- 实测 helper 返回成功，board 组件数从 1 增至 2；随后按 board 组件数组的实际布局
+  `payload + 8 + index * 0x238` 扫描，找到 kind `0x4e`、位置 `(30,0)`、ID
+  `0x414E44325F303031` 的实例。
+- 这表明自定义元件已进入可被菜单放置的原型表，并能通过菜单模型路径落到 board。
+  尚缺的是纯视觉上的“打开列表并按下鼠标拖动”自动化；本轮没有把模型放置冒充鼠标操作。
+- 证据：`build/component-placement-playtest-80554655e4a74f4da93ce23f542f1b89/game/tc-modloader-data/loader.log`。
+
 # 元件导入封装验证（2026-09-16，第二阶段）
 
 - 新组件模型测试通过：二进制字符串含 NUL、64 位返回 ID、临时分配释放平衡、目录参数、错线程拒绝、调用前后 Nim 错误状态及快照释放。

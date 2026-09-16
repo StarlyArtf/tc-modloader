@@ -59,4 +59,6 @@ try {
  if($LASTEXITCODE){throw 'AND component fixture generation failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\and-component-probe.cpp -o build\and-component-probe.dll
  if($LASTEXITCODE){throw 'AND component probe build failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-placement-probe.cpp -o build\component-placement-probe.dll
+ if($LASTEXITCODE){throw 'Component placement probe build failed'}
 } finally { Pop-Location }

@@ -227,3 +227,33 @@ v13/v14 的组件公共字段基本一致，差异在于 v14 在组件 `bits` �
 原型名称为 `AND2 Test`，输入 2、输出 1，三个引脚的 raw word size 均为 1。该证据覆盖
 “电路封装元件的引脚、位宽和内部电路已进入游戏原型表”，但不等于菜单、放置、连线、
 保存重载或逻辑真值表已经验收。
+
+## 8. 第三阶段：菜单放置模型（步骤 2）
+
+组件菜单最终调用 `add_component__presenterZutilitiesZhelper95functions_u5918`。
+它的第一个参数不是 board，而是 presenter/board 容器；board 位于 `context+0x78`。
+`handle_update_wire` 的第一个参数就是该容器指针，因此可以在开发探针中捕获。
+
+board 布局（已通过放置前后计数与现有 wire 代码交叉验证）：
+
+```text
+board = context + 0x78
+board + 0x00 / +0x08   组件序列长度 / payload
+board + 0x20 / +0x28   导线序列长度 / payload
+```
+
+序列 payload 有 8 字节头，元素从 `payload + 8` 开始；board 组件步长是 `0x238`。
+这和保存格式的组件对象大小一致。菜单放置请求只用以下字段：
+
+```text
++0x00  u8   kind（自定义为 0x4e）
++0x02  i32  位置，低 16 位 x、高 16 位 y
++0x06  u8   旋转/方向
++0x188 i64  自定义元件 ID
+```
+
+其余字段沿用菜单模板中的默认值，然后由 `add_component` 查找原型并调用
+`board_add_component` / `board_commit_add`。新增 `tests/component-placement-probe.cpp`
+在隔离 sandbox 中执行这条路径：注入的 AND 元件以 kind `0x4e`、位置 `(30,0)`、ID
+`0x414E44325F303031` 出现在 board 组件数组中。该测试证明菜单的模型路径可以放置插件
+注册的电路元件；鼠标命中测试和列表视觉渲染仍属于后续 UI 自动化范围。
