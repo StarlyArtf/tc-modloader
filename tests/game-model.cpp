@@ -34,6 +34,10 @@ uint64_t gCurrentWordSize = 8;
 alignas(8) unsigned char gLevelProgress[16]{};
 alignas(8) unsigned char gCampaignName[64]{};
 alignas(8) unsigned char gSimulationCircuitState[16]{};
+alignas(8) unsigned char gSimInputReplay[16]{};
+alignas(8) unsigned char gSimOutputHistory[16]{};
+alignas(8) unsigned char gSimKeyboardCharacter[16]{};
+alignas(8) unsigned char gSimKeyboardCoordinate[16]{};
 void* gSimulationSettingsValue = reinterpret_cast<void*>(1);
 void* gSimulationSettingsPointer = &gSimulationSettingsValue;
 int64_t gSimCycle = 100;
@@ -341,6 +345,18 @@ void* fakeResolve(void*, const char* name) {
     if (symbol == "set_command_setting__modelZsimulator95types_u131") {
         return reinterpret_cast<void*>(&fakeSimSetSetting);
     }
+    if (symbol == "simulation_input_replay__modelZsimulator95types_u84") {
+        return gSimInputReplay;
+    }
+    if (symbol == "simulation_output_history_pins__modelZsimulator95types_u85") {
+        return gSimOutputHistory;
+    }
+    if (symbol == "simulation_keyboard_character__modelZsimulator95types_u88") {
+        return gSimKeyboardCharacter;
+    }
+    if (symbol == "simulation_keyboard_coordinate__modelZsimulator95types_u89") {
+        return gSimKeyboardCoordinate;
+    }
     if (symbol == "pipette_wire__modelZutilities_u2289") {
         return reinterpret_cast<void*>(&fakePipetteWire);
     }
@@ -445,7 +461,11 @@ int main() {
 
     tc::TCSimulationModel sim;
     if (!sim.load(&host) || !sim.valid() || !sim.settingsReady() ||
-        sim.cycle() != 100 || sim.commandSetting(2) != 7) {
+        sim.cycle() != 100 || sim.commandSetting(2) != 7 ||
+        sim.inputReplay() != gSimInputReplay ||
+        sim.outputHistoryPins() != gSimOutputHistory ||
+        sim.keyboardCharacter() != gSimKeyboardCharacter ||
+        sim.keyboardCoordinate() != gSimKeyboardCoordinate) {
         std::cerr << "simulation model mismatch\n";
         return 1;
     }

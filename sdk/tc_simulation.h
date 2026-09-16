@@ -17,6 +17,10 @@ struct TCSimulationModel {
     void** settings = nullptr;
     TCSimGetSettingFn get_setting = nullptr;
     TCSimSetSettingFn set_setting = nullptr;
+    const void* input_replay = nullptr;
+    const void* output_history_pins = nullptr;
+    const void* keyboard_character = nullptr;
+    const void* keyboard_coordinate = nullptr;
 
     bool load(const TCHost* host) {
         if (host == nullptr) return false;
@@ -35,6 +39,14 @@ struct TCSimulationModel {
         set_setting = reinterpret_cast<TCSimSetSettingFn>(
             host->resolve_symbol(host->context,
                                  "set_command_setting__modelZsimulator95types_u131"));
+        input_replay = host->resolve_symbol(
+            host->context, "simulation_input_replay__modelZsimulator95types_u84");
+        output_history_pins = host->resolve_symbol(
+            host->context, "simulation_output_history_pins__modelZsimulator95types_u85");
+        keyboard_character = host->resolve_symbol(
+            host->context, "simulation_keyboard_character__modelZsimulator95types_u88");
+        keyboard_coordinate = host->resolve_symbol(
+            host->context, "simulation_keyboard_coordinate__modelZsimulator95types_u89");
         return valid();
     }
 
@@ -67,6 +79,11 @@ struct TCSimulationModel {
     void setCommandSetting(uint8_t key, int64_t value) const {
         if (set_setting) set_setting(key, value);
     }
+
+    const void* inputReplay() const { return input_replay; }
+    const void* outputHistoryPins() const { return output_history_pins; }
+    const void* keyboardCharacter() const { return keyboard_character; }
+    const void* keyboardCoordinate() const { return keyboard_coordinate; }
 };
 
 }  // namespace tc
