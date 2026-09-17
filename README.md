@@ -135,7 +135,7 @@ Windows x64 + MinGW-w64，默认 C:\msys64\ucrt64\bin，可通过 TC_MINGW_BIN �
 
 修改和构建加载器时，先解压分发包中的 TCModLoader-0.4.0-source.zip；完整示例源码也在该源码包中。
 
-依次执行 build.ps1、node tests/run.js、tests/native.ps1、tests/saves.ps1、tests/setup.ps1、package.ps1。验证电路封装 AND fixture 时，在 build.ps1 后执行 tests/and-component-playtest.ps1；验证元件菜单放置路径时执行 tests/component-placement-playtest.ps1；验证保存电路重启重载时执行 tests/component-persistence-playtest.ps1。
+依次执行 build.ps1、node tests/run.js、tests/native.ps1、tests/saves.ps1、tests/setup.ps1、package.ps1。验证电路封装 AND fixture 时，在 build.ps1 后执行 tests/and-component-playtest.ps1；验证元件菜单放置路径时执行 tests/component-placement-playtest.ps1；验证保存电路重启重载时执行 tests/component-persistence-playtest.ps1；验证原生 C++ OR 行为时执行 tests/custom-or-playtest.ps1。
 
 依赖源码 miniz 3.0.2、nlohmann/json 3.11.3、MinHook 1.3.4 已固定并随源码提供，不需联网构建。Node.js 只用于开发测试及导出表维护。
 

@@ -138,6 +138,26 @@
 边界：反馈环、多驱动与初始化后新注册原型仍保留原生统计；元件内部逻辑始终由游戏
 展开执行，本特性只影响编译期统计，不改变仿真语义。
 
+# 0.4.0 原生自定义逻辑验证
+
+2026-09-17：新增 `sdk/tc_custom_logic.h` 和 `examples/custom-or`。
+示例元件内部电路仍是 AND 作为后备，但运行时通过 `TCCustomLogicRuntime`
+把行为替换为 C++ OR 回调。
+
+`tests/custom-or-playtest.ps1` 在独立游戏副本/存档中验证：
+
+```text
+[example.custom-or] custom-or: registered native OR2 id=4705773643784794161
+[example.custom-or] custom-or: cycle=1 output=1 expected=0 fail
+PASS native custom OR component produced OR behavior through C++ callback
+```
+
+也就是说，cycle 1 的原生 AND 结果应为 0，但 C++ 回调算出 1，测试因此失败；
+这证明元件行为已经由插件代码决定，而不是由内部电路决定。
+
+当前原生运行时只解释简单关卡 IO（0x3f/0x44）、自定义实例（0x4e）和点对点导线；
+内置逻辑门、复杂网表、RAM/寄存器和暂停/重置生命周期尚未纳入。
+
 ## 验证边界
 
 未完整验证：实际电路内所有运行入口、战役通关、新元件注册、其他游戏构建、所有显卡和窗口配置、多种第三方原生插件组合。安全模式已实现，但未进行物理按键实机测试。
