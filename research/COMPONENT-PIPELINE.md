@@ -563,6 +563,32 @@ RAM 等 36 个 kind 共用同一个分支 `0x140227e30`**（结构型分支）�
 两级电平 IO；下一步需要把“读板子拓扑、计算每周期输入、写回输出”抽成
 稳定接口，并扩展到更多元件 kind 与更复杂的连线。
 
+### 12.4 原生逻辑 SDK 与示例 Mod（2026-09-17）
+
+新增 `sdk/tc_custom_logic.h`：
+
+- `TCCustomLogicComponent` 描述自定义 ID、输入/输出数和 C++ 逻辑回调。
+- `TCCustomLogicRuntime::run` 解析运行时 board：
+  - 元件序列：`model+0x78`/`+0x80`，步长 `0x238`
+  - 导线序列：`model+0x98`/`+0xa0`，步长 `0x68`
+  - wire 两端 int16 坐标在 `+0x18`/`+0x1c`，运行时状态索引在 `+0x38`
+- 运行时对 level input `0x3f`、level output `0x44`、自定义实例 `0x4e`
+  建立网表，每周期调用插件回调，并把值写回 `simulation_state` 与
+  `simulation_settings`。
+
+新增示例 `examples/custom-or`：内部电路仍是 AND 作为后备，C++ 回调把行为
+替换为 OR。`tests/custom-or-playtest.ps1` 已真机通过：
+
+```text
+[example.custom-or] custom-or: registered native OR2 id=4705773643784794161
+[example.custom-or] custom-or: cycle=1 output=1 expected=0 fail
+PASS native custom OR component produced OR behavior through C++ callback
+```
+
+这标志着“元件行为由插件 C++ 决定”已经从探针实验升级为可引用的 SDK 能力。
+当前限制：只解释简单 level IO + 自定义实例 + 点对点导线；内置逻辑门、
+复杂网表、RAM/寄存器和暂停/重置生命周期尚未纳入。
+
 实验步骤（下一轮执行）：
 
 1. 新建 `tests/sim-state-probe.cpp`：导入一个自定义元件 → 载入 `and_gate` 关卡 →

@@ -52,6 +52,15 @@ try {
  Copy-Item examples\circuit-and\native\circuit-and.dll (Join-Path $taskCircuitAnd 'native') -Force
  if(Test-Path dist\example.circuit-and.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.circuit-and.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskCircuitAnd -Output (Join-Path $taskRoot 'dist\example.circuit-and.mod')
+ New-Item -ItemType Directory -Force examples\custom-or\native | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk examples\custom-or\plugin.cpp -o examples\custom-or\native\custom-or.dll
+ if($LASTEXITCODE){throw 'Custom OR example build failed'}
+ $taskCustomOr=Join-Path $taskRoot 'build\custom-or-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskCustomOr 'native') | Out-Null
+ Copy-Item examples\custom-or\mod.json $taskCustomOr -Force
+ Copy-Item examples\custom-or\native\custom-or.dll (Join-Path $taskCustomOr 'native') -Force
+ if(Test-Path dist\example.custom-or.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.custom-or.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskCustomOr -Output (Join-Path $taskRoot 'dist\example.custom-or.mod')
  # Diagnostic observer for gate/delay score investigation (dev only).
  $taskCostWatch=Join-Path $taskRoot 'build\cost-watch-package'
  New-Item -ItemType Directory -Force (Join-Path $taskCostWatch 'native') | Out-Null

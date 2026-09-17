@@ -7,6 +7,7 @@
 // we are looking for.  Read-only: it never writes game state.
 
 #include "../sdk/tc_mod.h"
+#include "../sdk/tc_custom_logic.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -53,8 +54,6 @@ using GetSimState = void* (*)(void*, const void*);
 GetSimState get_sim_state_original;
 using GetTestState = int64_t (*)();
 GetTestState get_test_state;
-using SetSimulationSetting = void (*)(uint8_t, int64_t);
-SetSimulationSetting set_simulation_setting;
 
 bool started = false;
 double start_time = 0;
@@ -67,11 +66,44 @@ int test_frame = -1;
 int test_button_index = 0;
 bool imported_custom = false;
 std::string custom_logic;
-bool native_custom_failed = false;
-
-void* state_global = nullptr;  // address of the raw simulation_state pointer
+tc::TCCustomLogicRuntime custom_runtime;
 void* input_replay_global = nullptr;
 void* output_history_global = nullptr;
+unsigned char* smallBuffer(void* global);
+
+constexpr uint64_t kCustomComponentId = 0x414E44325F303031ULL;
+
+void customLogicOr(tc::TCCustomLogicIO* io) {
+    io->outputs[0] = (io->inputs[0] | io->inputs[1]) & 1;
+}
+
+uint64_t customLevelInput(int64_t cycle, uint32_t pin, void*) {
+    const uint64_t value = cycle < 0 ? 0 : (static_cast<uint64_t>(cycle) & 3);
+    return pin == 0 ? (value & 1) : ((value >> 1) & 1);
+}
+
+void customLevelInputWrite(int64_t cycle, uint32_t, uint64_t, void*) {
+    unsigned char* replay = smallBuffer(input_replay_global);
+    if (replay) {
+        const auto input = static_cast<unsigned char>(cycle < 0 ? 0 : (cycle & 3));
+        replay[0] = replay[8] = input;
+    }
+}
+
+void customLevelOutputWrite(int64_t, uint32_t, uint64_t value, void*) {
+    unsigned char* history = smallBuffer(output_history_global);
+    if (history) history[55] = history[64] = static_cast<unsigned char>(value & 1);
+}
+
+int64_t customTest(int64_t cycle, const uint64_t* outputs, uint32_t, void*) {
+    if (cycle < 0) return 0;
+    if (cycle >= 4) return 1;
+    static const uint8_t expected[4] = {0, 0, 0, 1};
+    if ((outputs[0] & 1) != expected[cycle]) return 2;
+    return cycle == 3 ? 1 : 0;
+}
+
+void* state_global = nullptr;  // address of the raw simulation_state pointer
 unsigned char* state_buffer = nullptr;
 std::vector<std::vector<unsigned char>> snapshots;
 std::vector<std::vector<unsigned char>> input_replay_snapshots;
@@ -130,47 +162,6 @@ unsigned char* smallBuffer(void* global) {
     return buffer;
 }
 
-void runNativeCustomLoop(int64_t target) {
-    unsigned char* replay = smallBuffer(input_replay_global);
-    unsigned char* history = smallBuffer(output_history_global);
-    if (!state_buffer || !replay || !history) return;
-
-    int64_t current = mod.simulation.cycle();
-    if (current < -1) current = -1;
-    if (current < 0) native_custom_failed = false;
-    for (int64_t cycle = current + 1; cycle <= target; ++cycle) {
-        const uint8_t input =
-            static_cast<uint8_t>(cycle < 0 ? 0 : (cycle & 3));
-        const uint8_t low = input & 1;
-        const uint8_t high = (input >> 1) & 1;
-        const uint8_t output =
-            custom_logic == "or" ? (low | high) : (low & high);
-
-        state_buffer[256] = state_buffer[257] = low;
-        state_buffer[262] = state_buffer[263] = low;
-        state_buffer[266] = low;
-        state_buffer[258] = state_buffer[259] = high;
-        state_buffer[260] = state_buffer[261] = high;
-        state_buffer[267] = high;
-        state_buffer[264] = state_buffer[265] = output;
-
-        replay[0] = replay[8] = input;
-        history[55] = history[64] = output;
-
-        int64_t test_state = 0;
-        if (cycle >= 0 && cycle < 4) {
-            static const uint8_t expected[4] = {0, 0, 0, 1};
-            if (output != expected[cycle]) native_custom_failed = true;
-            if (native_custom_failed) test_state = 2;       // fail
-            else if (cycle == 3) test_state = 1;            // win
-        } else if (cycle >= 4) {
-            test_state = native_custom_failed ? 2 : 1;
-        }
-        set_simulation_setting(0, cycle);
-        set_simulation_setting(2, test_state);
-    }
-}
-
 bool hookedUpdate(void* m, void* context, void* input, uint32_t point,
                   uint8_t fifth) {
     model = m;
@@ -188,10 +179,8 @@ void interceptedSimDo(void* state, uint8_t command, int64_t target) {
         model_logged = true;
         log("sim-state: model captured from sim_do " + hex(model));
     }
-    if (imported_custom && !custom_logic.empty() && command == 0 &&
-        set_simulation_setting) {
-        runNativeCustomLoop(target);
-        return;
+    if (imported_custom && !custom_logic.empty() && command == 0) {
+        if (custom_runtime.run(mod, state, target)) return;
     }
     if (sim_do_original) sim_do_original(state, command, target);
 }
@@ -348,6 +337,55 @@ void finish() {
     };
     report_small("input_replay", input_replay_snapshots);
     report_small("output_history", output_history_snapshots);
+
+    if (model) {
+        auto* base = static_cast<unsigned char*>(model);
+        uint64_t components = 0;
+        uint64_t wires = 0;
+        void* component_data = nullptr;
+        void* wire_data = nullptr;
+        std::memcpy(&components, base + 0x78, sizeof(components));
+        std::memcpy(&component_data, base + 0x80, sizeof(component_data));
+        std::memcpy(&wires, base + 0x98, sizeof(wires));
+        std::memcpy(&wire_data, base + 0xa0, sizeof(wire_data));
+        report << "board components=" << components << " wires=" << wires << "\n";
+        if (component_data && components <= 32) {
+            for (uint64_t i = 0; i < components; ++i) {
+                const auto* component =
+                    static_cast<const unsigned char*>(component_data) + 8 + i * 0x238;
+                uint16_t kind = 0;
+                int16_t x = 0;
+                int16_t y = 0;
+                uint64_t id = 0;
+                std::memcpy(&kind, component, sizeof(kind));
+                std::memcpy(&x, component + 2, sizeof(x));
+                std::memcpy(&y, component + 4, sizeof(y));
+                std::memcpy(&id, component + 0x188, sizeof(id));
+                report << "board_component " << i << " kind=0x" << std::hex
+                       << kind << std::dec << " pos=" << x << "," << y
+                       << " id=" << id << " bytes=";
+                for (size_t j = 0; j < 0x40; ++j) {
+                    char buf[4];
+                    std::snprintf(buf, sizeof(buf), "%02x", component[j]);
+                    report << buf;
+                }
+                report << "\n";
+            }
+        }
+        if (wire_data && wires <= 32) {
+            for (uint64_t i = 0; i < wires; ++i) {
+                const auto* wire =
+                    static_cast<const unsigned char*>(wire_data) + 8 + i * 0x68;
+                report << "board_wire " << i << " bytes=";
+                for (size_t j = 0; j < 0x60; ++j) {
+                    char buf[4];
+                    std::snprintf(buf, sizeof(buf), "%02x", wire[j]);
+                    report << buf;
+                }
+                report << "\n";
+            }
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(read_mutex);
@@ -507,8 +545,6 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         h->context, "get_sim_state__modelZsimulationZcontroller_u102");
     get_test_state = reinterpret_cast<GetTestState>(h->resolve_symbol(
         h->context, "sim_get_test_state__modelZsimulationZcontroller_u26"));
-    set_simulation_setting = reinterpret_cast<SetSimulationSetting>(
-        h->resolve_symbol(h->context, "set_simulation_setting__modelZsimulator95types_u118"));
     if (!update_target || !invisible_target || !sim_do_target) return 4;
 
     if (h->create_hook(h->context, update_target,
@@ -542,6 +578,17 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     unsigned char* initial_buffer =
         *reinterpret_cast<unsigned char**>(state_global);
     state_buffer = initial_buffer;
+    if (!custom_runtime.load(h)) return 11;
+    tc::TCCustomLogicComponent definition{};
+    definition.custom_id = kCustomComponentId;
+    definition.input_count = 2;
+    definition.output_count = 1;
+    definition.logic = &customLogicOr;
+    definition.level_input = &customLevelInput;
+    definition.level_input_write = &customLevelInputWrite;
+    definition.level_output_write = &customLevelOutputWrite;
+    definition.test = &customTest;
+    if (!custom_runtime.add(definition)) return 12;
     log("sim-state: state global=" + hex(state_global) +
         " buffer=" + hex(initial_buffer) +
         " size=" + std::to_string(kSimulationStateSize) +

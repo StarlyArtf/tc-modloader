@@ -10,6 +10,7 @@ $taskPatterns = @(
   'component-placement-playtest-*',
   'component-persistence-playtest-*',
   'component-cost-playtest-*',
+  'custom-or-playtest-*',
   'cost-watch-smoke-*',
   'circuit-and-playtest-*',
   'installer-test-*',

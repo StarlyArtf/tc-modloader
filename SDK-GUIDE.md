@@ -243,6 +243,38 @@ Nim 静态字符串：游戏可能共享而不是复制这种内存。原 `setPr
 所以以它为基础封装的有状态元件应声明 `(5,4)`；fixture 拓扑 `delay`
 （`tests/and-component-fixture.cpp`）就是这么做的，并用 `stateful` 用例回归。
 
+## 原生自定义逻辑元件（实验）
+
+`sdk/tc_custom_logic.h` 提供 `TCCustomLogicRuntime`：在简单关卡板型中，
+Mod 可以用 C++ 回调决定自定义元件的每周期行为，而不是只执行
+`circuit.data` 里的内部电路。
+
+当前支持的范围：
+
+- 关卡输入元件 `0x3f`
+- 关卡输出元件 `0x44`
+- 已注册的自定义元件实例 `0x4e`
+- 点到点导线；运行时从 wire 对象读取状态索引和两端坐标
+
+用法：
+
+1. 用现有 `TCComponentModel::importCircuit` 注册一个带引脚的元件定义，
+   作为菜单、放置和保存的后备。
+2. 创建 `TCCustomLogicRuntime`，调用 `load(host)`，再调用 `add(...)`
+   注册同一个自定义 ID、输入/输出数和 C++ 回调。
+3. Hook `sim_do`；收到 run 命令时调用 `runtime.run(mod, model, target)`，
+   成功则不再调用原函数。
+4. 通过 `level_input` / `level_input_write` / `level_output_write` /
+   `test` 回调提供关卡 IO 和测试语义。
+
+`examples/custom-or` 是完整示例：内部电路仍是 AND，作为后备；原生运行时
+用 OR 回调接管，真机回归 `tests/custom-or-playtest.ps1` 会验证 cycle 1
+输出 1 而期望 0，测试因此失败。
+
+边界：这不是任意板型的完整解释器。内置逻辑门尚未参与原生解释；
+复杂反馈、RAM/寄存器、暂停/重置的生命周期也还没有进入该 API。
+下一步是扩充支持的 kind 和更复杂的网表。
+
 ## 编译和打包
 
 使用 MSVC 或 MinGW-w64 构建 x64 DLL，建议静态链接编译器运行库，或将依赖 DLL 放在入口 DLL 同目录。
