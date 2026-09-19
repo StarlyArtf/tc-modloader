@@ -1,4 +1,4 @@
-# Runs the UI example (mod-inspector) in an isolated sandbox and asserts that its
+﻿# Runs the UI example (mod-inspector) in an isolated sandbox and asserts that its
 # panel actually drew a frame through sdk/tc_ui.h.
 #
 # The panel logs one line the first time it is drawn:

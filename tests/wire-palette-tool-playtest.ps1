@@ -1,4 +1,4 @@
-# End-to-end check of the wire palette's tool-column form: builds the mod, runs
+﻿# End-to-end check of the wire palette's tool-column form: builds the mod, runs
 # it in an isolated copy of the game beside a driver that enters a board and
 # holds the mouse over the tile, and takes a screenshot from inside the process
 # (the sandbox window is parked off the desktop, so nothing outside can see it).

@@ -1,4 +1,4 @@
-# Keyboard and character-input playtest for plugin pages.
+﻿# Keyboard and character-input playtest for plugin pages.
 #
 # What it proves (and what it deliberately does not):
 #   * a plugin's InputText receives key presses and characters through the

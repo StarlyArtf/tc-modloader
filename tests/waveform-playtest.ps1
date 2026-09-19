@@ -1,4 +1,4 @@
-# Real-machine playtest for the live waveform panel (example.waveform-demo).
+﻿# Real-machine playtest for the live waveform panel (example.waveform-demo).
 #
 # The point of this example is data, not widgets: it has to show the *running
 # level's* inputs and outputs, cycle by cycle, as waveforms.  The in-process

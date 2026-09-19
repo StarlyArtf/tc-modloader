@@ -1,4 +1,4 @@
-param([int]$Seconds=35,[string]$Loader='')
+﻿param([int]$Seconds=35,[string]$Loader='')
 $ErrorActionPreference='Stop'
 $taskRepo=Split-Path $PSScriptRoot
 $taskCompiler=if($env:TC_MINGW_BIN){$env:TC_MINGW_BIN}else{'C:\msys64\ucrt64\bin'}

@@ -1,4 +1,4 @@
-# Real-machine playtest for the Board handle registry (sdk/tc_handle_api.h).
+﻿# Real-machine playtest for the Board handle registry (sdk/tc_handle_api.h).
 #
 # tests/game-handles.cpp proves the registry in isolation; this playtest proves
 # the half only the real game can produce - a level lifetime.  The driver build

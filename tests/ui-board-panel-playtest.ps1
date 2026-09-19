@@ -1,4 +1,4 @@
-# Circuit-board side panel playtest: registration, real input ownership and
+﻿# Circuit-board side panel playtest: registration, real input ownership and
 # scene lifetime, driven through the real game window.
 #
 # What it proves, and how:

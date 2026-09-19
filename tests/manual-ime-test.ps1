@@ -1,4 +1,4 @@
-# One-command manual test bench for the things that cannot be scripted:
+﻿# One-command manual test bench for the things that cannot be scripted:
 # Chinese IME (composition string, candidate window placement) and whether
 # typing into a circuit-board panel also reaches the board's own hotkeys.
 #

@@ -1,4 +1,4 @@
-# Native UI page playtest: registration, ID isolation and lifecycle, driven
+﻿# Native UI page playtest: registration, ID isolation and lifecycle, driven
 # through the real game window.
 #
 # What it proves, and what it cannot:

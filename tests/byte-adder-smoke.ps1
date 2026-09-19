@@ -1,4 +1,4 @@
-# End-to-end check of the real example.byte-adder package in an isolated game
+﻿# End-to-end check of the real example.byte-adder package in an isolated game
 # copy: the campaign Byte Adder level drives carry_in + A + B and the level
 # itself compares (carry_out << 8) | sum.  Both callback phases are asserted,
 # because the on-screen table reads the refresh path while the level test reads
