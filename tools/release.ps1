@@ -30,9 +30,17 @@ function Resolve-ReleaseName([string]$Template, [string]$Version) {
   return $Template.Replace('{version}', $Version)
 }
 
-function Invoke-ReleaseTest([string[]]$Arguments) {
-  & (Join-Path $taskRepo 'tools\test.ps1') @Arguments
-  if ($LASTEXITCODE) { throw "Release validation failed: tools/test.ps1 $($Arguments -join ' ')" }
+<# Named parameters as a hashtable: an array-splat of '-Tier'/'fast' binds the
+   literal "-Tier" to test.ps1's positional $Tier and the run dies before any
+   test starts, which is how this entry point stayed broken while the release
+   contract test (which only compares archives) kept passing. #>
+function Invoke-ReleaseTest([hashtable]$Parameters) {
+  & (Join-Path $taskRepo 'tools\test.ps1') @Parameters
+  if ($LASTEXITCODE) {
+    $taskCalled = ($Parameters.GetEnumerator() | Sort-Object Key |
+      ForEach-Object { "-$($_.Key) $($_.Value)" }) -join ' '
+    throw "Release validation failed: tools/test.ps1 $taskCalled"
+  }
 }
 
 function Test-Excluded([string]$RelativePath, [object[]]$Patterns) {
@@ -165,14 +173,16 @@ if ($taskGit) {
 if (!$SkipTests) {
   if ($UseExistingBuild) {
     foreach ($taskFastTest in @('compatibility-contract', 'sdk-abi', 'package-manager', 'save-isolation', 'release-contract')) {
-      Invoke-ReleaseTest @('-Name', $taskFastTest, '-NoBuild')
+      Invoke-ReleaseTest @{ Name = $taskFastTest; NoBuild = $true }
     }
   } else {
-    Invoke-ReleaseTest @('-Tier', 'fast')
+    Invoke-ReleaseTest @{ Tier = 'fast' }
   }
-  if ($TestTier -in @('host', 'game', 'all')) { Invoke-ReleaseTest @('-Tier', 'host', '-NoBuild') }
-  if ($TestTier -in @('game', 'all')) { Invoke-ReleaseTest @('-Tier', 'game', '-NoBuild') }
-  if ($TestTier -eq 'all') { Invoke-ReleaseTest @('-Name', '*-diagnostic', '-NoBuild', '-KeepGoing') }
+  if ($TestTier -in @('host', 'game', 'all')) { Invoke-ReleaseTest @{ Tier = 'host'; NoBuild = $true } }
+  if ($TestTier -in @('game', 'all')) { Invoke-ReleaseTest @{ Tier = 'game'; NoBuild = $true } }
+  if ($TestTier -eq 'all') {
+    Invoke-ReleaseTest @{ Name = '*-diagnostic'; NoBuild = $true; KeepGoing = $true }
+  }
 } elseif (!$UseExistingBuild) {
   & (Join-Path $taskRepo 'build.ps1')
   if ($LASTEXITCODE) { throw 'Release build failed' }
