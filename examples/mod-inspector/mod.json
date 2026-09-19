@@ -1,0 +1,11 @@
+{
+  "format": 2,
+  "id": "tcmod.mod-inspector",
+  "name": "TC Mod Inspector",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "Shows TCMod aggregate model state: campaign, save count, cycle, selected components/wires.",
+  "requires": [],
+  "capabilities": ["symbol"],
+  "native": {"api": 1, "entry": "native/mod-inspector.dll"}
+}

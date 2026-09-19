@@ -29,5 +29,6 @@
     }
   ],
   "name": "导线调色盘",
+  "capabilities": ["symbol", "hook", "ui_slot"],
   "format": 2
 }

@@ -1,0 +1,476 @@
+{
+  "schemaVersion": 1,
+  "tests": [
+    {
+      "id": "build",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "build.ps1",
+      "timeoutSeconds": 900,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "Build every product, fixture and example, then run the compiled unit/model tests."
+    },
+    {
+      "id": "compatibility-contract",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/compatibility.ps1",
+      "timeoutSeconds": 30,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "Declarative game profile schema, generated header freshness and symbol catalogue coverage."
+    },
+    {
+      "id": "sdk-abi",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/abi.ps1",
+      "timeoutSeconds": 60,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "Compile and compare all public C ABI sizes, alignments, offsets and constants."
+    },
+    {
+      "id": "package-manager",
+      "tier": "fast",
+      "runner": "node",
+      "path": "tests/run.js",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": false,
+      "description": "Resource package, transaction, dependency and capability integration tests."
+    },
+    {
+      "id": "save-isolation",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/saves.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": false,
+      "description": "Save import, path isolation and reparse-point rejection."
+    },
+    {
+      "id": "release-contract",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/release.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": false,
+      "description": "Deterministic Mod archives and declarative release manifest contract."
+    },
+    {
+      "id": "native-host",
+      "tier": "host",
+      "runner": "powershell",
+      "path": "tests/native.ps1",
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Native plugin loading, tamper detection, raw-hook conflict and disable behavior."
+    },
+    {
+      "id": "hook-chain",
+      "tier": "host",
+      "runner": "powershell",
+      "path": "tests/hook-chain.ps1",
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Loader-owned chains, event bus and crash attribution against the offline host."
+    },
+    {
+      "id": "installer",
+      "tier": "host",
+      "runner": "powershell",
+      "path": "tests/setup.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Install, upgrade, uninstall and incompatible-build rejection."
+    },
+    {
+      "id": "compatibility-game",
+      "tier": "host",
+      "runner": "powershell",
+      "path": "tests/compatibility-game.ps1",
+      "timeoutSeconds": 60,
+      "requiresBuild": false,
+      "requiresGame": true,
+      "description": "Identify the pinned executable and original engine against the supported game profile."
+    },
+    {
+      "id": "and-component",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/and-component-playtest.ps1",
+      "timeoutSeconds": 90,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Circuit definition import through the real game."
+    },
+    {
+      "id": "circuit-and-smoke",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/circuit-and-playtest.ps1",
+      "timeoutSeconds": 90,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The shipped circuit-and example registers cleanly in the real game."
+    },
+    {
+      "id": "byte-adder",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/byte-adder-smoke.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The byte-adder example passes the stock level in cycle and refresh phases."
+    },
+    {
+      "id": "component-placement",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-placement-playtest.ps1",
+      "timeoutSeconds": 90,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Place a registered component through the real component menu path."
+    },
+    {
+      "id": "component-persistence",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-persistence-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Save and reload a custom component and its wires."
+    },
+    {
+      "id": "component-timing",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-timing-playtest.ps1",
+      "timeoutSeconds": 720,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Declared gates and timing across the topology regression matrix."
+    },
+    {
+      "id": "native-component",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/native-component-playtest.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Declarative 8-input/8-output component registration and execution."
+    },
+    {
+      "id": "native-component-single",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/native-component-playtest.ps1",
+      "arguments": ["-Single"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Declarative single-pin byte component execution."
+    },
+    {
+      "id": "native-logic",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/native-logic-playtest.ps1",
+      "timeoutSeconds": 900,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The complete native-logic shape and width matrix."
+    },
+    {
+      "id": "simulation-state",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sim-state-playtest.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Simulation state and level I/O mapping."
+    },
+    {
+      "id": "kind-list",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/kind-list-playtest.ps1",
+      "timeoutSeconds": 90,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Enumerate and validate the pinned build's built-in component kinds."
+    },
+    {
+      "id": "ui-basic",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-playtest.ps1",
+      "timeoutSeconds": 90,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Basic plugin frame callback and ImGui rendering."
+    },
+    {
+      "id": "ui-draw",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-draw-playtest.ps1",
+      "timeoutSeconds": 90,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Drawing primitives, clipping and render-thread behavior."
+    },
+    {
+      "id": "ui-texture",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-texture-playtest.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Texture decoding, upload, ownership and GPU readback."
+    },
+    {
+      "id": "ui-page-prepare",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/make-ui-sandbox.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Prepare the shared two-plugin page sandbox through the common sandbox module."
+    },
+    {
+      "id": "ui-page-probe",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-page-playtest.ps1",
+      "arguments": ["-ProbeButtons"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Measure the real home-page entry rectangles for page drivers."
+    },
+    {
+      "id": "ui-page-driver-prepare",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/make-ui-sandbox.ps1",
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-Mods", "dev.menu-demo-driver,dev.menu-demo-peer-driver"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Prepare the page sandbox whose two plugins both drive their own page from inside the game."
+    },
+    {
+      "id": "ui-page-driver-probe",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-page-playtest.ps1",
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-ProbeButtons"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Measure that sandbox's page-entry rectangle for the driver run."
+    },
+    {
+      "id": "ui-page-driver",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-page-playtest.ps1",
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-DriverMode"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Open and exercise a plugin page through its measured entry rectangle."
+    },
+    {
+      "id": "ui-page-isolation",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-page-playtest.ps1",
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-OpenSecondPage"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Two plugins with identical page and widget IDs stay isolated."
+    },
+    {
+      "id": "ui-board-panel-probe",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-board-panel-playtest.ps1",
+      "arguments": ["-Probe"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Measure the live board-panel hit boxes for the driver pass."
+    },
+    {
+      "id": "ui-board-panel",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-board-panel-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Board-panel input ownership, scrolling, collapse and scene lifecycle."
+    },
+    {
+      "id": "ui-keyboard-probe",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-keyboard-playtest.ps1",
+      "arguments": ["-Probe"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Measure the page entry used by the keyboard driver."
+    },
+    {
+      "id": "ui-keyboard",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-keyboard-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Physical keys, WM_CHAR and UTF-8 input in plugin UI."
+    },
+    {
+      "id": "waveform",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/waveform-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Live level trace, board panel, VCD export and image evidence."
+    },
+    {
+      "id": "game-handle-probe",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/game-handle-probe-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Board handle lifetime across a real level: issue, resolve, scene-change invalidation and a second level."
+    },
+    {
+      "id": "wire-palette-tool",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/wire-palette-tool-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Board toolbar tool handoff and wire palette interaction."
+    },
+    {
+      "id": "component-cost-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/component-cost-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Single-case component cost probe; the game tier uses the timing matrix wrapper."
+    },
+    {
+      "id": "component-probe-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/components-playtest.ps1",
+      "arguments": ["build/and2_component.data"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Inspect one circuit fixture through the generic component probe."
+    },
+    {
+      "id": "custom-or-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/custom-or-playtest.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Run one native-logic scenario; the game tier uses the full matrix wrapper."
+    },
+    {
+      "id": "sim-trace-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/sim-trace-probe.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Development probe for locating per-cycle level I/O traces."
+    },
+    {
+      "id": "ui-board-slot-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/ui-board-slot-probe.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Exact-callsite board-slot probe."
+    },
+    {
+      "id": "toolbar-font-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/toolbar-font-playtest.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Toolbar font and framebuffer development probe."
+    },
+    {
+      "id": "pin-label-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/pin-label-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Pin-label screenshot and overlap development probe."
+    },
+    {
+      "id": "manual-ime",
+      "tier": "manual",
+      "runner": "powershell",
+      "path": "tests/manual-ime-test.ps1",
+      "timeoutSeconds": 600,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "manual": true,
+      "description": "Visible IME composition and candidate-window checklist; never selected by -Tier all."
+    },
+    {
+      "id": "ui-page-demo",
+      "tier": "manual",
+      "runner": "powershell",
+      "path": "tests/ui-page-demo.ps1",
+      "timeoutSeconds": 600,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "manual": true,
+      "description": "Visible page demo; never selected by -Tier all."
+    }
+  ]
+}

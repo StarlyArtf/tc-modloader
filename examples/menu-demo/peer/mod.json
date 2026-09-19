@@ -1,0 +1,10 @@
+{
+  "format": 2,
+  "id": "dev.menu-demo-peer",
+  "name": "Menu demo peer",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "Same source as Menu demo, different mod id: proves page IDs and widget labels do not collide between plugins.",
+  "requires": [],
+  "native": {"api": 1, "entry": "native/menu-demo-peer.dll"}
+}

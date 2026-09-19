@@ -1004,7 +1004,7 @@ EXPORTS
  igInvisibleButton @1002
  igIsActiveIdUsingNavDir=tc_game_engine.igIsActiveIdUsingNavDir @1003
  igIsAliasKey=tc_game_engine.igIsAliasKey @1004
- igIsAnyItemActive=tc_game_engine.igIsAnyItemActive @1005
+ igIsAnyItemActive @1005
  igIsAnyItemFocused=tc_game_engine.igIsAnyItemFocused @1006
  igIsAnyItemHovered=tc_game_engine.igIsAnyItemHovered @1007
  igIsAnyMouseDown=tc_game_engine.igIsAnyMouseDown @1008

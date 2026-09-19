@@ -1,0 +1,10 @@
+{
+ "format": 2,
+ "id": "example.custom-or",
+ "name": "原生 OR 逻辑元件",
+ "version": "0.1.0",
+ "author": "TC Mod Loader",
+ "description": "注册一个两输入一输出的原生逻辑元件。内部电路作为后备，运行到简单关卡时由插件 C++ 回调决定每周期行为。示例行为是 OR。",
+ "capabilities": ["symbol", "hook", "logic", "component"],
+ "native": {"api": 1, "entry": "native/custom-or.dll"}
+}

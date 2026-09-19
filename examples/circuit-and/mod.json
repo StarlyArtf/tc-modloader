@@ -1,0 +1,10 @@
+{
+ "format": 2,
+ "id": "example.circuit-and",
+ "name": "电路封装 AND 元件",
+ "version": "0.1.0",
+ "author": "TC Mod Loader",
+ "description": "启动时注册一个两输入一输出、位宽为 1 的 AND 元件（AND2 Test），外观复用内置 AND 图标。用于手动验证菜单、放置、连线、保存和仿真。",
+ "capabilities": ["symbol", "component"],
+ "native": {"api": 1, "entry": "native/circuit-and.dll"}
+}

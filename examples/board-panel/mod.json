@@ -1,0 +1,11 @@
+{
+  "format": 2,
+  "id": "example.board-panel",
+  "name": "Board panel",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "Registers a panel on the circuit board's right edge: host-owned frame, real input, closes with the level.",
+  "requires": [],
+  "capabilities": ["ui_slot", "status"],
+  "native": {"api": 1, "entry": "native/board-panel.dll"}
+}

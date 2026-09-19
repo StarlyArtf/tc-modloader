@@ -1,0 +1,10 @@
+{
+  "format": 2,
+  "id": "example.byte-adder",
+  "name": "单字节加法器（1 门 1 延迟）",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "注册一个进位入 + 两个 8 位输入的加法器元件（输出 8 位和与进位出）。内部电路只是占位，行为由插件 C++ 回调决定；定义里声明的设计统计固定为 1 门、1 延迟，可直接观察声明延迟进入编译统计的效果。",
+  "capabilities": ["component", "logic"],
+  "native": {"api": 1, "entry": "native/byte-adder.dll"}
+}

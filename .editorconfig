@@ -1,0 +1,22 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{c,cpp,h,hpp}]
+indent_style = space
+indent_size = 4
+
+[*.{json,md,ps1,psm1,py}]
+indent_style = space
+indent_size = 2
+
+# Windows PowerShell 5.1 needs a BOM to decode non-ASCII script literals as UTF-8.
+[*.{ps1,psm1}]
+charset = utf-8-bom
+
+[Makefile]
+indent_style = tab
