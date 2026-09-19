@@ -152,7 +152,9 @@ $taskScenarios = @{
     Definition = @('nl_def_mux8.data')
     LevelInputs = 3; LevelOutputs = 1; Cycles = 40
     Detail = 'three 8-bit inputs -> 8-bit output (mux), checked by the level for 40 cycles'
-    Check = { param($i,$o) (($i[0] -eq 1) ? $i[2] : $i[1]) -eq $o[0] }
+    # PowerShell 5.1 has no ternary operator: write the select-the-B-when-set
+    # choice as an if expression (this file is run by powershell.exe, not pwsh).
+    Check = { param($i,$o) $(if ($i[0] -eq 1) { $i[2] } else { $i[1] }) -eq $o[0] }
     Expect = @(
       @{Pattern='Native logic: registered custom 0x4d5558385f303031 inputs=3 outputs=1 in0=\(-2,-1,w8\) in1=\(-2,0,w8\) in2=\(-2,1,w8\) out0=\(2,0,w8\)';Why='three word inputs registered'},
       @{Pattern='custom-or: run finished cycle=40 callback_calls=41 instances=1 verdict=0';Why='the game found no mismatch in 40 cycles'}
