@@ -33,7 +33,7 @@ static void applyDesignStatsOverride(uint64_t& gates, uint64_t& delay) {
 
 extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     if (!h || !plugin || h->api_version != TC_MOD_API_VERSION ||
-        h->size < sizeof(TCHost) || plugin->size < sizeof(TCPlugin)) {
+        h->size < TC_HOST_BASE_SIZE || plugin->size < sizeof(TCPlugin)) {
         return 1;
     }
     host = h;

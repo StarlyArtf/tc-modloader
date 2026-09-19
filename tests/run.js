@@ -6,9 +6,12 @@ function zip(entries){let chunks=[],central=[],offset=0;for(let [name,data] of e
 function fixture(name){const d=path.join(base,name);fs.mkdirSync(path.join(d,'mods'),{recursive:true});fs.mkdirSync(path.join(d,'translations'),{recursive:true});fs.writeFileSync(path.join(d,'translations/test.txt'),'original');return d;}
 function mod(d,id,files,extra={}){const m={format:1,id,name:id,version:'1.0.0',...extra};fs.writeFileSync(path.join(d,'mods',id+'.mod'),zip([['mod.json',JSON.stringify(m)],...Object.entries(files).map(([p,v])=>['files/'+p,v])]));}
 function run(d,args,ok=true,match){const r=cp.spawnSync(cli,[d,...args],{encoding:'utf8'});if((r.status===0)!==ok||match&&!((r.stdout+r.stderr).includes(match)))throw Error(JSON.stringify({args,...r}));return r;}
+function runRaw(args,ok=true,match){const r=cp.spawnSync(cli,args,{encoding:'utf8'});if((r.status===0)!==ok||match&&!((r.stdout+r.stderr).includes(match)))throw Error(JSON.stringify({args,...r}));return r;}
 function check(name,fn){fn();count++;console.log('PASS '+name);}
 function eq(a,b){if(a!==b)throw Error(`${a} != ${b}`);}
 let d=fixture('basic');mod(d,'demo',{'translations/test.txt':'modded','asset/new.txt':'added'});
+check('the CLI reports the version in VERSION',()=>{const expected=fs.readFileSync(path.resolve(__dirname,'../VERSION'),'utf8').trim();runRaw(['--version'],true,'tcmod-cli '+expected);});
+check('the CLI lists the capability names mod.json may ask for',()=>{const names=runRaw(['--capabilities']).stdout.trim().split(/,\s*/);for(const name of ['log','hook','logic','component','ui_page','ui_slot','texture','status'])if(!names.includes(name))throw Error('missing capability '+name);});
 check('list valid package',()=>run(d,['list'],true,'demo'));
 check('apply changes original and adds file',()=>{run(d,['apply','demo']);eq(fs.readFileSync(path.join(d,'translations/test.txt'),'utf8'),'modded');eq(fs.readFileSync(path.join(d,'asset/new.txt'),'utf8'),'added');});
 check('repeated apply is idempotent',()=>run(d,['apply','demo']));
@@ -17,6 +20,14 @@ mod(d,'conflict',{'translations/TEST.txt':'other'});
 check('case-insensitive conflict rejected before writes',()=>{run(d,['apply','demo','conflict'],false,'File conflict');eq(fs.readFileSync(path.join(d,'translations/test.txt'),'utf8'),'original');});
 check('missing dependency rejected',()=>{mod(d,'dependent',{'asset/dependent.txt':'x'},{requires:['demo']});run(d,['apply','dependent'],false,'requires demo');});
 check('dependencies accepted together',()=>run(d,['apply','demo','dependent']));
+check('declared capability accepted',()=>{const f=fixture('caps-ok');mod(f,'wants',{'asset/wants.txt':'x'},{capabilities:['status','ui_slot']});run(f,['list'],true,'wants');run(f,['apply','wants']);});
+check('unknown capability rejected while scanning',()=>{const f=fixture('caps-unknown');mod(f,'wants',{'asset/wants.txt':'x'},{capabilities:['telepathy']});run(f,['list'],true,'Unknown loader capability: telepathy');run(f,['apply','wants'],false,'Missing or invalid');});
+check('satisfied dependency constraint accepted',()=>{const f=fixture('dep-ok');mod(f,'core',{'asset/core.txt':'1'});mod(f,'plugin',{'asset/plugin.txt':'2'},{requires:{core:'>=1.0.0'}});run(f,['apply','core','plugin']);});
+check('unsatisfied dependency constraint rejected before writes',()=>{const f=fixture('dep-old');mod(f,'core',{'asset/core.txt':'1'});mod(f,'plugin',{'asset/plugin.txt':'2'},{requires:{core:'>=2.0.0'}});run(f,['apply','core','plugin'],false,'enabled version is 1.0.0');eq(fs.existsSync(path.join(f,'asset/plugin.txt')),false);});
+check('version comparison is numeric, not lexical',()=>{const f=fixture('dep-numeric');mod(f,'core',{'asset/core.txt':'1'},{version:'1.9.0'});mod(f,'plugin',{'asset/plugin.txt':'2'},{requires:{core:'>=1.10.0'}});run(f,['apply','core','plugin'],false,'enabled version is 1.9.0');});
+check('missing optional dependency accepted',()=>{const f=fixture('opt-missing');mod(f,'solo',{'asset/solo.txt':'1'},{optional:{friend:'>=1.0.0'}});run(f,['apply','solo']);});
+check('enabled optional dependency still checked',()=>{const f=fixture('opt-old');mod(f,'friend',{'asset/friend.txt':'1'},{version:'0.9.0'});mod(f,'solo',{'asset/solo.txt':'1'},{optional:{friend:'>=1.0.0'}});run(f,['apply','solo','friend'],false,'enabled version is 0.9.0');run(f,['apply','solo']);});
+check('a version constraint cannot be a number',()=>{const f=fixture('dep-shape');mod(f,'bad',{'asset/bad.txt':'1'},{requires:{friend:2}});run(f,['list'],true,'version constraints must be strings');});
 check('external edit protected on disable',()=>{fs.writeFileSync(path.join(d,'translations/test.txt'),'user edit');run(d,['disable-all'],false,'outside loader');eq(fs.readFileSync(path.join(d,'translations/test.txt'),'utf8'),'user edit');});
 check('can restore after reconciling external change',()=>{fs.writeFileSync(path.join(d,'translations/test.txt'),'modded');run(d,['disable-all']);});
 check('missing package can still be disabled',()=>{run(d,['apply','demo']);fs.unlinkSync(path.join(d,'mods/demo.mod'));run(d,['disable-all']);eq(fs.readFileSync(path.join(d,'translations/test.txt'),'utf8'),'original');});

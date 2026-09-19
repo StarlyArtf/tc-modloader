@@ -6,5 +6,6 @@
   "author": "TC Mod Loader",
   "description": "Shows TCMod aggregate model state: campaign, save count, cycle, selected components/wires.",
   "requires": [],
+  "capabilities": ["symbol"],
   "native": {"api": 1, "entry": "native/mod-inspector.dll"}
 }

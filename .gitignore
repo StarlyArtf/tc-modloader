@@ -2,3 +2,7 @@ build/
 dist/
 examples/*/native/*.dll
 __pycache__/
+host.log
+loader.log
+fault.log
+native-logic-source*.txt

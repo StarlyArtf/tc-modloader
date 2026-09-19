@@ -1,6 +1,15 @@
 #ifndef TC_CUSTOM_LOGIC_H
 #define TC_CUSTOM_LOGIC_H
 
+// DEPRECATED.  This runtime interprets the whole board itself, drives the
+// simulation from the plugin and recomputes the level test, so built-in gates,
+// level judgement, pause and reset no longer belong to the game.  It is kept
+// only for research probes such as tests/sim-state-probe.cpp.
+//
+// Use sdk/tc_logic_api.h and TCHost::register_logic instead: the loader then
+// replaces only the single logic node inside a registered custom component
+// while the game keeps generating and running every other component.
+//
 // Experimental native logic runtime for simple boards.
 //
 // Scope of this first version:

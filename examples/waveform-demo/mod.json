@@ -1,0 +1,11 @@
+{
+  "format": 2,
+  "id": "example.waveform-demo",
+  "name": "Waveform demo",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "Shows the live level's inputs and outputs as waveforms and exports them as a VCD file.",
+  "requires": [],
+  "capabilities": ["symbol", "ui_slot", "status", "events"],
+  "native": {"api": 1, "entry": "native/waveform-demo.dll"}
+}

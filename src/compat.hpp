@@ -1,9 +1,5 @@
 #pragma once
-#define TC_LOADER_020_SHA "1612880bc7c3c198604b5b967900a32720700ebebd135b72348a3e3ac409877b"
-#define TC_PREVIOUS_LOADER_SHA "f41ba881ebab46b8cced4eacd76193e1af97004667082b4cff5378b1d81f60c5"
-#define TC_EXE_SHA "8875da0e88cc878cb0fce30cfb63d20c5500cae341608af4d786649b88c8eb21"
-#define TC_ENGINE_SHA "0a4030b5f5538cc3682610ac3e7b39e8e31ec34f9aeafe7a1d036bfa33819166"
-#define TC_MENU_END_RVA 0x456c33ULL
-#define TC_HOME_START_RVA 0x449df0ULL
-#define TC_HOME_END_RVA 0x44b610ULL
-
+/* Compatibility facts are declared in compat/profiles.json and generated into
+   this header.  Keeping this wrapper stable avoids spreading a generated-file
+   name through the loader and installer sources. */
+#include "compat.generated.hpp"

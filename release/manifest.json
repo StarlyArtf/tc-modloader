@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "product": "TC Mod Loader",
+  "versionFile": "VERSION",
+  "sourceArchive": {
+    "name": "TCModLoader-{version}-source.zip",
+    "files": [
+      ".editorconfig",
+      ".gitattributes",
+      ".gitignore",
+      "build.ps1",
+      "package.ps1",
+      "README.md",
+      "LICENSE",
+      "VERSION"
+    ],
+    "trees": [
+      "abi",
+      "compat",
+      "docs",
+      "examples",
+      "release",
+      "sdk",
+      "src",
+      "tests",
+      "tools",
+      "vendor"
+    ],
+    "exclude": [
+      "examples/*/native/*.dll",
+      "*/__pycache__/*",
+      "*.pyc"
+    ]
+  },
+  "playerArchive": {
+    "name": "TCModLoader-{version}-win64.zip",
+    "files": [
+      { "source": "dist/TCModLoader-Setup.exe", "target": "TCModLoader-Setup.exe" },
+      { "source": "README.md", "target": "README.md" },
+      { "source": "LICENSE", "target": "LICENSE" },
+      { "source": "VERSION", "target": "VERSION" },
+      { "source": "dist/tcmod-cli.exe", "target": "tools/tcmod-cli.exe" },
+      { "source": "tools/Pack-Mod.ps1", "target": "tools/Pack-Mod.ps1" },
+      { "source": "tools/ReleaseTools.psm1", "target": "tools/ReleaseTools.psm1" },
+      { "source": "tools/compat.ps1", "target": "tools/compat.ps1" },
+      { "source": "compat/profiles.json", "target": "compat/profiles.json" },
+      { "source": "tools/abi.ps1", "target": "tools/abi.ps1" },
+      { "source": "tools/abi-snapshot.cpp", "target": "tools/abi-snapshot.cpp" },
+      { "source": "abi/windows-x64.json", "target": "abi/windows-x64.json" },
+      { "source": "release/manifest.json", "target": "release-manifest.json" }
+    ],
+    "trees": [
+      { "source": "docs", "target": "docs", "exclude": ["docs/research/*"] },
+      { "source": "sdk", "target": "sdk" }
+    ],
+    "licenses": [
+      { "source": "vendor/LICENSE", "target": "licenses/MINIZ-LICENSE.txt" },
+      { "source": "vendor/JSON-LICENSE", "target": "licenses/JSON-LICENSE.txt" },
+      { "source": "vendor/minhook/LICENSE.txt", "target": "licenses/MINHOOK-LICENSE.txt" },
+      { "source": "vendor/runtime-licenses/GCC-RUNTIME-EXCEPTION.txt", "target": "licenses/GCC-RUNTIME-EXCEPTION.txt" },
+      { "source": "vendor/runtime-licenses/GPL-3.txt", "target": "licenses/GPL-3.txt" },
+      { "source": "vendor/runtime-licenses/MINGW-RUNTIME.txt", "target": "licenses/MINGW-RUNTIME.txt" },
+      { "source": "vendor/runtime-licenses/WINPTHREAD.txt", "target": "licenses/WINPTHREAD.txt" }
+    ],
+    "mods": [
+      { "source": "dist/example.board-panel.mod", "target": "example.board-panel.mod", "id": "example.board-panel" },
+      { "source": "dist/example.byte-adder.mod", "target": "example.byte-adder.mod", "id": "example.byte-adder" },
+      { "source": "dist/example.circuit-and.mod", "target": "example.circuit-and.mod", "id": "example.circuit-and" },
+      { "source": "dist/example.custom-or.mod", "target": "example.custom-or.mod", "id": "example.custom-or" },
+      { "source": "dist/example.cycle-guard.mod", "target": "example.cycle-guard.mod", "id": "example.cycle-guard" },
+      { "source": "dist/example.drawing-demo.mod", "target": "example.drawing-demo.mod", "id": "example.drawing-demo" },
+      { "source": "dist/dev.menu-demo.mod", "target": "dev.menu-demo.mod", "id": "dev.menu-demo" },
+      { "source": "dist/example.waveform-demo.mod", "target": "example.waveform-demo.mod", "id": "example.waveform-demo" },
+      { "source": "dist/tcmod.mod-inspector.mod", "target": "tcmod.mod-inspector.mod", "id": "tcmod.mod-inspector" },
+      { "source": "dist/dev.cost-watch.mod", "target": "dev.cost-watch.mod", "id": "dev.cost-watch" }
+    ]
+  },
+  "standalone": [
+    { "source": "dist/TCModLoader-Setup.exe", "name": "TCModLoader-Setup.exe" }
+  ]
+}

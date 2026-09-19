@@ -1,143 +1,107 @@
-# TC Mod Loader 0.4.0
+# TC Mod Loader
 
-这是支持修改游戏逻辑的原生代码 Mod 加载器，适用于 Windows x64《Turing Complete》2.1.334 的指定构建。
+《Turing Complete》2.1.334（Windows x64 指定构建）的原生代码 Mod 加载器。
+它在不修改游戏 EXE 的前提下，把加载器代理成 `game_engine.dll` 进入进程，让 Mod 可以：
 
-## 0.4.0 新增
+| 能力 | 说明 | 文档 |
+|---|---|---|
+| 资源 Mod | 替换/新增游戏资源文件、精确文本补丁、停用恢复 | [docs/mod-format.md](docs/mod-format.md) |
+| 原生插件 | 解析游戏符号、Hook 函数、每帧回调、用游戏自身 ImGui 画面板 | [docs/sdk/host-api.md](docs/sdk/host-api.md) |
+| 插件界面 | `sdk/tc_ui.h`：面板/窗口作用域、类型化控件、视口尺寸、热键；导出在加载期统一校验 | [docs/sdk/ui.md](docs/sdk/ui.md) |
+| 自定义绘图 | `sdk/tc_ui_draw.h`：交互画布、线／圆／多边形／曲线／文本、局部坐标与嵌套裁剪 | [docs/sdk/ui.md](docs/sdk/ui.md) |
+| 图片纹理 | `sdk/tc_ui_texture.h`：图片／RGBA 上传、UV 裁切与翻转、图片按钮、按 Mod 管理与延迟释放 | [docs/sdk/ui.md](docs/sdk/ui.md) |
+| 电路封装元件 | 导入 `circuit.data` 生成自定义元件，菜单放置、保存重载 | [docs/sdk/game-model.md](docs/sdk/game-model.md) |
+| 声明式 C++ 元件 | 只声明引脚和回调，自动生成定义，无需手写电路文件 | [docs/sdk/native-components.md](docs/sdk/native-components.md) |
+| 声明延迟 | 元件声明的关键路径进入编译期时序统计 | [docs/sdk/game-model.md](docs/sdk/game-model.md#设计代价与声明延迟) |
+| 原生逻辑回调 | 元件每周期行为由插件 C++ 决定，关卡判定/暂停/重置仍由游戏执行 | [docs/sdk/custom-logic.md](docs/sdk/custom-logic.md) |
+| 独立存档 | 始终使用独立存档，可导入原版存档副本 | [docs/install.md](docs/install.md) |
+| 能力协商 | 插件按 `TC_CAP_*` 位判断宿主支持什么；包在 `mod.json` 里声明所需能力与依赖版本 | [docs/reference/capabilities.md](docs/reference/capabilities.md) |
+| 符号别名与钩子链 | 插件用 `sim.do` 这类稳定别名取地址；多个 Mod 可以加入同一个游戏函数的钩子链 | [docs/reference/symbols.md](docs/reference/symbols.md) |
+| 事件总线 | 订阅关卡加载、场景切换、仿真命令、保存等事件，不必自己钩内部函数 | [docs/reference/capabilities.md](docs/reference/capabilities.md) |
 
-- 电路封装元件的**声明延迟**现在会参与游戏的编译期时序统计：串联相加、并联取最长路径，嵌套在有声明延迟的外层元件内只计一次；元件内部逻辑照常展开执行。
-- 反馈环、多驱动、收缩后成环、非法数据或溢出时**保留游戏原生统计**，并写入 `Component timing: native timing retained...` 日志；未经验证的形状不会被套用规则。
-- SDK 新增 `setPrototypeGateCost` / `setPrototypeDelay` 与 `TCPrototypeBuilder::setDesignCost`，用于写入定义头里的 `(门数, 延迟)`。游戏解析时会重算门数，但**原样保留延迟**，所以定义文件必须携带真实关键路径。
-- 新增诊断与工具：`dev.cost-watch.mod`（只挂钩子、把代价/延迟写入日志）、示例 Mod 的 `design-stats.txt` 覆盖开关、`python tools/circuit_format.py <circuit.data> --analyze` 设计期预检。
-- 回归：`tests/component-timing-playtest.ps1` 在隔离游戏副本中覆盖单件／串联／并联／声明 0／内置元件／嵌套／沙盒／元件工坊／多驱动共 9 个真机用例。
+版本号只有一个来源：仓库根目录的 `VERSION`；`build.ps1` 由它生成 `src/version.hpp`，
+加载器横幅、安装器标题、`tcmod-cli --version` 与分发包文件名都读同一处，不再各写各的。
+源码树为 **0.6.0**：在 0.4.0 分发包之后加入了声明式元件、原生逻辑形状/位宽扩展、
+插件界面页面与插槽、纹理、波形导出，以及能力协商与依赖版本约束
+（见 [docs/changelog.md](docs/changelog.md)）；尚未重新打分发压缩包。
 
-## 玩家使用
+## 玩家：三步使用
 
-1. 关闭要安装的那份游戏，双击 TCModLoader-Setup.exe。
-2. 选择游戏目录中的 Turing Complete.exe，选择“是”安装／升级。
-3. 将 .mod 文件直接放入游戏根目录的 mods 文件夹，不要解压。
-4. 正常启动游戏，点击主菜单右上角 Mods，勾选并“应用更改”。
-5. 关闭并重新启动。页面会区分“下次启动启用”与“本次运行中”。
+1. 关闭游戏，运行 `TCModLoader-Setup.exe`，选择该份游戏的 `Turing Complete.exe`。
+2. 把 `.mod` 文件放进 `<游戏目录>/mods/`（不要解压）。
+3. 启动游戏 → 主菜单右上角 **Mods** → 勾选 → 应用更改 → 重启。
 
-可从已验证的 0.1.0／0.2.0 安装直接升级。玩家不需要 Python、Node.js、MinGW 或额外启动器。游戏目录必须可写。
+安装、升级、卸载、存档隔离与排错见 **[docs/install.md](docs/install.md)**。
 
-## 独立存档与原版导入
+## 开发者：从哪里开始
 
-从 0.3.0 起，装有加载器的游戏始终使用独立存档，即使全部 Mod 停用或按住 Shift 跳过原生插件也是如此。首次启动默认是一份新存档。
+| 目标 | 入口 |
+|---|---|
+| 写第一个原生 Mod | [docs/guides/first-native-mod.md](docs/guides/first-native-mod.md) |
+| 让自定义元件由 C++ 决定行为 | [docs/guides/component-with-cpp-logic.md](docs/guides/component-with-cpp-logic.md) |
+| SDK 头文件地图与编译打包 | [docs/sdk/README.md](docs/sdk/README.md) |
+| 上限与约束速查 | [docs/reference/limits.md](docs/reference/limits.md) |
+| 日志与故障排查 | [docs/reference/diagnostics.md](docs/reference/diagnostics.md) |
+| 全部文档索引 | [docs/README.md](docs/README.md) |
 
-- 原版位置：%USERPROFILE%\AppData\Roaming\Turing Complete
-- Mod 默认位置：%USERPROFILE%\AppData\Roaming\Turing Complete Mods\profiles\default
-- 导入副本位置：上述 profiles 目录中的 import-随机编号
+SDK 定义在 `sdk/`：`tc_mod_api.h`（宿主入口）、`tc_mod.h`（聚合模型）、
+`tc_game_model.h`、`tc_component_model.h`、`tc_board_model.h`、`tc_game_state.h`、
+`tc_simulation.h`、`tc_wire_model.h`、`tc_save_model.h`、`tc_logic_api.h`（原生逻辑回调）、
+`tc_hook.h` / `tc_hook_api.h`（钩子链）、`tc_trace.h`（关卡波形与 VCD 导出）、
+`tc_ui.h`（插件界面）。
 
-在主菜单 Mods 页面点击“导入原版存档（新副本）”，成功后关闭并重启游戏，即可继续原版进度。页面会显示当前存档路径和待切换副本，也能打开当前存档文件夹。
+## 示例
 
-导入前请关闭原版游戏。导入包含本机关卡进度、设置和电路文件，每次新建副本，逐文件校验；不修改原版、不合并或覆盖已有 Mod 存档。导入失败不切换存档。运行中的游戏继续使用原副本，重启才切换。Steam 云元数据 steam_autocloud.vdf 不复制；这里不是云存档下载功能，新目录也没有配置原版的云同步。
+| 包 | 内容 |
+|---|---|
+| `example.cycle-guard.mod` | Hook `sim_do`，把连续运行限制为“当前周期 + N”（1/10/100/1000），带调试面板 |
+| `example.circuit-and.mod` | 注册两输入一输出 AND 自定义元件，并声明设计统计 `(1 门, 1 延迟)` |
+| `example.custom-or.mod` | 元件行为由 C++ 回调决定；真机回归 11 个场景 |
+| `example.byte-adder.mod` | 单字节加法器（进位入/出），声明 **1 门 1 延迟**，行为由 C++ 决定 |
+| `dev.cost-watch.mod` | 只读诊断：把界面分数、各 kind 代价与原型字段写进日志 |
+| `dev.kind-list.mod` | 只读探测：枚举 125 个内置元件的 kind／名称／引脚 |
+| `dev.menu-demo.mod` | 主菜单页面注册与控件 ID 隔离示例 |
+| `example.drawing-demo.mod` | 自定义绘图页面与 F8 面板，支持拖动曲线控制点、网格和裁剪 |
+| `example.board-panel.mod` | 电路板侧栏面板：宿主提供的插槽、真实点击、随关卡关闭 |
+| `example.waveform-demo.mod` | 关卡波形面板：按周期画输入／输出方波，可导出 VCD 与图片 |
+| `tcmod.mod-inspector.mod` | 只读状态面板：战役、存档、周期、选中元件与导线；视口与鼠标坐标 |
 
-存档路径在游戏初始化前重定向；只改变进程内专用路径常量，磁盘 EXE 不修改。此构建实际根据 USERPROFILE 拼接路径，不能仅靠 APPDATA 环境变量隔离。
+每个示例的用法（含 cycle-guard 面板步骤与对照实验）见
+**[docs/examples.md](docs/examples.md)**；源码在 `examples/`。
 
-当前副本选择保存在游戏目录 tc-modloader-data/saves.ini；所有已导入副本保留，可手动备份。相同 Windows 用户下，不同游戏安装共享上述 profiles 目录，各安装的选择独立。默认副本为共享的 default。
+## 构建与测试
 
-卸载加载器后，游戏重新使用原版位置，Mod 存档仍保留，绝不自动写回原版。需要同时备份原版及 Mod 存档。原生插件若自行硬编码其他路径，加载器不能阻止它绕开游戏存档接口。
+Windows x64 + MinGW-w64（默认 `C:\msys64\ucrt64\bin`，可用 `TC_MINGW_BIN` 覆盖）。
+依赖 miniz 3.0.2、nlohmann/json 3.11.3、MinHook 1.3.4 已随源码固定，构建不需要联网。
 
-## 实际改变逻辑的示例
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test.ps1 -Tier fast  # 构建、单元测试、包管理、存档
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test.ps1 -Tier host  # 原生宿主、钩子链、安装器
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test.ps1 -Tier game  # 构建后串行运行真机回归
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test.ps1 -Tier all   # 全部自动化回归
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test.ps1 -List       # 测试 ID、分层与超时
+```
 
-example.cycle-guard.mod 是“周期运行守卫”，包含独立的 C++ DLL：
+测试目录由 `tests/test-catalog.json` 统一描述；可用 `-Name native-logic` 或
+`-Name 'ui-board-panel*'` 只跑指定用例，已有构建产物时加 `-NoBuild`。
+每次运行把 JSON、JUnit XML 和逐用例 stdout/stderr 写到 `build/test-results/`。
+人工 IME／可见页面测试会列在目录中，但不会被 `-Tier all` 自动启动。
 
-- Hook 游戏的 sim_do 函数，在命令到达仿真线程前修改目标周期。
-- 把连续／长运行限制为“当前周期 + N”，可选 1、10、100、1000。
-- 保留暂停、重置以及不超过上限的单步／短运行命令。
-- 添加调试面板，显示实际周期、拦截次数和修改前后目标，提供批量运行按钮。F6 显示／隐藏面板。
+真机用例都会复制游戏到 `build/` 下的隔离副本并切换 `USERPROFILE`/`APPDATA`，不触碰玩家存档。
+完整清单与断言语义见 **[docs/verification.md](docs/verification.md)**。
 
-进入已有电路后，先使用一次游戏原有的运行／单步按钮，让插件捕获该电路的仿真上下文。然后选择 100，点击“请求连续运行（验证拦截）”，仿真应在最多再执行 100 个周期后停下；关卡本身也可能提前停止。上下文尚未捕获时，面板的运行按钮为灰色。取消面板中的“拦截游戏运行命令”，后续命令恢复原行为。
-
-示例只拦截经过 sim_do 的运行命令，不保证拦截所有编译／加载路径或其他 Mod 直接访问内核的行为。它不改电路文件。源码位于 examples/cycle-guard/plugin.cpp。
-
-example.menu-demo.mod 是保留的旧版资源示例。
-
-example.circuit-and.mod 是电路封装元件示例。启动时注册一个两输入一输出、位宽为 1
-的 `AND2 Test` 自定义元件，并复用内置 AND 的外观图标。正常启动后，在 Sandbox 或
-Foundry 打开元件列表即可放置；在部分战役关卡中游戏会按自身规则禁止自定义元件。
-
-该示例同时写入定义头里的设计统计 `(1 门, 1 延迟)`。元件的"延迟"就是设计自身的关键
-路径，放置后整板延迟按声明值计入编译统计（本例与内置与门一致）。想对照验证，可把
-`tc-modloader-data/plugin-data/example.circuit-and/design-stats.txt` 写成 `1 5` 再重启：
-元件信息显示 5，单件板子的总延迟也是 5。
-
-dev.cost-watch.mod 是只读诊断包：挂钩游戏的代价与分数函数，把界面实际显示的
-`gates/delay`、各 kind 的返回值与原型字段周期性写进加载器日志（前缀 `cost-watch:`），
-不修改任何游戏状态。排查"延迟没被计入"一类问题时使用。
-
-## 开发能力
-
-SDK 定义：sdk/tc_mod_api.h。开发指南：SDK-GUIDE.md。
-
-原生 Mod 可以解析 EXE 中的符号、调用已知签名的游戏函数、安装函数 Hook 并调用原函数、执行每帧逻辑、处理快捷键、使用游戏自身 ImGui 创建新面板。
-
-这是通用底层扩展能力。`sdk/tc_mod.h` 提供聚合入口，覆盖：
-- 原型／组件对象模型：内置枚举、模板复制、名称/描述/SVG、自定义元件注册。
-- board 选择状态：当前/上一帧选中元件与导线，含计数和 ID 枚举。
-- 游戏状态：战役、关卡、字宽、当前输入/输出。
-- 仿真：周期、设置、run/pause/reset。
-- 导线：读取、取色、添加、放置、更新。
-- 存档：保存次数和当前 level/schematic 路径。
-
-`sdk/tc_custom_logic.h` 新增实验性的原生逻辑运行时：在简单关卡板型中，
-Mod 可以用 C++ 回调决定自定义元件的每周期输入输出，而不是只执行内部电路。
-示例 `example.custom-or.mod` 使用该接口把 AND 后备电路替换成 OR 行为；
-真机回归见 `tests/custom-or-playtest.ps1`。
-
-元件接口现提供实验性的电路文件导入、目录更新和原型快照释放（`tc_component_model.h`），已在隔离游戏实例验证；也已修正 64 位自定义 ID 和字符串长度。现已用两输入一输出 AND 元件验证自定义引脚数量、名称、一位位宽，并通过组件菜单使用的同一放置 helper 把实例落到 board。内部网表已按引脚偏移和导线方向验证 `00/01/10/11 -> 0/0/0/1`；带自定义实例和 3 条导线的关卡电路在两次游戏启动间保持 ID 与接线不变。实际鼠标拖动、游戏测试循环逐周期读数、运行时修改经 UI 保存落盘和有状态行为仍未验收，不能等同于任意新逻辑元件支持。证据与复现方法见 [元件链路研究](research/COMPONENT-PIPELINE.md)。
-
-## 启停、更新和恢复
-
-原生插件启停和更新需要重启，不做热卸载。重新打开 Mods 页面会扫描新包，也可点击“刷新列表”。
-
-原生包应用时记录 SHA-256。包被替换后，不会按旧启用状态自动执行新代码，需重新应用并重启。依赖先加载；循环依赖被拒绝，依赖失败会阻止依赖它的插件启动。
-
-两个 Mod Hook 同一函数时，后加载者会失败并显示状态，不做隐式 Hook 串联。初始化失败会撤销该插件已注册的 Hook。
-
-原生 DLL 与游戏具有相同权限，不在沙箱中。加载器不能可靠隔离原生代码的访问违规或崩溃。启动时按住 Shift 并保持到主菜单出现，可以跳过本次原生插件，再进入 Mods 停用问题包。
-
-无法进入游戏时，关闭该份游戏后可用 tools/tcmod-cli.exe 游戏目录 disable-all 保存全部停用状态。日志位于 tc-modloader-data/loader.log。
-
-## 卸载
-
-关闭该份游戏，再运行同版本安装器，选择同一个 EXE，在确认框中选择“否”。资源改动及原引擎恢复，Mod 包、备份和插件数据保留。原 EXE 不被修改。
-
-资源文件如果被外部工具或游戏更新修改，加载器会拒绝强行覆盖。不要在资源 Mod 启用期间删除备份目录。
+正式发布：`powershell -File tools/release.ps1`。它按 `release/manifest.json` 从空 staging
+收集内容，验证所有公开 Mod，生成可复现的源码包／玩家包、`release.json` 和两层
+`SHA256SUMS.txt`；工作树不干净时默认拒绝。只查看计划用 `tools/release.ps1 -Plan`，完整说明见
+**[docs/releasing.md](docs/releasing.md)**。`package.ps1` 保留为“使用已有构建、跳过测试”的兼容入口。
 
 ## 兼容构建
 
-界面版本号 2.1.334，同时严格校验以下 SHA-256：
+仅支持 2.1.334 指定构建，并严格校验 EXE 与引擎 SHA-256（见
+[docs/install.md](docs/install.md#兼容构建)）。可用 `tools/compat.ps1 -GameDirectory <游戏目录>`
+离线识别；画像格式、新版本适配流程和 SDK ABI 快照见
+[docs/compatibility.md](docs/compatibility.md)。游戏更新后需重新适配。
 
-Turing Complete.exe：
-8875da0e88cc878cb0fce30cfb63d20c5500cae341608af4d786649b88c8eb21
+## 许可
 
-原版 game_engine.dll：
-0a4030b5f5538cc3682610ac3e7b39e8e31ec34f9aeafe7a1d036bfa33819166
-
-游戏更新后需重新适配，不能简单关闭哈希检查。旧 Godot PCK、BepInEx 或 Lua Mod 不能直接用于此 SDK。
-
-## 文件位置
-
-- game_engine.dll：加载器代理。
-- tc_game_engine.dll：从玩家本机保留的原版引擎。
-- mods/*.mod：玩家分发的包。
-- tc-modloader-data/state.json：部署状态及原生包指纹。
-- tc-modloader-data/blobs/：资源原文件备份。
-- tc-modloader-data/plugins/<id>/<包指纹>/：原生 DLL 缓存。
-- tc-modloader-data/plugin-data/<id>/：插件自己的持久数据。
-
-安装包不包含原游戏 EXE 或引擎。原生 DLL 从缓存载入游戏进程，不覆盖游戏自己的 DLL。
-
-## 构建及测试
-
-Windows x64 + MinGW-w64，默认 C:\msys64\ucrt64\bin，可通过 TC_MINGW_BIN 指定。
-
-修改和构建加载器时，先解压分发包中的 TCModLoader-0.4.0-source.zip；完整示例源码也在该源码包中。
-
-依次执行 build.ps1、node tests/run.js、tests/native.ps1、tests/saves.ps1、tests/setup.ps1、package.ps1。验证电路封装 AND fixture 时，在 build.ps1 后执行 tests/and-component-playtest.ps1；验证元件菜单放置路径时执行 tests/component-placement-playtest.ps1；验证保存电路重启重载时执行 tests/component-persistence-playtest.ps1；验证原生 C++ OR 行为时执行 tests/custom-or-playtest.ps1。
-
-依赖源码 miniz 3.0.2、nlohmann/json 3.11.3、MinHook 1.3.4 已固定并随源码提供，不需联网构建。Node.js 只用于开发测试及导出表维护。
-
-实机和自动测试记录见 VALIDATION.md。项目源码 MIT，第三方许可随包提供。
-
+项目源码 MIT；第三方组件许可随分发包提供（`licenses/`）。

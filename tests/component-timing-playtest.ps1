@@ -1,7 +1,7 @@
 # Actual game compilation and menu score regressions, each in its own profile.
 $ErrorActionPreference='Stop'
 $taskRepo=Split-Path $PSScriptRoot
-$taskKeys=@('TC_FIXTURE','TC_SOLUTION','TC_COST_MODES','TC_EXPECT_DELAY','TC_EXPECT_GATES','TC_REPORT','TC_EXPECT_UI','TC_LEVEL','TC_EXPECT_LOG','TC_TOPO')
+$taskKeys=@('TC_FIXTURE','TC_SOLUTION','TC_COST_MODES','TC_EXPECT_DELAY','TC_EXPECT_GATES','TC_REPORT','TC_EXPECT_UI','TC_LEVEL','TC_EXPECT_LOG','TC_TOPO','TC_DECLARE_GATES','TC_DECLARE_DELAY','TC_EXTRA_MODS')
 $taskPrevious=@{}
 foreach($taskKey in $taskKeys) { $taskPrevious[$taskKey]=[Environment]::GetEnvironmentVariable($taskKey) }
 try {

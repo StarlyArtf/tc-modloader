@@ -7,6 +7,15 @@ $taskMod = Join-Path $taskRepo 'dist\dev.sim-state.mod'
 if(!(Test-Path -LiteralPath $taskMod)) { throw 'Missing dist\dev.sim-state.mod; run build.ps1 first' }
 $taskCustom = ($env:TC_SIM_STATE_CUSTOM -eq '1')
 $taskLogic = $env:TC_SIM_STATE_LOGIC
+# Extra packages to load next to the probe, by mod id: the real-machine check for
+# a feature that has to be exercised while the simulation runs uses this to add
+# example.cycle-guard (its sim.do chain link is idle on this 4-cycle level, so
+# the probe's own assertions stay untouched).
+# Assigned in two steps on purpose: `$x = if (...) { @(...) }` unrolls a
+# single-element array to a string (measured), and splatting a bare string with
+# @name then passes something unrelated - the CLI saw "-".
+$taskExtras = @()
+if($env:TC_SIM_STATE_EXTRA_MODS) { $taskExtras = @($env:TC_SIM_STATE_EXTRA_MODS -split ',' | Where-Object { $_ }) }
 
 $taskTest = Join-Path $taskRepo ('build\sim-state-playtest-' + [guid]::NewGuid().ToString('N'))
 $taskRoot = Join-Path $taskTest 'game'
@@ -33,7 +42,12 @@ if($taskCustom) {
   if(!(Test-Path -LiteralPath $taskFixture)) { throw "Missing custom fixture: $taskFixture" }
   Copy-Item -LiteralPath $taskFixture -Destination (Join-Path $taskData 'fixtures\and2_component.data')
 }
-& (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply dev.sim-state
+foreach($taskExtra in $taskExtras) {
+  $taskExtraMod = Join-Path $taskRepo ('dist\'+$taskExtra+'.mod')
+  if(!(Test-Path -LiteralPath $taskExtraMod)) { throw "Missing extra package: $taskExtraMod" }
+  Copy-Item -LiteralPath $taskExtraMod -Destination (Join-Path $taskRoot ('mods\'+$taskExtra+'.mod'))
+}
+& (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply dev.sim-state @taskExtras
 if($LASTEXITCODE){throw 'Sim state package apply failed'}
 
 $taskPreviousProfile = $env:USERPROFILE

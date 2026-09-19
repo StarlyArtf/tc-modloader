@@ -26,7 +26,8 @@ struct V2 {
     float x, y;
 };
 
-constexpr uint64_t kAndComponentId = 0x414E44325F303031ULL;
+// The probe accepts any definition file; the id comes from the file itself.
+uint64_t customComponentId = 0;
 const TCHost* host;
 tc::TCMod mod;
 void* model;
@@ -40,6 +41,9 @@ double start_time;
 double stage_time;
 double current_time;
 std::string mode = "plain";
+bool declared = false;
+uint64_t declareGates = 0;
+uint64_t declareDelay = 0;
 std::string level_name = "and_gate";
 bool (*invisible_original)(const char*, V2, int);
 int test_frame = -1;
@@ -223,7 +227,7 @@ static void frame(void*, const TCFrame* value) {
 
     tc::TCPrototype prototype{};
     const bool have_prototype =
-        mod.game.getCustomPrototype(kAndComponentId, prototype);
+        customComponentId && mod.game.getCustomPrototype(customComponentId, prototype);
     const int64_t prototype_gates =
         have_prototype ? static_cast<int64_t>(tc::prototypeGateCost(prototype)) : -1;
     const int64_t prototype_delay =
@@ -300,10 +304,20 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         if (mode_file) std::getline(mode_file, text);
         if (!text.empty()) mode = text;
     }
+    // Optional declared design cost: same order as a real Mod, which imports
+    // the definition and then rewrites the cached statistics before the final
+    // registration.  Without the file the probe registers what the importer
+    // produced, which is the previous behaviour.
+    {
+        std::ifstream declare_file(folder / "declare.txt");
+        if (declare_file >> declareGates >> declareDelay) declared = true;
+    }
 
     // "builtin" runs the same level geometry with the game's own AND gate and
     // no imported component, as a reference for what the score should read.
-    if (mode != "builtin") {
+    // "observe" also imports nothing: the board's custom component comes from
+    // another Mod that is enabled in the same session.
+    if (mode != "builtin" && mode != "observe") {
         std::ifstream file(folder / "fixtures" / "and2_component.data",
                            std::ios::binary);
         std::string bytes((std::istreambuf_iterator<char>(file)), {});
@@ -311,15 +325,21 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         const auto directory = (folder / "fixtures").generic_u8string() + "/";
         auto result = mod.components.importCircuit(
             "AND2 Test", bytes.data(), bytes.size(), directory.c_str());
-        if (!result.ok() || result.custom_id != kAndComponentId) return 4;
+        if (!result.ok() || !result.custom_id) return 4;
+        customComponentId = result.custom_id;
+        log("cost-probe: imported custom id=0x" + std::to_string(customComponentId));
         imported = true;
 
         tc::TCPrototype prototype{};
-        if (!mod.game.getCustomPrototype(kAndComponentId, prototype)) return 5;
+        if (!mod.game.getCustomPrototype(customComponentId, prototype)) return 5;
+        if (declared) {
+            mod.game.setPrototypeGateCost(prototype, declareGates);
+            mod.game.setPrototypeDelay(prototype, declareDelay);
+        }
         const uint64_t gate_cost = tc::prototypeGateCost(prototype);
         const uint64_t delay_cost = tc::prototypeDelay(prototype);
         // Register explicitly through the same SDK path used by native mods.
-        mod.game.setCustomPrototype(kAndComponentId, prototype);
+        mod.game.setCustomPrototype(customComponentId, prototype);
         mod.components.releasePrototype(prototype);
 
         if (mode == "insert") {

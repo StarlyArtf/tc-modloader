@@ -136,8 +136,9 @@ void hookedPreorder(void* settings, void* components, void* wires, void* memory,
     preorder_original(settings, components, wires, memory, a5, a6, a7, result);
 }
 
-bool hookedUpdateWire(void* context, void* a1, void* a2, uint32_t point,
-                      uint8_t fifth) {
+/* Kept for the record, not installed: see the target list in tc_mod_load. */
+[[maybe_unused]] bool hookedUpdateWire(void* context, void* a1, void* a2, uint32_t point,
+                                       uint8_t fifth) {
     board_context = context;
     return update_wire_original(context, a1, a2, point, fifth);
 }
@@ -261,32 +262,53 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         log("cost-watch: symbol lookup failed");
         return 3;
     }
-    if (h->create_hook(h->context, get_cost_target,
-                       reinterpret_cast<void*>(hookedGetCost),
-                       reinterpret_cast<void**>(&get_cost_original)) != 0 ||
-        h->create_hook(h->context, get_delay_target,
-                       reinterpret_cast<void*>(hookedGetDelayCost),
-                       reinterpret_cast<void**>(&get_delay_cost_original)) != 0 ||
-        h->create_hook(h->context, get_gate_target,
-                       reinterpret_cast<void*>(hookedGetGateCost),
-                       reinterpret_cast<void**>(&get_gate_cost_original)) != 0 ||
-        h->create_hook(h->context, build_scores_target,
-                       reinterpret_cast<void*>(hookedBuildScores),
-                       reinterpret_cast<void**>(&build_scores_original)) != 0 ||
-        h->create_hook(h->context, update_target,
-                       reinterpret_cast<void*>(hookedUpdateWire),
-                       reinterpret_cast<void**>(&update_wire_original)) != 0) {
-        log("cost-watch: hook install failed");
+    // An observer must tolerate targets the core loader already owns: it hooks
+    // preorder, custom_prototypes_set and the gate-cost entry points itself.
+    // Install what is free, name what is not, and keep the rest working.
+    //
+    // `handle_update_wire` is deliberately *not* in this list even though it is
+    // what fills the report's board line: the hook is exclusive, and a player
+    // mod that needs the same target (local.wire-palette hooks the wire update)
+    // would fail to load whenever this observer got there first.  A diagnostic
+    // probe does not get to break a real mod, so the board line now stays
+    // "no context yet" - the gate/delay numbers, which are the point, do not
+    // depend on it.
+    struct Target { const char* name; void* target; void* detour; void** original; };
+    const Target targets[] = {
+        {"get_cost", get_cost_target,
+         reinterpret_cast<void*>(&hookedGetCost),
+         reinterpret_cast<void**>(&get_cost_original)},
+        {"get_delay_cost", get_delay_target,
+         reinterpret_cast<void*>(&hookedGetDelayCost),
+         reinterpret_cast<void**>(&get_delay_cost_original)},
+        {"get_gate_cost", get_gate_target,
+         reinterpret_cast<void*>(&hookedGetGateCost),
+         reinterpret_cast<void**>(&get_gate_cost_original)},
+        {"build_scores", build_scores_target,
+         reinterpret_cast<void*>(&hookedBuildScores),
+         reinterpret_cast<void**>(&build_scores_original)},
+        {"preorder", preorder_target,
+         reinterpret_cast<void*>(&hookedPreorder),
+         reinterpret_cast<void**>(&preorder_original)},
+    };
+    int installed = 0;
+    for (const auto& entry : targets) {
+        if (h->create_hook(h->context, entry.target, entry.detour,
+                           entry.original) == 0) {
+            ++installed;
+        } else {
+            log(std::string("cost-watch: ") + entry.name +
+                " hook unavailable (owned by the loader or rejected)");
+        }
+    }
+    if (!installed) {
+        log("cost-watch: no observation hook could be installed");
         return 4;
     }
-    // The loader now owns this hook. It is optional for an observer; continue
-    // observing the UI and cost functions when that target is already owned.
-    if(h->create_hook(h->context, preorder_target,
-                      reinterpret_cast<void*>(hookedPreorder),
-                      reinterpret_cast<void**>(&preorder_original)) != 0)
-        log("cost-watch: preorder counter unavailable (hook owned by loader)");
     plugin->on_frame = frame;
-    log("cost-watch: observing get_cost, get_delay_cost, get_gate_cost, "
-        "build_scores, preorder, board");
+    log("cost-watch: observing " + std::to_string(installed) + "/" +
+        std::to_string(sizeof(targets) / sizeof(targets[0])) +
+        " targets (get_cost, get_delay_cost, get_gate_cost, build_scores, "
+        "preorder)");
     return 0;
 }

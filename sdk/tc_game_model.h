@@ -125,7 +125,7 @@ struct TCGameModel {
 
     // Registration/list primitives.  set/del are the low-level verified
     // mutation APIs. add_custom_prototype parses a circuit and has a hidden
-    // result pointer (see research/COMPONENT-PIPELINE.md). The separate experimental
+    // result pointer (see docs/research/component-pipeline.md). The separate experimental
     // TCComponentModel wraps circuit import, thread/error guards and cleanup.
     bool mutationValid() const {
         return custom_prototypes_set != nullptr &&

@@ -26,6 +26,11 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI
     raise SystemExit("python-snappy is required: python -m pip install python-snappy") from exc
 
 
+# Exported component definitions use versions 13/14.  Level save files written
+# by the pinned build use version 16, whose header is longer than this reader
+# assumes (the component array starts later), so those files are not decoded
+# here yet: the game's own loader log and the sandbox playtests are the tools
+# for inspecting a saved board for now.
 SUPPORTED_VERSIONS = (13, 14)
 KIND_INPUT = 0x3F
 KIND_OUTPUT = 0x44

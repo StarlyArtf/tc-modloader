@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
 $taskLevel = if($env:TC_LEVEL) { $env:TC_LEVEL } else { 'and_gate' }
-if($taskLevel -notin @('and_gate','sandbox','foundry')) { throw 'Unsupported timing test level' }
+$taskLevelDir = Join-Path $taskGame ('campaign\' + $taskLevel)
+if(!(Test-Path -LiteralPath $taskLevelDir)) { throw "Unsupported timing test level: $taskLevel" }
 $taskFixture = if($env:TC_FIXTURE) { $env:TC_FIXTURE } else { Join-Path $taskRepo 'build\and2_component.data' }
 $taskSolution = if($env:TC_SOLUTION) { $env:TC_SOLUTION } else { Join-Path $taskRepo 'build\and2_solution.data' }
 foreach($taskFile in @($taskFixture,$taskSolution)) {
@@ -35,10 +36,22 @@ foreach($taskMode in $taskModes) {
   Copy-Item -LiteralPath (Join-Path $taskRepo 'build\component-cost-probe.dll') -Destination (Join-Path $taskPackage 'native\probe.dll')
   '{"format":2,"id":"test.component-cost","name":"Development component cost probe","version":"0.0.1","native":{"api":1,"entry":"native/probe.dll"}}' | Set-Content -LiteralPath (Join-Path $taskPackage 'mod.json') -Encoding utf8
   & (Join-Path $taskRepo 'tools\Pack-Mod.ps1') -Source $taskPackage -Output (Join-Path $taskRoot 'mods\probe.mod') | Out-Null
-  & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply test.component-cost
+  # TC_EXTRA_MODS lets a case hand the measured component to a real Mod instead
+  # of the probe importing its own copy.
+  $taskEnable = @('test.component-cost')
+  foreach($taskExtra in ($env:TC_EXTRA_MODS -split ',' | Where-Object { $_ })) {
+    Copy-Item -LiteralPath (Join-Path $taskRepo ('dist\' + $taskExtra)) -Destination (Join-Path $taskRoot ('mods\' + $taskExtra))
+    $taskEnable += ($taskExtra -replace '\.mod$','')
+  }
+  & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply @taskEnable
   if($LASTEXITCODE){throw 'Component cost probe package apply failed'}
   Set-Content -LiteralPath (Join-Path $taskData 'mode.txt') -Value $taskMode -Encoding ascii
   Set-Content -LiteralPath (Join-Path $taskData 'level.txt') -Value $taskLevel -Encoding ascii
+  # A real Mod rewrites the cached statistics before its final registration.
+  # TC_DECLARE_GATES / TC_DECLARE_DELAY reproduce that order in the probe.
+  if($env:TC_DECLARE_GATES -and $env:TC_DECLARE_DELAY) {
+    Set-Content -LiteralPath (Join-Path $taskData 'declare.txt') -Value ($env:TC_DECLARE_GATES + ' ' + $env:TC_DECLARE_DELAY) -Encoding ascii
+  }
 
   $taskCircuitSource = if($taskMode -eq 'builtin') { Join-Path $taskRepo 'build\and2_solution_builtin.data' } else { $taskSolution }
   Copy-Item -LiteralPath $taskCircuitSource -Destination (Join-Path $taskSchema 'circuit.data') -Force
@@ -64,7 +77,7 @@ foreach($taskMode in $taskModes) {
     }
     if(!$taskProcess.HasExited) {
       [void]$taskProcess.CloseMainWindow()
-      if(!$taskProcess.WaitForExit(3000)) { Stop-Process -Id $taskProcess.Id }
+      if(!$taskProcess.WaitForExit(3000)) { Stop-Process -Id $taskProcess.Id -ErrorAction SilentlyContinue }
     }
     $taskText = [IO.File]::ReadAllText($taskResult)
     if($env:TC_EXPECT_DELAY -and $taskText -notmatch "(?m)^compiled delay=$([regex]::Escape($env:TC_EXPECT_DELAY))\r?$") {

@@ -12,6 +12,8 @@
 #include <functional>
 #include "json.hpp"
 #include "miniz.h"
+#include "capabilities.hpp"
+#include "version.hpp"
 namespace tc {
 namespace fs = std::filesystem;
 using J = nlohmann::json;
@@ -47,12 +49,119 @@ inline void no_links(const fs::path& root,const fs::path& p) {
  fs::path cur=root; for(auto& x:rel) {cur/=x; DWORD a=GetFileAttributesW(cur.c_str()); if(a!=INVALID_FILE_ATTRIBUTES&&(a&FILE_ATTRIBUTE_REPARSE_POINT)) throw std::runtime_error("Linked paths are not supported: "+cur.u8string());}
 }
 inline bool resource(const std::string& rel){auto prefix=rel.substr(0,rel.find('/'));return safe(rel)&&rel.find('/')!=rel.npos&&(prefix=="asset"||prefix=="campaign"||prefix=="translations");}
-struct Mod {std::string id,name,version,author,description,error,digest,entry; fs::path source; std::map<std::string,std::string> files,native; std::vector<std::string> dependencies;};
+inline std::string trim(const std::string& s){auto a=s.find_first_not_of(" \t\r\n");if(a==std::string::npos)return "";auto b=s.find_last_not_of(" \t\r\n");return s.substr(a,b-a+1);}
+inline bool valid_id(const std::string& id){return !id.empty()&&id.size()<=80&&id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789._-")==id.npos;}
+/* Mod versions are free-form text, so a dependency constraint is checked
+   against the leading dotted numeric run - 1.2.10 sorts after 1.9, which a
+   plain string comparison gets backwards - and falls back to a string
+   comparison when a version carries no numbers at all.  Accepted forms:
+   "" or "*" (any), "1.2.3", "=1.2.3", "!=1.2.3", ">=1.2.3", ">1.2.3",
+   "<=1.2.3", "<1.2.3", and several of those joined by commas (all must hold).
+   Trailing text is ignored ("1.0.0-beta" compares as 1.0.0). */
+inline std::vector<long long> version_numbers(const std::string& text){
+ std::vector<long long> out;size_t i=0;if(i<text.size()&&(text[i]=='v'||text[i]=='V'))i++;
+ while(i<text.size()){
+  if(text[i]<'0'||text[i]>'9')break;long long value=0;
+  while(i<text.size()&&text[i]>='0'&&text[i]<='9'){if(value<1000000000)value=value*10+(text[i]-'0');i++;}
+  out.push_back(value);
+  if(i<text.size()&&text[i]=='.'){i++;continue;}
+  break;
+ }
+ return out;
+}
+inline int version_compare(const std::string& a,const std::string& b){
+ auto x=version_numbers(a),y=version_numbers(b);
+ if(!x.empty()&&!y.empty()){auto n=std::max(x.size(),y.size());
+  for(size_t i=0;i<n;i++){auto l=i<x.size()?x[i]:0,r=i<y.size()?y[i]:0;if(l<r)return -1;if(l>r)return 1;}
+  return 0;}
+ if(a==b)return 0;return a<b?-1:1;
+}
+inline bool version_satisfies(const std::string& version,const std::string& constraint){
+ std::string text=trim(constraint);
+ if(text.empty()||text=="*")return true;
+ size_t start=0;
+ while(true){
+  auto comma=text.find(',',start);
+  std::string part=trim(text.substr(start,comma==std::string::npos?std::string::npos:comma-start));
+  if(!part.empty()){
+   std::string op="=",operand=part;
+   for(auto candidate:{std::string("!="),std::string(">="),std::string("<="),std::string("=="),std::string("="),std::string(">"),std::string("<")})
+    if(part.compare(0,candidate.size(),candidate)==0){op=candidate;operand=trim(part.substr(candidate.size()));break;}
+   if(operand.empty())return false;
+   auto cmp=version_compare(version,operand);
+   auto ok=op=="!="?cmp!=0:op==">="?cmp>=0:op=="<="?cmp<=0:op==">"?cmp>0:op=="<"?cmp<0:cmp==0;
+   if(!ok)return false;
+  }
+  if(comma==std::string::npos)break;start=comma+1;
+ }
+ return true;
+}
+struct Mod {
+ std::string id,name,version,author,description,error,digest,entry; fs::path source;
+ std::map<std::string,std::string> files,native;
+ /* Required and optional dependencies, in declaration order, plus the version
+    constraint each one carries ("" means "any version"). */
+ std::vector<std::string> dependencies,optional;
+ std::map<std::string,std::string> required_versions,optional_versions;
+ /* Capability names this package asked for in mod.json; every one of them was
+    already checked against the loader's own mask while the package was
+    scanned, so a package that reaches apply() has what it declared. */
+ std::vector<std::string> capabilities;
+};
+/* "requires" is either a list of ids (the original form) or an object that maps
+   an id to a version constraint; "optional" reads the same way but a missing or
+   unselected entry is not an error. */
+inline void parse_dependencies(const J& j,const char* key,std::vector<std::string>& ids,std::map<std::string,std::string>& constraints){
+ if(!j.contains(key))return;
+ const auto& node=j.at(key);
+ auto add=[&](const std::string& id,const std::string& constraint){
+  if(!valid_id(id))throw std::runtime_error(std::string("Invalid mod id in ")+key+": "+id);
+  if(constraints.count(id))return;
+  ids.push_back(id);constraints[id]=trim(constraint);
+ };
+ if(node.is_array()){for(auto& entry:node){if(!entry.is_string())throw std::runtime_error(std::string(key)+" entries must be mod ids");add(entry.get<std::string>(),"");}}
+ else if(node.is_object()){for(auto it=node.begin();it!=node.end();++it){if(!it.value().is_string())throw std::runtime_error(std::string(key)+" version constraints must be strings");add(it.key(),it.value().get<std::string>());}}
+ else throw std::runtime_error(std::string(key)+" must be an array of ids or an object of id/constraint pairs");
+}
+inline std::string constraint_of(const std::map<std::string,std::string>& constraints,const std::string& id){
+ auto it=constraints.find(id);return it==constraints.end()?std::string():it->second;
+}
+/* A package states what it needs from the loader by name, so the answer is
+   decided while the package is scanned: the player sees "this loader does not
+   provide ui_slot" in the list instead of a plugin that fails halfway through
+   tc_mod_load. */
+inline void parse_capabilities(const J& j,uint64_t loader,std::vector<std::string>& out){
+ if(!j.contains("capabilities"))return;
+ if(!j.at("capabilities").is_array())throw std::runtime_error("capabilities must be an array");
+ for(auto& entry:j.at("capabilities")){
+  if(!entry.is_string())throw std::runtime_error("capability entries must be names");
+  auto name=entry.get<std::string>();auto bit=capability_bit(name);
+  if(!bit)throw std::runtime_error("Unknown loader capability: "+name);
+  if(!(loader&bit))throw std::runtime_error("This loader does not provide the capability: "+name);
+  out.push_back(name);
+ }
+}
+/* A dependency may carry a version constraint; check it only when the dependent
+   package is actually selected, which is also the only case where the version
+   in the enabled set is the one that will run. */
+inline void check_dependency_version(const Mod& user,const std::string& id,const Mod& dep,const std::string& constraint){
+ if(constraint.empty())return;
+ if(!version_satisfies(dep.version,constraint))throw std::runtime_error(user.name+" requires "+id+" "+constraint+", but the enabled version is "+(dep.version.empty()?std::string("(none)"):dep.version));
+}
 struct Lock {HANDLE h; Lock(const fs::path& p) {h=CreateFileW(p.c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr); if(h==INVALID_HANDLE_VALUE) throw std::runtime_error("Another Mod operation is running");} ~Lock(){CloseHandle(h);} };
 class Core {
 public:
  fs::path root,dir; std::vector<Mod> mods; J state; std::string notice;
- Core(fs::path r):root(fs::absolute(r).lexically_normal()),dir(root/L"tc-modloader-data") {no_links(root,dir); no_links(root,dir/L"blobs"); fs::create_directories(dir/L"blobs"); for(auto name:{L"lock",L"state.json",L"transaction.json",L"state.json.tc-tmp",L"transaction.json.tc-tmp"})no_links(root,dir/name); Lock lock(dir/L"lock"); recover(); reload();}
+ /* What this loader provides to native plugins, and therefore what a package may
+    list in mod.json's "capabilities".  Settable so a test can stand in for an
+    older or smaller loader. */
+ uint64_t capabilities=loader_capabilities();
+ /* Scale the game's main menu is currently drawn with (the home page
+    multiplies its coordinates by it).  The loader records it each time it
+    draws inside that menu, so the native page container can match the game's
+    text size instead of guessing one. */
+ float ui_scale=1.f;
+ Core(fs::path r,uint64_t caps=loader_capabilities()):root(fs::absolute(r).lexically_normal()),dir(root/L"tc-modloader-data") {capabilities=caps;no_links(root,dir); no_links(root,dir/L"blobs"); fs::create_directories(dir/L"blobs"); for(auto name:{L"lock",L"state.json",L"transaction.json",L"state.json.tc-tmp",L"transaction.json.tc-tmp"})no_links(root,dir/name); Lock lock(dir/L"lock"); recover(); reload();}
  void reload(){state=jsonfile(dir/L"state.json",J{{"enabled",J::array()},{"files",J::object()}});}
  bool enabled(const std::string& id) const {for(auto& e:state.at("enabled")) if(e==id)return true;return false;}
  std::set<std::string> enabled_set() const {std::set<std::string> r;for(auto& e:state.at("enabled"))r.insert(e.get<std::string>());return r;}
@@ -78,8 +187,11 @@ public:
      size_t len{};void* data=mz_zip_reader_extract_to_heap(&z,i,&len,0);if(!data)throw std::runtime_error("Archive CRC/decompression failed");contents[path]=std::string((char*)data,len);mz_free(data);
     }
     if(!contents.count("mod.json"))throw std::runtime_error("Missing mod.json");if(contents.at("mod.json").size()>65536)throw std::runtime_error("Manifest exceeds 64 KiB");auto j=J::parse(contents.at("mod.json"));if(j.at("format")!=1&&j.at("format")!=2)throw std::runtime_error("Unsupported Mod format");
-    m.id=j.at("id").get<std::string>();if(m.id.empty()||m.id.size()>80||m.id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789._-")!=m.id.npos)throw std::runtime_error("Invalid Mod id");
-    m.name=j.at("name");m.version=j.at("version");m.author=j.value("author","");m.description=j.value("description","");m.dependencies=j.value("requires",std::vector<std::string>{});
+    m.id=j.at("id").get<std::string>();if(!valid_id(m.id))throw std::runtime_error("Invalid Mod id");
+    m.name=j.at("name");m.version=j.at("version");m.author=j.value("author","");m.description=j.value("description","");
+    parse_dependencies(j,"requires",m.dependencies,m.required_versions);
+    parse_dependencies(j,"optional",m.optional,m.optional_versions);
+    parse_capabilities(j,capabilities,m.capabilities);
     if(j.contains("native")){if(j.at("format")!=2||j.at("native").at("api")!=1)throw std::runtime_error("Native plugin requires format 2 / API 1");m.entry=j.at("native").at("entry").get<std::string>();if(!safe(m.entry)||m.entry.rfind("native/",0)!=0||lower(fs::u8path(m.entry).extension().u8string())!=".dll")throw std::runtime_error("Invalid native entry");}
     for(auto& [p,data]:contents){if(p=="mod.json")continue;if(p.rfind("native/",0)==0){m.native[p]=std::move(data);continue;}auto rel=p.substr(6);if(!resource(rel))throw std::runtime_error("Unsupported target: "+rel);m.files[rel]=std::move(data);}
     if(!m.native.empty()&&m.entry.empty())throw std::runtime_error("Native files require a native manifest entry");
@@ -96,7 +208,11 @@ public:
  }
  void apply(const std::set<std::string>& selected){Lock lock(dir/L"lock");recover();reload();scan();std::map<std::string,const Mod*> byId;for(auto& m:mods)if(m.error.empty())byId[m.id]=&m;
   std::map<std::string,std::string> desired,owners;
-  for(auto& id:selected){if(!byId.count(id))throw std::runtime_error("Missing or invalid Mod: "+id);auto& m=*byId.at(id);for(auto& req:m.dependencies)if(!selected.count(req))throw std::runtime_error(m.name+" requires "+req);
+  for(auto& id:selected){if(!byId.count(id))throw std::runtime_error("Missing or invalid Mod: "+id);auto& m=*byId.at(id);
+   for(auto& req:m.dependencies){if(!selected.count(req)||!byId.count(req))throw std::runtime_error(m.name+" requires "+req);check_dependency_version(m,req,*byId.at(req),constraint_of(m.required_versions,req));}
+   /* An optional dependency only has a version to check when it is enabled as
+      well; skipping it is exactly what "optional" means. */
+   for(auto& opt:m.optional){if(!selected.count(opt)||!byId.count(opt))continue;check_dependency_version(m,opt,*byId.at(opt),constraint_of(m.optional_versions,opt));}
    for(auto& [rel,data]:m.files){auto key=lower(rel);if(owners.count(key))throw std::runtime_error("File conflict: "+rel+" ("+owners[key]+" / "+id+")");owners[key]=id;desired[rel]=data;}}
   // Resolve case aliases against existing deployment paths on Windows.
   std::map<std::string,std::string> existing;for(auto it=state["files"].begin();it!=state["files"].end();++it)existing[lower(it.key())]=it.key();

@@ -24,7 +24,7 @@ void log(const std::string& message) {
 }
 
 // The public TCPin* returned by the helpers needs +8 bytes to reach the real
-// 0x38-byte descriptor whose +2 holds the relative point (see SDK-GUIDE).
+// 0x38-byte descriptor whose +2 holds the relative point (see docs/sdk/game-model.md).
 void readPin(const tc::TCPrototype& prototype, bool input, uint64_t index,
              std::ostringstream& out) {
     tc::TCPin* pin = input ? tc::prototypeInputPin(prototype, index)

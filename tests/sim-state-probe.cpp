@@ -173,16 +173,25 @@ bool hookedUpdate(void* m, void* context, void* input, uint32_t point,
                            : false;
 }
 
-void interceptedSimDo(void* state, uint8_t command, int64_t target) {
-    model = state;
+/* A link in the loader's sim.do chain: several mods may watch or steer run
+   requests at once, and returning non-zero (with skip_original set) is how this
+   probe keeps a run request from reaching the game while it drives the level
+   itself. */
+int interceptedSimDo(TCHookCall* call) {
+    auto* args = tc::hook::simDoArgs(call);
+    if (!args) return 0;
+    model = args->model;
     if (model && !model_logged) {
         model_logged = true;
         log("sim-state: model captured from sim_do " + hex(model));
     }
-    if (imported_custom && !custom_logic.empty() && command == 0) {
-        if (custom_runtime.run(mod, state, target)) return;
+    if (imported_custom && !custom_logic.empty() && args->command == 0) {
+        if (custom_runtime.run(mod, args->model, args->target)) {
+            call->skip_original = 1;
+            return 1;
+        }
     }
-    if (sim_do_original) sim_do_original(state, command, target);
+    return 0;
 }
 
 uint64_t hookedStateReadU64(int64_t index) {
@@ -552,11 +561,9 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
                        reinterpret_cast<void**>(&update_original)) != 0) {
         return 5;
     }
-    if (h->create_hook(h->context, sim_do_target,
-                       reinterpret_cast<void*>(&interceptedSimDo),
-                       reinterpret_cast<void**>(&sim_do_original)) != 0) {
-        return 6;
-    }
+    /* sim_do is a loader hook chain point: joining the chain is what lets this
+       probe run next to another mod that also watches run requests. */
+    if (tc::hook::addSimDo(h, 0, &interceptedSimDo, nullptr) != TC_HOOK_OK) return 6;
     if (h->create_hook(h->context, invisible_target,
                        reinterpret_cast<void*>(&hookedInvisible),
                        reinterpret_cast<void**>(&invisible_original)) != 0) {
