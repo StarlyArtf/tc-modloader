@@ -29,13 +29,16 @@ try {
   ('#define TC_MODLOADER_VERSION_PATCH {0}' -f $taskPatchNumber),
   '#define TC_MODLOADER_VERSION_CODE ((TC_MODLOADER_VERSION_MAJOR<<16)|(TC_MODLOADER_VERSION_MINOR<<8)|TC_MODLOADER_VERSION_PATCH)',
   ('#define TC_MODLOADER_VERSION_WTEXT L"{0}"' -f $taskVersion)
- ) -join "`r`n"
+ ) -join "`n"
  $taskPreviousVersion = ''
  if (Test-Path -LiteralPath $taskVersionPath) {
   $taskMatch = Select-String -LiteralPath $taskVersionPath -Pattern '^#define TC_MODLOADER_VERSION_STRING "([^"]+)"'
   if ($taskMatch) { $taskPreviousVersion = $taskMatch.Matches[0].Groups[1].Value }
  }
- Set-Content -LiteralPath $taskVersionPath -Value ($taskVersionHeader + "`r`n") -Encoding ascii -NoNewline
+ # LF, because .gitattributes says `*.hpp text eol=lf`: a CRLF here made every
+ # build dirty the working copy, and the release pipeline refuses to package a
+ # tree that its own build changed.
+ Set-Content -LiteralPath $taskVersionPath -Value ($taskVersionHeader + "`n") -Encoding ascii -NoNewline
  if ($taskPreviousVersion -ne $taskVersion) { Write-Host "Version: $taskPreviousVersion -> $taskVersion (src/version.hpp regenerated)" }
  New-Item -ItemType Directory -Force build,dist | Out-Null
  if (!(Test-Path src\proxy.def)) { & node tools\exports.js; if ($LASTEXITCODE) { throw 'Export generation failed' } }
