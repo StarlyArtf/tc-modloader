@@ -264,11 +264,33 @@
       "description": "Measure the real home-page entry rectangles for page drivers."
     },
     {
+      "id": "ui-page-driver-prepare",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/make-ui-sandbox.ps1",
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-Mods", "dev.menu-demo-driver,dev.menu-demo-peer-driver"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Prepare the page sandbox whose two plugins both drive their own page from inside the game."
+    },
+    {
+      "id": "ui-page-driver-probe",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/ui-page-playtest.ps1",
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-ProbeButtons"],
+      "timeoutSeconds": 120,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Measure that sandbox's page-entry rectangle for the driver run."
+    },
+    {
       "id": "ui-page-driver",
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-page-playtest.ps1",
-      "arguments": ["-DriverMode"],
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-DriverMode"],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -279,7 +301,7 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-page-playtest.ps1",
-      "arguments": ["-OpenSecondPage"],
+      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-OpenSecondPage"],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,

@@ -16,7 +16,10 @@ param(
   [int]$Seconds = 25,
   [switch]$KeepRunning,
   # With a driver-enabled demo package the plugin itself clicks through the
-  # page (tests/ui-page-driver.hpp) and captures the game's framebuffer.
+  # page (tests/ui-page-driver.hpp) and captures the game's framebuffer.  This
+  # mode needs a sandbox whose only page entry belongs to that package (see the
+  # ui-page-driver-prepare/-probe cases), otherwise the entry that gets clicked
+  # opens a plain demo plugin and no driver ever sees the page.
   [switch]$DriverMode,
   # Phase 1 only: run the game, print the loader's home-page button rectangles
   # and stop.  Used to feed a driver run the real hit boxes instead of a guess.
@@ -28,6 +31,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
+# Resolve the sandbox against the repository: Start-Process takes the game path
+# from here, and a relative sandbox (as the catalog passes for the driver-only
+# one) would otherwise start the game with a working directory it cannot find -
+# no window, no loader log, "Game window never appeared".
+if (![IO.Path]::IsPathRooted($Sandbox)) { $Sandbox = Join-Path $taskRepo $Sandbox }
+$Sandbox = [IO.Path]::GetFullPath($Sandbox)
 $taskRoot = Join-Path $Sandbox 'game'
 $taskOut = Join-Path $Sandbox 'out'
 $taskLog = Join-Path $taskRoot 'tc-modloader-data\loader.log'
@@ -129,10 +138,22 @@ $taskPreviousButton = $env:TC_DEMO_OPEN_BUTTON
 $taskProcess = $null
 try {
   if ($DriverMode) {
-    # From the probe run: the loader's own page-entry hit box, not a guess.
+    # Self-contained on purpose: the clicking driver lives in its own package
+    # (built with -DTC_DEMO_DRIVER), and this sandbox must contain nothing else,
+    # or the entry the driver clicks would open another plugin's page.
+    & (Join-Path $PSScriptRoot 'make-ui-sandbox.ps1') -Sandbox $Sandbox `
+      -Mods dev.menu-demo-driver,dev.menu-demo-peer-driver | Out-Null
+    if ($LASTEXITCODE) { throw 'Could not prepare the page-driver sandbox' }
+  }
+  if ($DriverMode -or $OpenSecondPage) {
+    # From the probe run: the loader's own page-entry hit box, not a guess.  The
+    # driver plugin clicks it from inside the game, because an external process's
+    # mouse messages do not reach the game's UI.
     $taskButtons = Join-Path $Sandbox 'buttons.txt'
     if (!(Test-Path -LiteralPath $taskButtons)) { throw "Missing $taskButtons; run the playtest with -ProbeButtons first" }
-    $taskOpen = (Get-Content -LiteralPath $taskButtons | Where-Object { $_ -notmatch '^Mods ' } | Select-Object -First 1)
+    $taskEntries = @(Get-Content -LiteralPath $taskButtons | Where-Object { $_ -notmatch '^Mods ' })
+    if ($OpenSecondPage -and $taskEntries.Count -lt 2) { throw 'Expected two page entries on the home page' }
+    $taskOpen = if ($OpenSecondPage) { $taskEntries[$taskEntries.Count - 1] } else { $taskEntries[0] }
     if (!$taskOpen) { throw 'No page-entry button was logged by the loader' }
     $env:TC_DEMO_OPEN_BUTTON = $taskOpen
     "Driver will click page entry: $taskOpen"
@@ -153,18 +174,9 @@ try {
     "Captured main menu: $($taskMenuSize.Width)x$($taskMenuSize.Height)"
   }
   if ($OpenSecondPage) {
-    $taskButtons = Join-Path $Sandbox 'buttons.txt'
-    if (!(Test-Path -LiteralPath $taskButtons)) { throw "Missing $taskButtons; run with -ProbeButtons first" }
-    $taskEntries = Get-Content -LiteralPath $taskButtons | Where-Object { $_ -notmatch '^Mods ' }
-    if (($taskEntries | Measure-Object).Count -lt 2) { throw 'Expected two page entries on the home page' }
-    $taskSecond = $taskEntries | Select-Object -Last 1
-    $taskFields = $taskSecond -split ' '
-    # The loader logs the surface its UI is drawn on and the real client size;
-    # the ratio between them is what turns a button rectangle into a click.
-    $taskScaleX = [double]$taskFields[5] / [double]$taskFields[3]
-    $taskScaleY = [double]$taskFields[6] / [double]$taskFields[4]
-    "Opening the second entry: $taskSecond (click scale $taskScaleX,$taskScaleY)"
-    Click-GamePoint $taskHandle ([int][double]$taskFields[1]) ([int][double]$taskFields[2]) $taskScaleX $taskScaleY
+    # The entry above was clicked by the driver plugin from inside the game; the
+    # screenshot is the visual half of the evidence, the log lines below are the
+    # assertion half.
     Start-Sleep -Seconds 4
     [void](Save-GameShot $taskHandle (Join-Path $taskOut 'peer-page.png'))
   }
@@ -202,7 +214,10 @@ if ($ProbeButtons) {
 $taskFailures = $taskLines | Where-Object { $_ -match 'Plugin callback threw|Native failed|UI page failed|Plugin UI page threw|回调异常|UI 页面异常' }
 if ($taskFailures) { $taskFailures | Select-Object -First 10; throw 'A native UI page reported an error' }
 $taskRegistered = $taskLines | Where-Object { $_ -match 'UI page registered' }
-$taskRequiredPages = if ($DriverMode) { 1 } else { 2 }
+# One registration is enough here: a probe run may use the driver-only sandbox.
+# That the two demo plugins each get their own home-page entry is
+# ui-page-isolation's assertion (it counts the entries below).
+$taskRequiredPages = 1
 if (($taskRegistered | Measure-Object).Count -lt $taskRequiredPages) {
   $taskLines | Select-Object -Last 25
   throw "Expected at least $taskRequiredPages page registration(s)"
@@ -228,7 +243,9 @@ if ($OpenSecondPage) {
   # must be the peer's, and the other plugin must have drawn nothing.
   $taskDrawn = $taskLines | Where-Object { $_ -match 'first drawn on frame' }
   if (($taskDrawn | Measure-Object).Count -ne 1) { throw 'Exactly one page should have drawn' }
-  if (!($taskLines | Where-Object { $_ -match 'Opened UI page dev.menu-demo-peer/settings' })) {
+  # The peer's page, whichever build of it this sandbox carries (the shared one
+  # holds dev.menu-demo-peer, the driver sandbox its -driver twin).
+  if (!($taskLines | Where-Object { $_ -match 'Opened UI page dev\.menu-demo-peer(-driver)?/settings' })) {
     $taskDrawn | Select-Object -First 4
     throw 'The peer page entry did not open the peer page'
   }

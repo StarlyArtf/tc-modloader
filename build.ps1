@@ -192,6 +192,18 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  '{"format":2,"id":"dev.menu-demo-driver","name":"Menu demo driver","version":"0.1.0","native":{"api":1,"entry":"native/menu-demo.dll"}}' | Set-Content (Join-Path $taskMenuDemoDriver 'mod.json') -Encoding ascii
  if(Test-Path dist\dev.menu-demo-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.menu-demo-driver.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskMenuDemoDriver -Output (Join-Path $taskRoot 'dist\dev.menu-demo-driver.mod')
+ # ... and the peer's own driver build.  Two page plugins that both click inside
+ # the game are what the isolation case needs: an external process cannot inject
+ # a click that the game's UI reacts to (measured - the window never leaves its
+ # parked position for it), so the click has to come from a plugin.
+ $taskMenuDemoPeerDriver=Join-Path $taskRoot 'build\menu-demo-peer-driver-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskMenuDemoPeerDriver 'native') | Out-Null
+ @('"-DTC_DEMO_PAGE_ID=\"settings\""','"-DTC_DEMO_PAGE_TITLE=\"Menu demo peer\""') | Set-Content -LiteralPath $taskMenuDefs -Encoding ascii
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk '@build\menu-demo-defs.rsp' -DTC_DEMO_PEER=1 -DTC_DEMO_DRIVER=1 examples\menu-demo\plugin.cpp -o (Join-Path $taskMenuDemoPeerDriver 'native\menu-demo-peer.dll') -lopengl32
+ if($LASTEXITCODE){throw 'Menu demo peer driver build failed'}
+ '{"format":2,"id":"dev.menu-demo-peer-driver","name":"Menu demo peer driver","version":"0.1.0","native":{"api":1,"entry":"native/menu-demo-peer.dll"}}' | Set-Content (Join-Path $taskMenuDemoPeerDriver 'mod.json') -Encoding ascii
+ if(Test-Path dist\dev.menu-demo-peer-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.menu-demo-peer-driver.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskMenuDemoPeerDriver -Output (Join-Path $taskRoot 'dist\dev.menu-demo-peer-driver.mod')
  # Circuit-board side panel example, plus a driver-enabled test build of the
  # same source (tests/ui-board-panel-driver.hpp).
  New-Item -ItemType Directory -Force examples\board-panel\native | Out-Null

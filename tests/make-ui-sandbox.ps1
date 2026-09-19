@@ -9,6 +9,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
+# A test-catalog entry can only pass one token per argument, and `-Mods a b`
+# would bind "b" to the next positional parameter (-Game), so a comma-separated
+# list is accepted as well: -Mods dev.menu-demo,dev.menu-demo-peer.
+$Mods = @($Mods | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 Import-Module (Join-Path $PSScriptRoot 'lib\Sandbox.psm1') -Force
 $taskSandbox = New-TcGameSandbox -Repository $taskRepo -Sandbox $Sandbox -Game $Game -Mods $Mods -Recreate:$Recreate
 "Sandbox ready: $($taskSandbox.Sandbox)"
