@@ -132,17 +132,6 @@
       "description": "The byte-adder example passes the stock level in cycle and refresh phases."
     },
     {
-      "id": "byte-adder-single",
-      "tier": "game",
-      "runner": "powershell",
-      "path": "tests/byte-adder-smoke.ps1",
-      "arguments": ["-Single"],
-      "timeoutSeconds": 120,
-      "requiresBuild": true,
-      "requiresGame": true,
-      "description": "The single-pin declarative byte component passes its stock level."
-    },
-    {
       "id": "component-placement",
       "tier": "game",
       "runner": "powershell",

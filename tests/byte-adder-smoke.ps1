@@ -7,6 +7,17 @@ param([string]$PackagePath, [string]$SchematicPath, [switch]$Stress, [switch]$Si
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
+# -Stress and -Single assert the *probe* package's registration and sampling
+# logs ("Declarative 8 inputs / 8 outputs", "declarative: double …"), so they only
+# make sense with an explicit -PackagePath: tests/native-component-playtest.ps1
+# builds that probe and passes one.  Running -Single against the shipped
+# example.byte-adder package can never pass - that package declares a single
+# three-pin component - and a test-catalog entry doing exactly that was the only
+# reason the release pipeline stopped at the game tier.
+if (($Stress -or $Single) -and !$PSBoundParameters.ContainsKey('PackagePath')) {
+  throw ('byte-adder-smoke.ps1 -Stress/-Single verify the native-component probe package; ' +
+         'pass -PackagePath, or use tests/native-component-playtest.ps1 -Single')
+}
 $taskSchematic = Join-Path $taskRepo 'build\nl_adder8board.data'
 if($SchematicPath) { $taskSchematic = $SchematicPath }
 if(!$PackagePath) { $PackagePath = Join-Path $taskRepo 'dist\example.byte-adder.mod' }
