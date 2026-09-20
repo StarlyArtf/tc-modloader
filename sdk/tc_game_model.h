@@ -18,6 +18,8 @@
 //   notin_custom_prototypes__modelZboardZcustom95prototype95list_u189
 //   cc_length__modelZboardZcustom95prototype95list_u8
 //   cc_live_values__modelZboardZcustom95prototype95list_u7
+//   PROTOTYPES table layout (length, bucket pointer, 0x5b8-byte buckets,
+//     key byte at +0x10, nonzero hash at +0x08)
 //
 // The remaining fields are left as opaque raw bytes.  Do not pass unknown
 // built-in kind bytes to getPrototype(); the pinned build raises a Nim index
@@ -33,23 +35,53 @@
 namespace tc {
 
 // get_prototype() checks this discriminator first.  0x4e ('N') selects the
-// custom-prototype branch and causes the uint16_t at +0x188 to be used as the
-// custom prototype ID.
+// custom-prototype branch and loads the uint64_t at +0x188 as the custom ID.
+// Only the initial hash-table slot is truncated to 16 bits, not the identity.
 enum : uint8_t { kPrototypeKindCustom = 0x4e };
+enum : size_t {
+    kPrototypeNameOffset = 0x10,
+    kPrototypeDescriptionOffset = 0x28,
+    kPrototypeCategoryRawOffset = 0x40,
+    kPrototypeFlagsRawOffset = 0x48,
+    kPrototypeShapeSvgOffset = 0xb0,
+    kPrototypeGateCostOffset = 0x130,
+    kPrototypeDelayOffset = 0x138
+};
+enum : uint64_t {
+    kPrototypeBucketStride = 0x5b8,
+    kPrototypeBucketHashOffset = 0x08,
+    kPrototypeBucketKeyOffset = 0x10
+};
 
 // The only two fields read by get_prototype() in the pinned build.  Keep this
 // struct as raw storage rather than a meaningful object model.
 struct TCPrototypeKind {
     uint8_t tag;
     uint8_t reserved[0x187];
-    uint16_t custom_id;  // offset 0x188
+    uint64_t custom_id;  // offset 0x188; full identity, not a hash slot
 };
+
+static_assert(offsetof(TCPrototypeKind, custom_id) == 0x188,
+              "Pinned component kind ID offset changed");
+static_assert(sizeof(TCPrototypeKind) == 0x190,
+              "Lookup key must include the complete 64-bit custom ID");
 
 // Verified output size of get_prototype()/get_custom_prototype().  The actual
 // object is a Nim Prototype; only the offsets below are currently exposed.
 struct TCPrototype {
     alignas(8) unsigned char bytes[0x5a8];
 };
+
+// Nim string object as used by the pinned build: length followed by a
+// pointer to the payload.  rawNewString() creates such an object.
+struct TCNimString {
+    uint64_t length;
+    void* data;
+};
+
+inline const char* prototypeNameCStr(const TCPrototype& p);
+inline const char* prototypeDescriptionCStr(const TCPrototype& p);
+inline const char* prototypeShapeSvgCStr(const TCPrototype& p);
 
 // Input/output pin entries in a Prototype are each 0x38 bytes.  The raw word
 // size value is the 8 bytes at +0x10 (verified in get_input_word_size and
@@ -62,16 +94,19 @@ using TCGetPrototypeFn = void (*)(const void* kind, void* out);
 using TCGetCustomPrototypeFn = void (*)(uint64_t custom_id, void* out);
 using TCWordSizeFn = uint64_t (*)(uint8_t kind, uint16_t pin_index,
                                   const void* expected_word_size);
+using TCRawNewStringFn = void (*)(void* out, int64_t length);
 using TCCustomPrototypeSetFn = void (*)(uint64_t custom_id,
                                         const void* prototype);
 using TCCustomPrototypeDelFn = void (*)(uint64_t custom_id);
 using TCCustomPrototypeContainsFn = uint8_t (*)(uint64_t custom_id);
+using TCAddCostFn = void (*)(uint8_t kind, const void* costs);
 
 struct TCGameModel {
     TCGetPrototypeFn get_prototype = nullptr;
     TCGetCustomPrototypeFn get_custom_prototype = nullptr;
     TCWordSizeFn get_input_word_size = nullptr;
     TCWordSizeFn get_output_word_size = nullptr;
+    TCRawNewStringFn raw_new_string = nullptr;
     const void* auto_size = nullptr;
     const void* prototypes_table = nullptr;
     const void* category_order = nullptr;
@@ -81,6 +116,7 @@ struct TCGameModel {
     TCCustomPrototypeContainsFn notin_custom_prototypes = nullptr;
     const uint64_t* custom_prototype_count = nullptr;
     const void* custom_prototype_live_values = nullptr;
+    TCAddCostFn add_cost = nullptr;
 
     // Returns true when the essential prototype lookup functions resolved.
     bool valid() const {
@@ -88,9 +124,9 @@ struct TCGameModel {
     }
 
     // Registration/list primitives.  set/del are the low-level verified
-    // mutation APIs; add_custom_prototype (file/parse based) is intentionally
-    // not wrapped yet because its full stack-argument layout is still being
-    // verified.
+    // mutation APIs. add_custom_prototype parses a circuit and has a hidden
+    // result pointer (see docs/research/component-pipeline.md). The separate experimental
+    // TCComponentModel wraps circuit import, thread/error guards and cleanup.
     bool mutationValid() const {
         return custom_prototypes_set != nullptr &&
                custom_prototypes_del != nullptr &&
@@ -116,6 +152,8 @@ struct TCGameModel {
             resolve("get_input_word_size__modelZboardZprototype95list_u4196"));
         get_output_word_size = reinterpret_cast<TCWordSizeFn>(
             resolve("get_output_word_size__modelZboardZprototype95list_u4353"));
+        raw_new_string = reinterpret_cast<TCRawNewStringFn>(
+            resolve("rawNewString"));
         auto_size = resolve("AUTO_SIZE__modelZmodel95types_u54");
         prototypes_table = resolve("PROTOTYPES__modelZboardZprototype95list_u3772");
         category_order = resolve("CATEGORY_ORDER__modelZboardZprototype95list_u21");
@@ -131,12 +169,18 @@ struct TCGameModel {
             resolve("cc_length__modelZboardZcustom95prototype95list_u8"));
         custom_prototype_live_values =
             resolve("cc_live_values__modelZboardZcustom95prototype95list_u7");
+        add_cost = reinterpret_cast<TCAddCostFn>(
+            resolve("add_cost__modelZscores_u2110"));
         return true;
     }
 
     bool wordSizeValid() const {
         return get_input_word_size != nullptr &&
                get_output_word_size != nullptr && auto_size != nullptr;
+    }
+
+    bool stringAllocValid() const {
+        return raw_new_string != nullptr;
     }
 
     // Fetch a prototype into out.  For custom prototypes use
@@ -163,6 +207,82 @@ struct TCGameModel {
         return true;
     }
 
+    bool customPrototypeAt(uint64_t occupied_index, TCPrototype& out) const {
+        if (occupied_index >= customPrototypeCount()) return false;
+        return getCustomPrototype(customPrototypeIdAt(occupied_index), out);
+    }
+
+    // Copy a verified built-in prototype into out.  This is the safe base for
+    // prototype-table experiment: copy it, adjust verified fields, then call
+    // setCustomPrototype(). This does not register new simulation behavior or
+    // construct the embedded circuit expected by the custom-component path.
+    bool cloneBuiltinPrototype(uint8_t kind, TCPrototype& out) const {
+        if (!isBuiltinPrototypeKind(kind)) return false;
+        return getPrototype(kind, 0, out);
+    }
+
+    bool builtinPrototypeAt(uint64_t occupied_index, TCPrototype& out) const {
+        if (occupied_index >= builtinPrototypeCount()) return false;
+        return cloneBuiltinPrototype(builtinPrototypeKindAt(occupied_index),
+                                     out);
+    }
+
+    // Convenience helper for the common template workflow.  The copied
+    // prototype is registered under custom_id; the caller should keep the
+    // returned out alive only as a working copy, since setCustomPrototype
+    // deep-copies it into the game's custom prototype table.
+    bool registerBuiltinAsCustom(uint8_t kind, uint64_t custom_id,
+                                 TCPrototype& out) const {
+        if (!cloneBuiltinPrototype(kind, out)) return false;
+        return setCustomPrototype(custom_id, out);
+    }
+
+    bool registerNamedBuiltinAsCustom(uint8_t kind, uint64_t custom_id,
+                                      const char* name,
+                                      const char* description) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return false;
+        if (!setPrototypeName(prototype, name)) return false;
+        if (!setPrototypeDescription(prototype, description)) return false;
+        return setCustomPrototype(custom_id, prototype);
+    }
+
+    const char* builtinPrototypeName(uint8_t kind) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return nullptr;
+        return prototypeNameCStr(prototype);
+    }
+
+    const char* builtinPrototypeDescription(uint8_t kind) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return nullptr;
+        return prototypeDescriptionCStr(prototype);
+    }
+
+    const char* builtinPrototypeShapeSvg(uint8_t kind) const {
+        TCPrototype prototype{};
+        if (!cloneBuiltinPrototype(kind, prototype)) return nullptr;
+        return prototypeShapeSvgCStr(prototype);
+    }
+
+    const char* customPrototypeName(uint64_t custom_id) const {
+        TCPrototype prototype{};
+        if (!getCustomPrototype(custom_id, prototype)) return nullptr;
+        return prototypeNameCStr(prototype);
+    }
+
+    const char* customPrototypeDescription(uint64_t custom_id) const {
+        TCPrototype prototype{};
+        if (!getCustomPrototype(custom_id, prototype)) return nullptr;
+        return prototypeDescriptionCStr(prototype);
+    }
+
+    const char* customPrototypeShapeSvg(uint64_t custom_id) const {
+        TCPrototype prototype{};
+        if (!getCustomPrototype(custom_id, prototype)) return nullptr;
+        return prototypeShapeSvgCStr(prototype);
+    }
+
     uint64_t inputWordSize(uint8_t kind, uint16_t pin_index) const {
         if (!wordSizeValid()) return 0;
         return get_input_word_size(kind, pin_index, auto_size);
@@ -178,6 +298,89 @@ struct TCGameModel {
         uint64_t value = 0;
         memcpy(&value, custom_prototype_count, sizeof(value));
         return value;
+    }
+
+    // Enumerate the built-in PROTOTYPES hash table without ever passing an
+    // unknown key to get_prototype().  The table object is two qwords:
+    // length, bucket pointer.  Buckets are 0x5b8 bytes; an occupied bucket
+    // has a nonzero hash at +0x08 and its single-byte key at +0x10.
+    uint64_t builtinPrototypeCount() const {
+        if (!prototypes_table) return 0;
+        uint64_t length = 0;
+        void* buckets = nullptr;
+        memcpy(&length, prototypes_table, sizeof(length));
+        memcpy(&buckets, static_cast<const unsigned char*>(prototypes_table) + 8,
+               sizeof(buckets));
+        if (!buckets || length > 4096) return 0;
+
+        uint64_t count = 0;
+        for (uint64_t i = 0; i < length; ++i) {
+            uint64_t hash = 0;
+            const auto* bucket =
+                static_cast<const unsigned char*>(buckets) +
+                i * kPrototypeBucketStride;
+            memcpy(&hash, bucket + kPrototypeBucketHashOffset, sizeof(hash));
+            if (hash != 0) ++count;
+        }
+        return count;
+    }
+
+    uint8_t builtinPrototypeKindAt(uint64_t occupied_index) const {
+        if (!prototypes_table || occupied_index >= builtinPrototypeCount()) {
+            return 0;
+        }
+        uint64_t length = 0;
+        void* buckets = nullptr;
+        memcpy(&length, prototypes_table, sizeof(length));
+        memcpy(&buckets, static_cast<const unsigned char*>(prototypes_table) + 8,
+               sizeof(buckets));
+        if (!buckets || length > 4096) return 0;
+
+        uint64_t seen = 0;
+        for (uint64_t i = 0; i < length; ++i) {
+            uint64_t hash = 0;
+            const auto* bucket =
+                static_cast<const unsigned char*>(buckets) +
+                i * kPrototypeBucketStride;
+            memcpy(&hash, bucket + kPrototypeBucketHashOffset, sizeof(hash));
+            if (hash == 0) continue;
+            if (seen == occupied_index) {
+                uint8_t key = 0;
+                memcpy(&key, bucket + kPrototypeBucketKeyOffset, sizeof(key));
+                return key;
+            }
+            ++seen;
+        }
+        return 0;
+    }
+
+    bool isBuiltinPrototypeKind(uint8_t kind) const {
+        return builtinPrototypeIndexForKind(kind) != ~uint64_t{0};
+    }
+
+    uint64_t builtinPrototypeIndexForKind(uint8_t kind) const {
+        if (!prototypes_table) return ~uint64_t{0};
+        uint64_t length = 0;
+        void* buckets = nullptr;
+        memcpy(&length, prototypes_table, sizeof(length));
+        memcpy(&buckets, static_cast<const unsigned char*>(prototypes_table) + 8,
+               sizeof(buckets));
+        if (!buckets || length > 4096) return ~uint64_t{0};
+
+        uint64_t occupied = 0;
+        for (uint64_t i = 0; i < length; ++i) {
+            uint64_t hash = 0;
+            const auto* bucket =
+                static_cast<const unsigned char*>(buckets) +
+                i * kPrototypeBucketStride;
+            memcpy(&hash, bucket + kPrototypeBucketHashOffset, sizeof(hash));
+            if (hash == 0) continue;
+            uint8_t key = 0;
+            memcpy(&key, bucket + kPrototypeBucketKeyOffset, sizeof(key));
+            if (key == kind) return occupied;
+            ++occupied;
+        }
+        return ~uint64_t{0};
     }
 
     // cc_live_values entries are 16 bytes: {uint64_t id, uint16_t id_low,
@@ -210,6 +413,93 @@ struct TCGameModel {
     bool removeCustomPrototype(uint64_t custom_id) const {
         if (!custom_prototypes_del) return false;
         custom_prototypes_del(custom_id);
+        return true;
+    }
+
+    // Insert an entry into the per-kind score table.  The game builds this
+    // table before native plugins load, so a kind a plugin introduces stays
+    // out of it otherwise.  Note that custom component instances (kind 0x4e)
+    // do NOT read this table: get_cost resolves them through
+    // get_custom_prototype and returns the prototype's own gate/delay fields
+    // (see setPrototypeGateCost / setPrototypeDelay).
+    bool addComponentCost(uint8_t kind, uint64_t gate_cost,
+                          uint64_t delay_cost) const {
+        if (!add_cost) return false;
+        const uint64_t pair[2] = {gate_cost, delay_cost};
+        add_cost(kind, pair);
+        return true;
+    }
+
+    void removeAllCustomPrototypes() const {
+        while (customPrototypeCount() > 0) {
+            removeCustomPrototype(customPrototypeIdAt(0));
+        }
+    }
+
+    // Replace the verified name/description fields with a newly allocated
+    // Nim string.  The old template string is not freed; use this only on a
+    // working copy before registering it, never on a live table entry.
+    bool setPrototypeName(TCPrototype& prototype, const char* utf8) const {
+        return setPrototypeString(prototype, utf8, 0x10);
+    }
+
+    bool setPrototypeDescription(TCPrototype& prototype,
+                                 const char* utf8) const {
+        return setPrototypeString(prototype, utf8, kPrototypeDescriptionOffset);
+    }
+
+    bool setPrototypeShapeSvg(TCPrototype& prototype,
+                              const char* utf8) const {
+        return setPrototypeString(prototype, utf8, kPrototypeShapeSvgOffset);
+    }
+
+    // Cached design statistics of a circuit-backed prototype.  The game
+    // recomputes the gate count while parsing a definition but keeps the
+    // stored delay verbatim. For prototypes registered during native Mod
+    // initialization, the loader also uses this declared delay in acyclic
+    // board timing: serial components add, parallel paths take the maximum.
+    // Gate totals still use the game's recursive circuit count. A definition has
+    // to carry its real critical path; patch it here when the serialized header
+    // cannot be prepared ahead of time.
+    bool setPrototypeGateCost(TCPrototype& prototype, uint64_t value) const {
+        return setPrototypeRaw(prototype, kPrototypeGateCostOffset, &value);
+    }
+
+    bool setPrototypeDelay(TCPrototype& prototype, uint64_t value) const {
+        return setPrototypeRaw(prototype, kPrototypeDelayOffset, &value);
+    }
+
+    bool setPrototypeRaw(TCPrototype& prototype, size_t field_offset,
+                         const void* data) const {
+        if (data == nullptr || field_offset > sizeof(prototype.bytes) ||
+            sizeof(uint64_t) > sizeof(prototype.bytes) - field_offset) {
+            return false;
+        }
+        memcpy(prototype.bytes + field_offset, data, sizeof(uint64_t));
+        return true;
+    }
+
+    bool setPrototypeString(TCPrototype& prototype, const char* utf8,
+                            size_t field_offset) const {
+        if (!raw_new_string || utf8 == nullptr ||
+            field_offset > sizeof(prototype.bytes) ||
+            sizeof(TCNimString) > sizeof(prototype.bytes) - field_offset) {
+            return false;
+        }
+        const size_t length = strlen(utf8);
+        if (length > INT64_MAX) return false;
+
+        TCNimString value{};
+        if (length) {
+            raw_new_string(&value, static_cast<int64_t>(length));
+            if (!value.data) return false;
+            // rawNewString reserves capacity but returns logical length zero.
+            value.length = length;
+            memcpy(static_cast<unsigned char*>(value.data) + 8, utf8, length);
+            static_cast<unsigned char*>(value.data)[8 + length] = 0;
+        }
+
+        memcpy(prototype.bytes + field_offset, &value, sizeof(value));
         return true;
     }
 };
@@ -266,6 +556,146 @@ inline uint64_t pinWordSizeRaw(const TCPin& pin) {
     memcpy(&value, pin.bytes + 0x10, sizeof(value));
     return value;
 }
+
+inline TCNimString prototypeName(const TCPrototype& p) {
+    TCNimString value{};
+    memcpy(&value.length, p.bytes + kPrototypeNameOffset, sizeof(value.length));
+    memcpy(&value.data, p.bytes + kPrototypeNameOffset + 8, sizeof(value.data));
+    return value;
+}
+
+inline TCNimString prototypeDescription(const TCPrototype& p) {
+    TCNimString value{};
+    memcpy(&value.length, p.bytes + kPrototypeDescriptionOffset, sizeof(value.length));
+    memcpy(&value.data, p.bytes + kPrototypeDescriptionOffset + 8, sizeof(value.data));
+    return value;
+}
+
+inline TCNimString prototypeShapeSvg(const TCPrototype& p) {
+    TCNimString value{};
+    memcpy(&value.length, p.bytes + kPrototypeShapeSvgOffset, sizeof(value.length));
+    memcpy(&value.data, p.bytes + kPrototypeShapeSvgOffset + 8, sizeof(value.data));
+    return value;
+}
+
+inline uint64_t prototypeCategoryRaw(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeCategoryRawOffset, sizeof(value));
+    return value;
+}
+
+inline uint64_t prototypeFlagsRaw(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeFlagsRawOffset, sizeof(value));
+    return value;
+}
+
+inline uint64_t prototypeGateCost(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeGateCostOffset, sizeof(value));
+    return value;
+}
+
+inline uint64_t prototypeDelay(const TCPrototype& p) {
+    uint64_t value = 0;
+    memcpy(&value, p.bytes + kPrototypeDelayOffset, sizeof(value));
+    return value;
+}
+
+inline const char* prototypeNameCStr(const TCPrototype& p) {
+    TCNimString value = prototypeName(p);
+    return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
+}
+
+inline const char* prototypeDescriptionCStr(const TCPrototype& p) {
+    TCNimString value = prototypeDescription(p);
+    return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
+}
+
+inline const char* prototypeShapeSvgCStr(const TCPrototype& p) {
+    TCNimString value = prototypeShapeSvg(p);
+    return value.data ? static_cast<const char*>(value.data) + 8 : nullptr;
+}
+
+// Small convenience wrapper for the verified template workflow.  It owns a
+// working TCPrototype copy and keeps the model reference used to register it.
+// Identity/visual fields not yet reverse-engineered remain raw bytes; they can
+// be modified through setRawField() when their offsets are known.
+class TCPrototypeBuilder {
+ public:
+    TCPrototypeBuilder(const TCGameModel& model, uint8_t builtin_kind)
+        : model_(&model), kind_(builtin_kind), ready_(false) {
+        ready_ = model.cloneBuiltinPrototype(builtin_kind, prototype_);
+    }
+
+    bool ready() const { return ready_; }
+    uint8_t kind() const { return kind_; }
+    TCPrototype& prototype() { return prototype_; }
+    const TCPrototype& prototype() const { return prototype_; }
+
+    void setInputCount(uint64_t count) {
+        prototypeSetInputCount(prototype_, count);
+    }
+
+    void setInputPins(TCPin* pins) {
+        prototypeSetInputPins(prototype_, pins);
+    }
+
+    void setOutputCount(uint64_t count) {
+        prototypeSetOutputCount(prototype_, count);
+    }
+
+    void setOutputPins(TCPin* pins) {
+        prototypeSetOutputPins(prototype_, pins);
+    }
+
+    void setCategoryRaw(uint64_t value) {
+        setRawField(kPrototypeCategoryRawOffset, &value, sizeof(value));
+    }
+
+    void setFlagsRaw(uint64_t value) {
+        setRawField(kPrototypeFlagsRawOffset, &value, sizeof(value));
+    }
+
+    bool setName(const char* utf8) {
+        return model_->setPrototypeName(prototype_, utf8);
+    }
+
+    bool setDescription(const char* utf8) {
+        return model_->setPrototypeDescription(prototype_, utf8);
+    }
+
+    bool setShapeSvg(const char* utf8) {
+        return model_->setPrototypeShapeSvg(prototype_, utf8);
+    }
+
+    // Circuit-backed components: store the design's own gate count and
+    // critical-path delay so the reported cost matches the design.
+    // The loader honors declared delays for Mod prototypes registered during
+    // initialization. This does not change their logical behavior. Feedback or
+    // multiple-driver graphs retain native timing and emit a loader diagnostic.
+    bool setDesignCost(uint64_t gates, uint64_t delay) {
+        return model_->setPrototypeGateCost(prototype_, gates) &&
+               model_->setPrototypeDelay(prototype_, delay);
+    }
+
+    void setRawField(size_t offset, const void* data, size_t size) {
+        if (offset <= sizeof(prototype_.bytes) &&
+            size <= sizeof(prototype_.bytes) - offset) {
+            memcpy(prototype_.bytes + offset, data, size);
+        }
+    }
+
+    bool registerAsCustom(uint64_t custom_id) const {
+        return ready_ && model_->setCustomPrototype(custom_id, prototype_);
+    }
+
+ private:
+    const TCGameModel* model_;
+    uint8_t kind_;
+    bool ready_;
+    TCPrototype prototype_{};
+};
 
 }  // namespace tc
 

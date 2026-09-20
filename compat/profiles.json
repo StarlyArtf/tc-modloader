@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "id": "tc-win64-2.1.334",
+      "current": true,
+      "status": "supported",
+      "gameVersion": "2.1.334",
+      "gameBuildLabel": "2.1.334 / native-api-1",
+      "platform": "windows-x64",
+      "files": {
+        "executable": {
+          "name": "Turing Complete.exe",
+          "size": 9752394,
+          "sha256": "8875da0e88cc878cb0fce30cfb63d20c5500cae341608af4d786649b88c8eb21"
+        },
+        "engine": {
+          "installedName": "game_engine.dll",
+          "backupName": "tc_game_engine.dll",
+          "size": 1989120,
+          "sha256": "0a4030b5f5538cc3682610ac3e7b39e8e31ec34f9aeafe7a1d036bfa33819166"
+        }
+      },
+      "rvas": {
+        "TC_MENU_END_RVA": "0x456c33",
+        "TC_HOME_START_RVA": "0x449df0",
+        "TC_HOME_END_RVA": "0x44b610",
+        "TC_BOARD_INPUT_SAMPLE_RVA": "0x46b593",
+        "TC_BOARD_TOOLBAR_END_RVA": "0x4659c1",
+        "TC_BOARD_WINDOW_HOVER_RVA": "0x46b5e2"
+      },
+      "requiredSymbolAliases": [
+        "sim.do",
+        "sim.cycle",
+        "sim.settings",
+        "sim.setting.get",
+        "sim.setting.set",
+        "sim.state.read",
+        "level.load",
+        "level.loaded",
+        "scene.change",
+        "board.wire.update",
+        "save.count",
+        "save.level",
+        "save.path.level",
+        "save.path.schematic",
+        "runtime.emutls",
+        "ui.fonts",
+        "ui.pushFont",
+        "ui.invisibleButton",
+        "cost.gate",
+        "cost.total",
+        "cost.delay"
+      ],
+      "acceptedInstalledLoaders": [
+        {
+          "macro": "TC_LOADER_020_SHA",
+          "version": "0.2.0",
+          "sha256": "1612880bc7c3c198604b5b967900a32720700ebebd135b72348a3e3ac409877b"
+        },
+        {
+          "macro": "TC_PREVIOUS_LOADER_SHA",
+          "version": "previous",
+          "sha256": "f41ba881ebab46b8cced4eacd76193e1af97004667082b4cff5378b1d81f60c5"
+        }
+      ]
+    }
+  ]
+}

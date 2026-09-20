@@ -5,5 +5,6 @@
  "version": "1.0.0",
  "author": "TC Mod Loader",
  "description": "真正的原生代码 Mod：拦截游戏 sim_do 运行命令，把长时间或连续运行限制为每次最多 N 个周期，保留暂停、重置和单步。附带批量运行面板，F6 显示或隐藏。用于调试现有电路；请在关卡中使用。",
+ "capabilities": ["symbol", "symbol_alias", "hook", "hook_chain"],
  "native": {"api": 1, "entry": "native/cycle-guard.dll"}
 }

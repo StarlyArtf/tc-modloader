@@ -1,0 +1,10 @@
+{
+  "format": 2,
+  "id": "example.drawing-demo",
+  "name": "Custom drawing demo",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "Interactive canvas with shapes, curves, clipping and draggable points. Open its main-menu page or press F8 on a board.",
+  "capabilities": ["ui_page", "texture"],
+  "native": {"api": 1, "entry": "native/drawing-demo.dll"}
+}

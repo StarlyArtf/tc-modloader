@@ -1,0 +1,29 @@
+* text=auto
+
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+VERSION        text eol=lf
+
+*.c       text eol=lf
+*.cpp     text eol=lf
+*.def     text eol=lf
+*.h       text eol=lf
+*.hpp     text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.ps1     text eol=lf
+*.psm1    text eol=lf
+*.py      text eol=lf
+*.rc      text eol=lf
+*.txt     text eol=lf
+
+*.bmp     binary
+*.data    binary
+*.dll     binary
+*.exe     binary
+*.ico     binary
+*.mod     binary
+*.png     binary
+*.zip     binary
