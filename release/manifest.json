@@ -72,7 +72,8 @@
       { "source": "dist/dev.menu-demo.mod", "target": "dev.menu-demo.mod", "id": "dev.menu-demo" },
       { "source": "dist/example.waveform-demo.mod", "target": "example.waveform-demo.mod", "id": "example.waveform-demo" },
       { "source": "dist/tcmod.mod-inspector.mod", "target": "tcmod.mod-inspector.mod", "id": "tcmod.mod-inspector" },
-      { "source": "dist/dev.cost-watch.mod", "target": "dev.cost-watch.mod", "id": "dev.cost-watch" }
+      { "source": "dist/dev.cost-watch.mod", "target": "dev.cost-watch.mod", "id": "dev.cost-watch" },
+      { "source": "dist/local.word-watchee-64.mod", "target": "local.word-watchee-64.mod", "id": "local.word-watchee-64" }
     ]
   },
   "standalone": [

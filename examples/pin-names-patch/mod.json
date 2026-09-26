@@ -1,0 +1,10 @@
+{
+  "format": 2,
+  "id": "local.pin-names-patch",
+  "name": "自定义元件引脚显示修复",
+  "version": "0.0.4",
+  "author": "TC Mod Loader",
+  "description": "给自定义元件预览中的引脚顺时针编号，并在旁边用表格列出编号与标签的对应关系；预览里每个引脚的白条改短变细，只用来标位置。左侧输入状态/输出状态面板的即时刷新已归加载器所有（它自己拥有 build_io_state_view），因此本包只负责预览这一侧，不再钩那个函数。",
+  "capabilities": ["log", "symbol", "hook", "status"],
+  "native": {"api": 1, "entry": "native/pin-names-patch.dll"}
+}

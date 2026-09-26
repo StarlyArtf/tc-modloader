@@ -2,6 +2,26 @@
   "schemaVersion": 1,
   "tests": [
     {
+      "id": "io-value-service",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/io-value-service.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The loader's side of TC_SERVICE_IO_VALUE: the expression parser a value field's text has to survive (0x/0b/0o, ~ - * / % + - << >> & ^ |, parentheses, digit separators), the width truncation every field applies, and the service table's shape."
+    },
+    {
+      "id": "punch-tape-layout",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/punch-tape-layout.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The punch tape follows the panel it is drawn in: whole byte groups wrap first, then the chips scale into the free box (up on a big window, down on a short drawer) and every bit stays inside the grid."
+    },
+    {
       "id": "build",
       "tier": "fast",
       "runner": "powershell",
@@ -32,6 +52,16 @@
       "description": "Compile and compare all public C ABI sizes, alignments, offsets and constants."
     },
     {
+      "id": "word-watchee-model",
+      "tier": "fast",
+      "runner": "node",
+      "path": "tests/word-watchee-model.js",
+      "timeoutSeconds": 60,
+      "requiresBuild": false,
+      "requiresGame": true,
+      "description": "WordWatchee 64: the value_size clamp in the pinned executable and the shader's 33..64 bit digit extraction."
+    },
+    {
       "id": "package-manager",
       "tier": "fast",
       "runner": "node",
@@ -49,7 +79,7 @@
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": false,
-      "description": "Save import, path isolation and reparse-point rejection."
+      "description": "Save import, path isolation, reparse-point rejection, and the profile management and dependency report the 存档 page drives. The case imports the vanilla save twice in an isolated home (complete copy including Unicode names and binary schematics, cloud metadata excluded, previous imports and the default profile untouched), rejects a linked source and a traversal profile without changing the selection, and then exercises the management core the page and 'tcmod-cli saves ...' share: list reports the selected profile as running, create makes a fresh local- profile and selects it without disturbing the others, duplicate carries the source contents into a copy-, rename moves it, remove moves it into a trash- profile whose contents survive, and removing the profile the next start would use is refused with the selection left alone. It then frames a literal-only Snappy circuit by hand (the encoding tests/float-fixture.cpp writes) holding one custom_id the registry cache knows and one it does not, and requires 'saves report' to name the Mod and type from the cache, to report the unknown type by its author tag, to count both as missing while nothing provides them, and to report nothing for a profile without custom components."
     },
     {
       "id": "release-contract",
@@ -152,6 +182,88 @@
       "description": "Save and reload a custom component and its wires."
     },
     {
+      "id": "component-persistence-insert",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-persistence-playtest.ps1",
+      "arguments": [
+        "-Mode",
+        "insert"
+      ],
+      "timeoutSeconds": 200,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Insert, grow, save and read back a component's custom tail through the game's own table setter."
+    },
+    {
+      "id": "component-storage",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-storage-playtest.ps1",
+      "timeoutSeconds": 200,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Write an instance configuration through tc.component.storage, save it with the schematic and read it back after a restart."
+    },
+    {
+      "id": "component-storage-migrate",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-storage-playtest.ps1",
+      "arguments": [
+        "-Mode",
+        "migrate"
+      ],
+      "timeoutSeconds": 200,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "A configuration saved under an older schema is converted by the definition's migration, committed to the record and read back by the next launch."
+    },
+    {
+      "id": "component-storage-migrate-reject",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-storage-playtest.ps1",
+      "arguments": [
+        "-Mode",
+        "reject"
+      ],
+      "timeoutSeconds": 200,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "A refused configuration migration leaves both the live configuration and the stored record alone, and the next launch is offered the same bytes."
+    },
+    {
+      "id": "component-placeholder",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-placeholder-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "What a missing Mod costs: the component becomes a tombstone, the file survives until a save, a reinstall restores the configuration, and a save without the Mod loses it."
+    },
+    {
+      "id": "component-undo",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-undo-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "One Ctrl+Z reverts exactly one configuration commit and one redo re-applies it, driven through the game's own undo entry."
+    },
+    {
+      "id": "component-capacity",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-capacity-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "A full 1024-byte configuration (132 record entries) is written, saved and read back, with the schematic growth reported."
+    },
+    {
       "id": "component-timing",
       "tier": "game",
       "runner": "powershell",
@@ -176,7 +288,9 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/native-component-playtest.ps1",
-      "arguments": ["-Single"],
+      "arguments": [
+        "-Single"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -257,7 +371,9 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-page-playtest.ps1",
-      "arguments": ["-ProbeButtons"],
+      "arguments": [
+        "-ProbeButtons"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -268,7 +384,12 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/make-ui-sandbox.ps1",
-      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-Mods", "dev.menu-demo-driver,dev.menu-demo-peer-driver"],
+      "arguments": [
+        "-Sandbox",
+        "build/ui-page-driver-sandbox",
+        "-Mods",
+        "dev.menu-demo-driver,dev.menu-demo-peer-driver"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -279,7 +400,11 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-page-playtest.ps1",
-      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-ProbeButtons"],
+      "arguments": [
+        "-Sandbox",
+        "build/ui-page-driver-sandbox",
+        "-ProbeButtons"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -290,7 +415,11 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-page-playtest.ps1",
-      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-DriverMode"],
+      "arguments": [
+        "-Sandbox",
+        "build/ui-page-driver-sandbox",
+        "-DriverMode"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -301,7 +430,11 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-page-playtest.ps1",
-      "arguments": ["-Sandbox", "build/ui-page-driver-sandbox", "-OpenSecondPage"],
+      "arguments": [
+        "-Sandbox",
+        "build/ui-page-driver-sandbox",
+        "-OpenSecondPage"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -312,7 +445,9 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-board-panel-playtest.ps1",
-      "arguments": ["-Probe"],
+      "arguments": [
+        "-Probe"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -333,7 +468,9 @@
       "tier": "game",
       "runner": "powershell",
       "path": "tests/ui-keyboard-playtest.ps1",
-      "arguments": ["-Probe"],
+      "arguments": [
+        "-Probe"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -360,6 +497,59 @@
       "description": "Live level trace, board panel, VCD export and image evidence."
     },
     {
+      "id": "scope-capture",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/scope-capture-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Per-cycle capture (TC_SERVICE_SIM_CAPTURE): the tick inside the compiled program fills a ring one row per cycle with no gaps, and the rows are the level's own inputs."
+    },
+    {
+      "id": "scope-panel",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/scope-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The scope board panel (local.scope): lanes resolved from the board's wires through tc.sim.channel, filled per cycle by tc.sim.capture with gaps = 0 while a real level runs."
+    },
+    {
+      "id": "pin-shape-source",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/pin-shape-playtest.ps1",
+      "arguments": ["-Shape", "source"],
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "A component with no inputs: the game imports the 0-in scaffold, keeps the driver whose input is unconnected, and calls the callback once per cycle."
+    },
+    {
+      "id": "pin-shape-sink",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/pin-shape-playtest.ps1",
+      "arguments": ["-Shape", "sink"],
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "A component with no outputs: the game keeps the extra driver node whose output is unconnected, and the callback runs once per cycle with the input it was given."
+    },
+    {
+      "id": "pin-shape-wide9",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/pin-shape-playtest.ps1",
+      "arguments": ["-Shape", "wide9"],
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "tc.component.types V2: a nine-pin definition registers, the bridge binds it, and TCLogicIOV2 delivers all nine inputs with the definition's own state size."
+    },
+    {
       "id": "game-handle-probe",
       "tier": "game",
       "runner": "powershell",
@@ -380,6 +570,39 @@
       "description": "Board toolbar tool handoff and wire palette interaction."
     },
     {
+      "id": "word-watchee",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/word-watchee-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The WordWatchee 64 package: shader text patch, live value_size ceiling and a board drawn by the patched engine."
+    },
+    {
+      "id": "punch-tape-runtime",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/punch-tape-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Wide constants as runtime lookups: the player's own board compiles, a tape update costs microseconds and leaves the compile counter alone, and the circuit's own state holds the new value. Needs the saved profile (defaults to %APPDATA%\\Turing Complete)."
+    },
+    {
+      "id": "punch-tape-no-dump",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/punch-tape-playtest.ps1",
+      "arguments": [
+        "-NoDumpEvidence"
+      ],
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The other half of the generated-source dumps: with TC_MODLOADER_DUMP_SOURCE unset the same level compiles and the tape updates, and the game directory stays free of native-logic-source-*.txt."
+    },
+    {
       "id": "component-cost-diagnostic",
       "tier": "diagnostic",
       "runner": "powershell",
@@ -394,7 +617,9 @@
       "tier": "diagnostic",
       "runner": "powershell",
       "path": "tests/components-playtest.ps1",
-      "arguments": ["build/and2_component.data"],
+      "arguments": [
+        "build/and2_component.data"
+      ],
       "timeoutSeconds": 120,
       "requiresBuild": true,
       "requiresGame": true,
@@ -451,6 +676,16 @@
       "description": "Pin-label screenshot and overlap development probe."
     },
     {
+      "id": "word-watchee-layout-diagnostic",
+      "tier": "diagnostic",
+      "runner": "powershell",
+      "path": "tests/word-watchee-layout-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Screenshot of a real board with every word label forced to 64 bits: the two-line low/high decimal layout."
+    },
+    {
       "id": "manual-ime",
       "tier": "manual",
       "runner": "powershell",
@@ -471,6 +706,302 @@
       "requiresGame": true,
       "manual": true,
       "description": "Visible page demo; never selected by -Tier all."
+    },
+    {
+      "id": "pin-order",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/pin-order.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The pin-order store behind TC_SERVICE_PIN_ORDER: cache reordering by key, contributed-bounds unioning, and frame geometry that uses a measured one-bit control height instead of cutting it at half-line height."
+    },
+    {
+      "id": "pin-order-playtest",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/pin-order-playtest.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The pin-order Mod on a real level: the handles frame every entry of the left IO panel, a posted drag moves the entry it was dropped on, and the tc.pin_order service reports the new order."
+    },
+    {
+      "id": "component-registry",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/component-registry.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The component catalogue behind TC_SERVICE_COMPONENT_REGISTRY: a declared type keeps its pins, costs and owner; the compiled shape overrides widths without losing declared names; a refusal is an inactive entry with the bridge's reason; unknown ids, bad indexes and malformed query structs are told apart; a rejected Mod takes its types with it."
+    },
+    {
+      "id": "component-render-text-box",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/text-box-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "M5 geometry/render consumer: the text box registers an 8x4 draggable footprint, keeps the game's own thumbnail/watermark off a board instance (pixel readback hidden=0 against an untouched visible control), proves such an instance is still grabbed and dragged one cell with the selection going 1 -> 0, validates rotations 0/1/2/3, live camera zoom and pan, and all four clip edges by framebuffer pixel readback, then completes its editor self-test."
+    },
+    {
+      "id": "component-registry-playtest",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/component-registry-playtest.ps1",
+      "timeoutSeconds": 150,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "TC_SERVICE_COMPONENT_REGISTRY in a running game: a refused registration is listed with its reason and the bridged byte-adder component shows its declared pin names, widths and costs."
+    },
+    {
+      "id": "simcore",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "simcore/tests/simcore.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The sandbox simulator's own kernel (docs/PLAN-sandbox-simulator.md, S1/S2): four-state values with strength resolution, the layered time-wheel scheduler and its overflow heap, per-arc rising/falling delays, inertial and transport models, delta convergence, NBA, setup/hold, VCD/Verilog, explicit post-init feedback seeding, board constants, and the host clock runtime - 190 assertions, no game involved."
+    },
+    {
+      "id": "simcore-iverilog",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tools/simcore-iverilog.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The external judge for the sandbox simulator (docs/PLAN-sandbox-simulator.md section 8.2): seven circuits - per-edge delays and inertial pulse filtering, multi-driver resolution including a weak driver against a strong one, Z/X gate inputs, a released three-stage ring, a 64-stage zero-delay chain, a D flip-flop shift register, and a four-bit Maker/Splitter bus - are exported as Verilog, run under Icarus Verilog, and compared net by net with the engine's own event list. Skips with a printed reason when iverilog is not installed."
+    },
+    {
+      "id": "sandbox-sim",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-playtest.ps1",
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The sandbox simulator in a real session (docs/PLAN-sandbox-simulator.md, S2): dev.sandbox-sim binds a netlist to the running board - built from the component and wire records alone, with the game's own prototype table for pin geometry - runs simcore for each game cycle, and publishes its values into the exact state bytes the board reads (256/257, 258/259, 260/261 on the and_gate board). The report proves it bound, ran and published, and names the two-pins-in-one-cell cases it refused to guess. -Invert publishes the opposite value, which is how the suite proves the bytes carry the simulator's value rather than the game program's."
+    },
+    {
+      "id": "sandbox-sim-disabled",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-playtest.ps1",
+      "arguments": ["-Disabled"],
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "S2 off-path invariant: enabled=0 returns before resolving state or installing level, cycle, sim.do, or frame callbacks. The real session asserts zero behavioural hooks and no state report, so installing the package while disabled leaves game simulation ownership untouched."
+    },
+    {
+      "id": "sandbox-sim-ring",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-ring-playtest.ps1",
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "S2 flagship: the closed three-NAND ring is built from board records without a game compile, keeps its three constant drivers, survives the game's failed-compile model reset, advances on the simulator-owned cycle, receives one explicit post-initialisation power-on seed, publishes into the board slots, and produces timed transitions exactly 3 stages * 8 ticks apart (48 ticks for a full value period). Since 2026-09-25 it also owns the state index of every wire (docs/PLAN-sandbox-simulator.md, 14.6), so the case fails if any net is still published to the shared placeholder byte below 256 or if the board's wire table changes shape mid-session."
+    },
+    {
+      "id": "sandbox-sim-latch",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-ring-playtest.ps1",
+      "arguments": ["-Circuit", "latch"],
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "S2 latch: a closed cross-coupled two-NAND board plus its three configured constants is built directly from sandbox records, advanced under the simulator-owned cycle, published to game slots, and required to settle to a stable known state for the final eight sampled cycles. Every net must also be published to an allocated slot (no placeholder byte below 256) and the wire table must keep its shape for the whole session."
+    },
+    {
+      "id": "sandbox-sim-clock",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-ring-playtest.ps1",
+      "arguments": ["-Circuit", "clock"],
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "S2 clock board: the registered host clock prototype is resolved by custom id, driven by the simulator-owned cycle, and its first NOT output must toggle one 8-tick gate delay after the clock while both values are published to the game slots - again to allocated slots only, with the wire table's shape checked for stability."
+    },
+    {
+      "id": "sandbox-sim-edge",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-ring-playtest.ps1",
+      "arguments": ["-Circuit", "edge", "-StepsPerCycle", "16", "-GateDelay", "1024"],
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Sub-cycle publishing (docs/PLAN-sandbox-simulator.md, 14.7): the clock -> NOT -> AND edge detector produces a pulse one gate delay wide (measured: 1024 ticks of an 8192-tick cycle, i.e. one unit), far shorter than a cycle, so every per-cycle sample missed it. The case runs with one unit per gate and a sub-step of half a unit - a sample boundary then lands strictly inside every pulse - and requires the AND output to appear high in at least two published rows per rising edge (measured: 2 rows at half-unit steps, 4 rows in 4 cycles; the same board under the default cadence never publishes it). The report keeps four cycles of rows so the pulse cannot be truncated away."
+    },
+    {
+      "id": "sandbox-sim-switch",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/sandbox-sim-ring-playtest.ps1",
+      "arguments": ["-Circuit", "switch", "-InteractiveLevel", "1"],
+      "timeoutSeconds": 240,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Interactive switch (docs/PLAN-sandbox-simulator.md, 14.8): local.clock's SWIT_001 keeps its level in the host-owned instance configuration, and the game's generated program is what used to copy that level into a wire slot - suppressed in the sandbox, so the switch used to be frozen. The case writes the level the way a click does (instance config + refresh, exposed as the Mod's `interactive_level=` diagnostic) and requires the switch's net to be driven with it: level 1 -> net0=1/net1=0, level 0 -> net0=0/net1=1."
+    },
+    {
+      "id": "clock-period-window",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/clock-period-playtest.ps1",
+      "timeoutSeconds": 200,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The clock's adjustable period through the game's own UI (examples/clock): the driver build of the Mod (dist/dev.clock-driver.mod) clicks the number box the drawing code registered in the component's corner, checks the value window opened for the clicked clock, types 8 and presses Enter, and then requires both the period the callback holds and the bytes the instance's configuration carries to be 8. The box-to-pixel identity (the rectangle the click handler hit-tests is the painted one) and the wave for each period are unit-tested in tests/clock-period.cpp."
+    },
+    {
+      "id": "float-package",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/float-package.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": false,
+      "description": "Float Ops, package level (docs/PLAN-float-components.md, sections 4-5): builds the independent local.float-ops.mod and runs both offline tests first - the M1 binary32 kernel against 7571 golden vectors generated by an independent Python oracle (values and the five flags bit for bit, plus canonical NaN, non-sticky flags and per-thread SoftFloat state), and the M0 compatibility test (five public V2 shapes, eight FP32 bit patterns through RESET/REFRESH/CYCLE, a missing tc.component.types service must fail the load). It then checks that the golden vectors are not stale, discovers, enables and disables the package in an isolated sandbox, and requires that nothing outside mods/ and tc-modloader-data/ was written."
+    },
+    {
+      "id": "float-compat-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-compat-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Float Ops M0/M1 in the real game: 21 instances (source -> pass x17 -> result+flags -> sink, plus a Flags[5] sink fed from the dual probe's second output) bind as tokens 1..21 and every probe has to read the full 0xDEADBEEF pattern, with the five-bit output arriving as 0x0000001f. The plugin also has to report the M1 kernel self-check line (including a fused multiply-add whose result differs from mul-then-add), which proves the vendored SoftFloat kernel links into the shipped DLL and computes under the loader. A test-only driver takes the simulation over after the board is compiled and walks run -> pause -> RESET -> run, so the case requires refresh observations with the right values inside the pause window (the paused board still renders the pattern), the RESET summary to report zero mismatches, and the cycles after the RESET to carry the pattern again."
+    },
+    {
+      "id": "float-m2-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-ops-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Float Ops M2 vertical slice in the real game (docs/PLAN-float-components.md, sections 6.1, 7 and 10.2): two FP32 Constants feed an FP32 Add whose R[32] drives an FP32 Display. The driver writes each instance's configuration through tc.component.storage - the same call the editors make - and reads the Display's own text back, so the case fails unless configuration reaches the instance, the kernel runs with that instance's rounding mode, and the result reaches the renderer: defaults show 2 0x40000000, 3.5+1.25 shows 4.75 0x40980000, and the halfway case 1.0+2^-25 shows 1 0x3F800000 under RNE but 1.0000001 0x3F800001 after the rounding box is set to RUP. The run also requires every service the editors need (render, geometry, storage, instances, ui, mouse) to be present."
+    },
+    {
+      "id": "float-boundary-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-boundary-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Float Ops M0/M1 binding-token boundary: the same chain widened to 42 instances records where the loader's wide-output bridge stops working, with the M1 kernel self-check required in the same run. Tokens 1..32 must hold the pattern (a failure there is a real compatibility blocker); the measured result is that token 33 is the first token without a state slot of its own, so its consumer at token 34 reads 0. The per-token table is written to build/float-boundary-report.txt instead of being treated as a test failure, because the loader's documented limit is 32 tokens and expanding it is not part of this Mod."
+    },
+    {
+      "id": "float-panel-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-panel-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Float Ops editor rows in the game's own component drawer, with real input (the player's report: 'the input box and the check box in the bottom panel do nothing'). The shipped package is the Mod under test; tests/float-panel-driver.cpp selects the FP32 Constant through the board's own select_component, walks the real cursor onto the drawer's label field and clicks it with real mouse messages, then types 'xy' with real keyboard messages and presses Enter. The Mod's own trace has to show the row window hovered with a live row (and the game's drawer not hovered at the same spot - that measurement is why the rows live in a Mod-owned window laid over the panel), the field has to commit ('the label field was committed after editing'), the instance has to carry the typed label, the board has to show name=\"xy\", and no editor window may appear anywhere in the log."
+    },
+    {
+      "id": "float-busy-board-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-panel-playtest.ps1",
+      "arguments": ["-Fixture", "crowd"],
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The same drawer case on a board that carries more native components than a fixed handle buffer can hold (the player's report: '现在所有能写配置的元件都写入不了，都是写入元件配置失败。'). tests/float-fixture.cpp --crowd writes eighteen unwired FP32 Displays and *then* the M2 chain, so the constant this case edits sits far past the eight handles the Mod used to ask the host for. The host's tc.component.instances enumeration answers OK only when every instance fitted the caller's buffer, so that fixed array turned every write into 'the component is not on the board' - the label commit never landed. The case asserts the same evidence as the panel case (the row took the click, the typing and the commit, the label reached the instance and the board) and additionally that the log carries none of the write-failure diagnostics ('no live handle for instance', 'the host refused the configuration for instance', 'this write was not attempted'). Run against the shipped package it fails on the old code and passes with the Mod growing its buffer to the total the host reports - and it is the run that reproduced the player's own 22-component board."
+    },
+    {
+      "id": "float-reentry-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-reentry-playtest.ps1",
+      "timeoutSeconds": 420,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The level lifetime a player walks through (the 2026-09-26 report: '常量的值还得我点一下才会刷新', '进入沙盒后退出再重进，会发现选中元件之后面板的相关配置不会渲染', '同 2 重进的时候，常量值输出变为默认'). tests/float-reentry-driver.cpp opens the level from the screen's own level block, edits one FP32 Constant's value through the drawer's 常量值 field with real mouse and keyboard input, leaves the level with the player's own Escape, presses the level entry again, and then selects the Constant *without touching a field*. The case asserts the whole sequence: the edit reached the instance's record; the loader's circuit save wrote the schematic directory the level's own meta names as its kind (schematics/architecture/Default for the level whose name is 'sandbox'); the second visit restored that record before anything was clicked (the display shows the first visit's value again with no click in between); and the drawer read the record back into its own fields (a later panel frame, the value row present, the field text equal to the saved value). Three rules only bite on this path: component ids repeat across a re-entry, so 'the instance changed' says nothing; the save used to write schematics/<level name>/Default, a directory the game never reads, which is why the Constant came back as its default; and the paused board's refresh needs the simulation model that the level load now hands the loader's control service. Run against the previous package the edit is refused, no circuit file is written, and the drawer never re-reads."
+    },
+    {
+      "id": "float-pitch-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-pitch-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "How close two float parts may be placed, and the case that drove both footprint fixes (the player's reports: '这些元件在垂直方向上 footprint 好像有点大了…不能贴在一起' and '其它元件都好了这四个还是有点问题'). tests/float-pitch-probe.cpp asks the game's own placement command to put a reference part and a second one one, two, three... cells below (and beside) it, each measurement in its own band of rows so an accepted part cannot decide the next answer, and reports the smallest accepted offset. Asserted: a stock-sized face (4.92 x 2.93 cells) reserves three cells vertically so two of them sit flush - subtract, the M2 constant, fma, split bits and make bits - while Compare keeps four because its four-output side spans rows 0..3; horizontally five face cells plus one cell for every pin outside the box (seven with input pins, six without). The two mistakes this guards: a half height the host rounds outwards (1.565 -> a four-cell box) and a face grown by a fixed margin (3.2 cells -> four). Fixing the four multi-pin types needed the offset-capable declaration (tc.component.geometry V3, set_footprint_cells), because the game lays a generated side out from row 0 and their faces therefore sit below the component's own cell."
+    },
+    {
+      "id": "float-catalogue-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-catalogue-playtest.ps1",
+      "timeoutSeconds": 420,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Float Ops M3/M4 catalogue in the real game (docs/PLAN-float-components.md, sections 6.2, 6.3 and 7.2): one instance of every new type - Subtract, Multiply, Divide, Square Root, Negate, Absolute, Compare, Classify, FMA, Remainder, Round To Integral, MinimumNumber, MaximumNumber, I32/U32 To FP32, FP32 To I32/U32, Split Bits, Make Bits - placed by tests/float-fixture.cpp --catalogue with the M2 circuit beside it. The run asserts that all nineteen register (one log line), that each one is drawn with the stock 4.92-cell face (the multi-pin types taller, never narrower) and its stock symbol and name, that a type which rounds shows the five-mode rounding row in the game's own drawer while a type without a choice shows its explanation row instead, and that no window of the Mod's own appears. The arithmetic of the same types is covered offline (the kernel's 7571 golden vectors plus tests/float-compat.cpp, which drives every catalogue callback and checks its pins, widths, schema-3 configuration, 3.0 pin lane and outputs, including the D2 saturating conversion policy)."
+    },
+    {
+      "id": "float-palette-game",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/float-palette-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "The float types inside the game's own component column (the player asked for '分类文件夹是真的插进游戏自己的分类体系'): the game's palette builds its folders out of a custom prototype's name - add_to_menu_tree splits the name on '/' and walks the parts as parent categories - so the Mod names its types '浮点/FP32 Add' and the game itself files them under a 浮点 folder. tests/float-menu-probe.cpp hooks the game's own reload_component_menu__presenterZutilities_u14192, waits for it to build the menu and dumps the tree the palette draws (build/menu.txt). The case asserts that the dump still has the game's five categories, that a 浮点 category node exists inside 自定义, that the folder's children are exactly the 22 catalogue ids and nothing else, and that no Float Ops id is listed anywhere else in the tree - so the types are in the game's folder and not also dumped straight into 自定义. docs/research/palette-categories.md records the measurement and why the folder lands inside 自定义 (that is where the pinned build roots a custom prototype's menu path)."
+    },
+    {
+      "id": "component-icon-research",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/icon-playtest.ps1",
+      "timeoutSeconds": 300,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "Research case for the custom components' icons (docs/research/component-icons.md). tests/icon-probe.cpp hooks get_captured_path__presenterZio_u28 and the texture factory create_texture_unsafe/create_texture read-only and forwards every call unchanged, so the log names the exact file the game asks for as a component's picture: for a custom prototype it is '?snapshot_cc/com_custom_<decimal id>.png' under <game>/asset/ (e.g. com_custom_5058442071141929777.png for the Float Ops Constant), for a built-in '?snapshot/<kind name>.png'. The case clicks the component's body (the drawer's preview asks for the same texture) and then walks the palette's hover flyouts (category -> sub-category -> item list) while taking in-process GL screenshots, because the palette list only draws at the player's window size and only while the pointer rests on a level. Measured with it: a PNG dropped at the requested path IS read and re-encoded by the game, yet the run with the file and the run without it produce byte-identical palette frames (0 differing pixels) - the drawn picture is the game's own render of the prototype (design thumbnail + watermark: render_component_snapshots__main_u414, update_dirty_snapshots__main_u873, is_snapshot_mode__presenterZrendererZmulti95meshZmulti95mesh_u270). The probe also dumps built-in shape_svg fragments to show what a catalog thumbnail looks like for a built-in kind, and the companion run confirms that setting shape_svg on a custom prototype changes nothing (the same note is already in docs/PLAN-custom-components.md). Run with -NoIcon for the negative control." 
+    },
+    {
+      "id": "component-picture",
+      "tier": "game",
+      "runner": "powershell",
+      "path": "tests/picture-playtest.ps1",
+      "timeoutSeconds": 1800,
+      "requiresBuild": true,
+      "requiresGame": true,
+      "description": "tc.component.render V5 and V6 in the real game, on the surfaces that take a Mod component's own art: the item in the game's own component column and the preview picture in the bottom drawer (V5), plus the placement ghost that follows the cursor while a component is dragged out of the palette (V6). The loader answers the one texture request the game makes for that picture ('?snapshot_cc/com_custom_<decimal id>.png', once per frame) with a copy of the PNG the Mod registered, because a file dropped at the game's own path is read and re-encoded yet never shown (docs/research/component-icons.md). tests/icon-probe.cpp photographs each surface in-process (the palette's hover flyouts, a click on the component's body, drags out of the palette) and runs the Mod twice - with deliberately garish marker pictures and with no registration at all - asserting marker colour in the V5 surfaces of the first run and in neither of the control run's, while the ghost has to show Float Ops' purple body and pins in both runs and never leak the V5 marker picture. The probe now drags twice: once released over the palette (cancelled) and once dropped on the board (a real placement, which is the path the player reported), and both the cancelled cell and the drop cell are asserted to end up free of a leftover preview, with the loader's own 'taken over'/'ended' log lines required to pair up - a takeover that only ends on hide_clipboard leaves the successful placement's ghost behind, the bug this case was extended for. The pictures that ship (examples/float-ops/icons.cpp, generated from the Mod's own drawing code) are checked offline by the float-icons case."
+    },
+    {
+      "id": "float-icons",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/float-icons.ps1",
+      "timeoutSeconds": 180,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The component pictures the Float Ops package ships: examples/float-ops/icons.cpp is built and run, and every one of the 22 PNGs is checked for the picture the board's own layout implies - a transparent 192x192 canvas, the purple body inside it (one cell is 26 px, so the face is 4.92 cells = 128 px wide and centred), the red pins reaching the +-3.2-cell lane, and enough white pixels for the '32' badge, the name and the symbol. This is the data half of tc.component.render V5: the real-game case (component-picture) proves the plumbing, this one proves the picture is really the part's board appearance at the board's own scale rather than a blank or a placeholder."
+    },
+    {
+      "id": "picture-path",
+      "tier": "fast",
+      "runner": "powershell",
+      "path": "tests/picture-path.ps1",
+      "timeoutSeconds": 120,
+      "requiresBuild": false,
+      "requiresGame": false,
+      "description": "The rule behind tc.component.render V5 (src/picture_path.hpp): which texture request names a Mod component's picture. The accepted form is what a real board asked for - '.../asset/?snapshot_cc/com_custom_<decimal id>.png', with either separator - and everything else is forwarded untouched: the built-in '?snapshot/com_custom_7.png' branch, a missing id, bytes after '.png', an upper-case extension, a marker glued to another word, an id wider than 64 bits, and bytes past the passed length. Getting this rule wrong is how a picture substitution would quietly rewrite the wrong texture, so it is a case of its own rather than a comment."
     }
   ]
 }

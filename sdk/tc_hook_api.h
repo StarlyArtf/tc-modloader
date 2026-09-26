@@ -50,6 +50,27 @@ typedef struct TCHookLevelLoadArgs {
     const void* name;
 } TCHookLevelLoadArgs;
 
+#define TC_HOOK_SET_CURSOR_POS 3u
+/* void(ImVec2 position) - the engine's igSetCursorPos, which the game's own
+   panels use to place the lines of a list (the left IO panel positions every
+   entry's label with it).  A callback may change x/y; the game's function then
+   runs with the changed position. */
+typedef struct TCHookSetCursorPosArgs {
+    uint32_t size;
+    uint32_t reserved;
+    float x;
+    float y;
+} TCHookSetCursorPosArgs;
+
+#define TC_HOOK_SET_CURSOR_POS_Y 4u
+/* void(float y) - the same, one axis at a time.  The game anchors the line that
+   follows the current entry with this one. */
+typedef struct TCHookSetCursorPosYArgs {
+    uint32_t size;
+    uint32_t reserved;
+    float y;
+} TCHookSetCursorPosYArgs;
+
 /* Only the points whose signature has been measured for this build are
    catalogued here.  A plugin can still create_hook any other EXE symbol it has
    verified itself; the catalogue is what the loader can promise.  Promoting a
@@ -74,6 +95,11 @@ struct TCHookCall {
     int32_t (*run_chain)(TCHookCall* call);
     /* Loader-private state; plugins must not touch it. */
     void* loader_state;
+    /* Where the game's own call came from: the return address of the call the
+       loader's detour intercepted, so a callback can tell the game's call sites
+       apart (the left IO panel's anchors are recognised this way).  Null when
+       the point has no caller, or for a call a plugin made itself. */
+    const void* caller;
 };
 
 /* Return 0 to continue the chain, non-zero to stop after this callback. */

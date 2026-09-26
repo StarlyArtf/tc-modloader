@@ -103,7 +103,10 @@ for (let count = Number(i64()); count; --count) {
   const boolB = u8();
   const init = u8();
   for (let n = u16(); n; --n) { i64(); i64(); skipString(); i64(); i64(); }
-  for (let n = u16(); n; --n) { skipString(); skipString(); }
+  const settings = [];
+  for (let n = u16(); n; --n) {
+    settings.push([skipString().toString(), skipString().toString()]);
+  }
 
   if (kind === 0x4e) {
     // The fixture is a definition, not a custom-instance level.
@@ -111,7 +114,7 @@ for (let count = Number(i64()); count; --count) {
     for (let n = u16(); n; --n) { i64(); i64(); }
   }
   components.push({ kind, x, y, flags, identity, name, data, value16, bits,
-                    boolA, valueA, valueB, boolB, init });
+                    boolA, valueA, valueB, boolB, init, settings });
 }
 
 const wires = [];
@@ -131,10 +134,11 @@ for (let count = Number(i64()); count; --count) {
 assert.equal(state.pos, raw.length, 'parser did not consume the fixture');
 
 if (process.env.TC_NETLIST_DEBUG) {
-  console.log(components.map(c => ({ kind: c.kind, x: c.x, y: c.y,
-    name: c.name.toString() })));
+  console.log(JSON.stringify(components.map(c => ({ kind: c.kind, x: c.x, y: c.y,
+    name: c.name.toString(), settings: c.settings })), null, 2));
   console.log(wires);
 }
+if (process.env.TC_NETLIST_DUMP_ONLY) process.exit(0);
 
 const directions = {
   0: [1, 0], 1: [1, 1], 2: [0, 1], 3: [-1, 1],

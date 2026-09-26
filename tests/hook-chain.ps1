@@ -15,9 +15,10 @@ $taskProbes=@{
   skip=@(@{dll='skip';id='dev.hook-chain-skip'})
   raw=@(@{dll='raw';id='dev.hook-chain-raw'})
   events=@(@{dll='events';id='dev.hook-chain-events'})
+  cursor=@(@{dll='cursor';id='dev.hook-chain-cursor'})
   crash=@(@{dll='crash';id='dev.hook-chain-crash'})
 }
-foreach($taskMode in @('chain','skip','raw','events','crash')) {
+foreach($taskMode in @('chain','skip','raw','events','cursor','crash')) {
   $taskFixture=Join-Path $taskRepo ('build\hook-chain-test-'+$taskMode+'-'+[guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force (Join-Path $taskFixture 'mods') | Out-Null
   Copy-Item (Join-Path $taskRepo 'build\hook-chain-host.exe') (Join-Path $taskFixture 'Turing Complete.exe')
@@ -37,8 +38,23 @@ foreach($taskMode in @('chain','skip','raw','events','crash')) {
   $taskText=$taskResult -join "`n"
   if($taskMode -eq 'chain') {
     # The loader, not the plugin, owns the detour: the install line is the proof
-    # that one detour serves all three links.
-    if($taskText -notmatch 'Hook chain sim\.do installed with 3 link\(s\)') {throw 'The loader did not install one sim.do chain for three links'}
+    # that one detour serves every link.  The loader keeps a link of its own at
+    # INT_MIN (simulation control + the sim.do event), so the assertion is about
+    # the three Mod links and their priority order, not about the raw total.
+    if($taskText -notmatch 'Hook chain sim\.do installed with (\d+) link\(s\): ([^\r\n]*)') {
+      throw 'The loader did not install a sim.do chain'
+    }
+    $taskLinks=$Matches[2]
+    foreach($taskExpected in @('dev.hook-chain-a@0','dev.hook-chain-b@0','dev.hook-chain-a@10')) {
+      if($taskLinks -notmatch [regex]::Escape($taskExpected)) {
+        throw "The sim.do chain is missing $taskExpected : $taskLinks"
+      }
+    }
+    $taskOrder=@('dev.hook-chain-a@0','dev.hook-chain-b@0','dev.hook-chain-a@10') |
+      ForEach-Object { $taskLinks.IndexOf($_) }
+    if($taskOrder[0] -gt $taskOrder[1] -or $taskOrder[1] -gt $taskOrder[2]) {
+      throw "The sim.do chain is not in priority order: $taskLinks"
+    }
   }
   if($taskMode -eq 'skip' -and $taskText -notmatch 'swallow=1') {throw 'The skipping link never ran'}
   if($taskMode -eq 'raw') {
@@ -49,6 +65,13 @@ foreach($taskMode in @('chain','skip','raw','events','crash')) {
     foreach($taskNeedle in @('Event source level\.load: ok','Event source sim\.do: ok','Event source scene\.change armed','Event source save armed')) {
       if($taskText -notmatch $taskNeedle) {throw "The loader did not arm an event source: $taskNeedle"}
     }
+  }
+  if($taskMode -eq 'cursor') {
+    # The engine's cursor calls are chain points now: the caller the chain hands
+    # over is what lets two Mods (the punch tape and the pin-order handles) share
+    # them, and an edit to the position must reach the game's own function.
+    if($taskText -notmatch 'Hook chain ig\.set_cursor_pos installed with 1 link') {throw 'The loader did not install the cursor chain'}
+    if($taskText -notmatch 'PASS cursor chain') {throw 'The cursor chain assertions did not pass'}
   }
   if($taskMode -eq 'crash') {
     $taskFault=Join-Path $taskFixture 'tc-modloader-data\fault.log'

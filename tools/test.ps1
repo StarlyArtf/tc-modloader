@@ -91,6 +91,13 @@ function Invoke-CatalogTest([object]$Test, [string]$OutputPath, [string]$ErrorPa
   $taskInfo.RedirectStandardOutput = $true
   $taskInfo.RedirectStandardError = $true
   $taskInfo.EnvironmentVariables['TC_TEST_RUNNER'] = '1'
+  if ([string]$Test.runner -eq 'powershell') {
+    # The suite deliberately uses Windows PowerShell for game-era scripts.
+    # When the parent is PowerShell 7, forwarding its PSModulePath can shadow
+    # Windows PowerShell's inbox modules (Get-FileHash then disappears).  Let
+    # the child rebuild the native module path just as a direct launch does.
+    [void]$taskInfo.EnvironmentVariables.Remove('PSModulePath')
+  }
 
   $taskProcess = New-Object Diagnostics.Process
   $taskProcess.StartInfo = $taskInfo

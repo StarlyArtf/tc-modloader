@@ -62,6 +62,17 @@ if ($LASTEXITCODE) { throw 'Loader build failed' }
 if ($LASTEXITCODE) { throw 'Pin name patch build failed' }
 New-Item -ItemType Directory -Force (Join-Path $taskRoot 'dist\pin-names-patch') | Out-Null
 Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\game_engine.dll') -Force
+ # Mod form of the same patch.  The ordinary loader build above excludes the
+ # feature; this variant registers its four hooks through the host and is only
+ # active when the player enables local.pin-names-patch.
+ $taskPinNamesMod=Join-Path $taskRoot 'build\pin-names-mod-package'
+ if(Test-Path -LiteralPath $taskPinNamesMod){Remove-Item -LiteralPath $taskPinNamesMod -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskPinNamesMod 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Wno-misleading-indentation -Wno-cast-function-type -Wno-unused-function -Wno-unused-variable -DTC_PIN_PATCH_ONLY -DTC_PIN_PATCH_PLUGIN -static -static-libgcc -static-libstdc++ -shared -Ivendor -Ivendor\minhook\include src\loader.cpp @taskObjects @taskHooks -lbcrypt -lshell32 -lopengl32 -lole32 -lwindowscodecs -o (Join-Path $taskPinNamesMod 'native\pin-names-patch.dll')
+ if($LASTEXITCODE){throw 'Pin name patch mod build failed'}
+ Copy-Item examples\pin-names-patch\mod.json $taskPinNamesMod -Force
+ if(Test-Path dist\local.pin-names-patch.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.pin-names-patch.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskPinNamesMod -Output (Join-Path $taskRoot 'dist\local.pin-names-patch.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -Ivendor src\cli.cpp @taskObjects -lbcrypt -o dist\tcmod-cli.exe
  if ($LASTEXITCODE) { throw 'CLI build failed' }
  '101 RCDATA "../dist/tc-loader.dll"' | Set-Content build\setup.rc -Encoding ascii
@@ -85,6 +96,20 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  Copy-Item examples\mod-inspector\native\mod-inspector.dll (Join-Path $taskInspector 'native') -Force
  if(Test-Path dist\tcmod.mod-inspector.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\tcmod.mod-inspector.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskInspector -Output (Join-Path $taskRoot 'dist\tcmod.mod-inspector.mod')
+ # The sandbox simulator (docs/PLAN-sandbox-simulator.md, S2): the loader's own
+ # engine drives the board, so the package carries the simcore headers it was
+ # built against.
+ $taskSandboxSim=Join-Path $taskRoot 'build\sandbox-sim-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskSandboxSim 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\sandbox-sim\plugin.cpp -o (Join-Path $taskSandboxSim 'native\sandbox-sim.dll')
+ if($LASTEXITCODE){throw 'Sandbox simulator build failed'}
+ # The simulator reads the interactive switch/button from their instance
+ # configuration (tc.component.instances + tc.component.storage), which is why
+ # it needs the "component" capability as well.
+ '{"format":2,"id":"dev.sandbox-sim","name":"Sandbox simulator (simcore)","version":"0.1.0","capabilities":["log","symbol","hook","component"],"native":{"api":1,"entry":"native/sandbox-sim.dll"}}' | Set-Content (Join-Path $taskSandboxSim 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.sandbox-sim.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.sandbox-sim.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskSandboxSim -Output (Join-Path $taskRoot 'dist\dev.sandbox-sim.mod')
+ if($LASTEXITCODE){throw 'Sandbox simulator package failed'}
  New-Item -ItemType Directory -Force examples\circuit-and\native | Out-Null
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk examples\circuit-and\plugin.cpp -o examples\circuit-and\native\circuit-and.dll
  if($LASTEXITCODE){throw 'Circuit AND example build failed'}
@@ -130,6 +155,109 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  '{"format":2,"id":"dev.waveform-demo-driver","name":"Waveform demo driver","version":"0.1.0","native":{"api":1,"entry":"native/waveform-demo.dll"}}' | Set-Content (Join-Path $taskWaveformDriver 'mod.json') -Encoding ascii
  if(Test-Path dist\dev.waveform-demo-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.waveform-demo-driver.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskWaveformDriver -Output (Join-Path $taskRoot 'dist\dev.waveform-demo-driver.mod')
+ # WordWatchee 64: a player-facing fix package.  The plugin raises the
+ # renderer's value_size ceiling from 32 to 64 (the shader already implements
+ # 33..64 bit hex, unsigned and signed decimal); the manifest carries the
+ # one-line exact patch for the shader's own 64-bit hex offset.  Diagnosis and
+ # evidence: docs/research/word-watchee-64.md.
+ $taskWatchee=Join-Path $taskRoot 'build\word-watchee-64-package'
+ # Staged from scratch: the package ships whole shader files, so a leftover copy
+ # from an older layout would silently end up in the archive.
+ if(Test-Path -LiteralPath $taskWatchee){Remove-Item -LiteralPath $taskWatchee -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskWatchee 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\word-watchee-64\plugin.cpp -o (Join-Path $taskWatchee 'native\word-watchee-64.dll')
+ if($LASTEXITCODE){throw 'Word watchee 64 mod build failed'}
+ Copy-Item examples\word-watchee-64\mod.json $taskWatchee -Force
+ Copy-Item examples\word-watchee-64\files $taskWatchee -Recurse -Force
+ if(Test-Path dist\local.word-watchee-64.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.word-watchee-64.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskWatchee -Output (Join-Path $taskRoot 'dist\local.word-watchee-64.mod')
+# Wide constants: append the game's own punch-tape sprite to the native
+# component drawer, persist clicks through set_setting, and update the JIT's
+# runtime constant slot without recompiling the whole board.
+ $taskPunchTape=Join-Path $taskRoot 'build\punch-tape-package'
+ if(Test-Path -LiteralPath $taskPunchTape){Remove-Item -LiteralPath $taskPunchTape -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskPunchTape 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\punch-tape\plugin.cpp -o (Join-Path $taskPunchTape 'native\punch-tape.dll') -lole32 -lwindowscodecs
+ if($LASTEXITCODE){throw 'Punch tape mod build failed'}
+ Copy-Item examples\punch-tape\mod.json $taskPunchTape -Force
+ if(Test-Path dist\local.punch-tape.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.punch-tape.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskPunchTape -Output (Join-Path $taskRoot 'dist\local.punch-tape.mod')
+# Pin order: frames, grips and drag-to-reorder for the left IO panel.  The
+# order itself lives in the loader (src/pin_order.hpp, TC_SERVICE_PIN_ORDER);
+# this Mod is only the handle the player drags.
+ $taskPinOrder=Join-Path $taskRoot 'build\pin-order-package'
+ if(Test-Path -LiteralPath $taskPinOrder){Remove-Item -LiteralPath $taskPinOrder -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskPinOrder 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\pin-order\plugin.cpp -o (Join-Path $taskPinOrder 'native\pin-order.dll')
+ if($LASTEXITCODE){throw 'Pin order mod build failed'}
+ Copy-Item examples\pin-order\mod.json $taskPinOrder -Force
+ if(Test-Path dist\local.pin-order.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.pin-order.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskPinOrder -Output (Join-Path $taskRoot 'dist\local.pin-order.mod')
+ # The board grid: draws the coordinate grid the game never draws, and carries
+ # its switch in the game's own Options page (hook options.general).
+ $taskBoardGrid=Join-Path $taskRoot 'build\board-grid-package'
+ if(Test-Path -LiteralPath $taskBoardGrid){Remove-Item -LiteralPath $taskBoardGrid -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskBoardGrid 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\board-grid\plugin.cpp -o (Join-Path $taskBoardGrid 'native\board-grid.dll')
+ if($LASTEXITCODE){throw 'Board grid mod build failed'}
+ Copy-Item examples\board-grid\mod.json $taskBoardGrid -Force
+ if(Test-Path dist\local.board-grid.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.board-grid.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskBoardGrid -Output (Join-Path $taskRoot 'dist\local.board-grid.mod')
+  # A Mod-registered pure clock source (0 in, 1 bit out).  The sandbox simulator
+  # resolves it by custom id and drives it from the simulator-owned cycle.
+  $taskClock=Join-Path $taskRoot 'build\clock-package'
+  if(Test-Path -LiteralPath $taskClock){Remove-Item -LiteralPath $taskClock -Recurse -Force}
+  New-Item -ItemType Directory -Force (Join-Path $taskClock 'native') | Out-Null
+  # -lole32 -lwindowscodecs: the value mark decodes the game's own
+  # asset/io_state/io_state.png with WIC, the same decoder the loader uses.
+  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\clock\plugin.cpp -o (Join-Path $taskClock 'native\clock.dll') -lole32 -lwindowscodecs
+  if($LASTEXITCODE){throw 'Clock mod build failed'}
+  Copy-Item examples\clock\mod.json $taskClock -Force
+  if(Test-Path dist\local.clock.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.clock.mod')}
+  & .\tools\Pack-Mod.ps1 -Source $taskClock -Output (Join-Path $taskRoot 'dist\local.clock.mod')
+  # Driver build of the same plugin: tests/clock-period-driver.hpp clicks the
+  # clock's corner box and types into the value window it opens, so the playtest
+  # can assert the whole path (box -> window -> typed number -> configuration).
+  $taskClockDriver=Join-Path $taskRoot 'build\clock-driver-package'
+  if(Test-Path -LiteralPath $taskClockDriver){Remove-Item -LiteralPath $taskClockDriver -Recurse -Force}
+  New-Item -ItemType Directory -Force (Join-Path $taskClockDriver 'native') | Out-Null
+  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Wno-unused-function -static -shared -Isdk -DTC_CLOCK_DRIVER=1 examples\clock\plugin.cpp -o (Join-Path $taskClockDriver 'native\clock-driver.dll') -lole32 -lwindowscodecs
+  if($LASTEXITCODE){throw 'Clock driver build failed'}
+  '{"format":2,"id":"dev.clock-driver","name":"Clock value-window driver","version":"0.1.0","capabilities":["log","component","logic","services","symbol_alias"],"native":{"api":1,"entry":"native/clock-driver.dll"}}' | Set-Content -LiteralPath (Join-Path $taskClockDriver 'mod.json') -Encoding ascii
+  if(Test-Path dist\dev.clock-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.clock-driver.mod')}
+  & .\tools\Pack-Mod.ps1 -Source $taskClockDriver -Output (Join-Path $taskRoot 'dist\dev.clock-driver.mod')
+  # The scope: one lane per board wire, sampled per cycle through
+ # tc.sim.capture, with channels named by tc.sim.channel.
+ $taskScope=Join-Path $taskRoot 'build\scope-package'
+ if(Test-Path -LiteralPath $taskScope){Remove-Item -LiteralPath $taskScope -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskScope 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\scope\plugin.cpp -o (Join-Path $taskScope 'native\scope.dll')
+ if($LASTEXITCODE){throw 'Scope mod build failed'}
+ Copy-Item examples\scope\mod.json $taskScope -Force
+ if(Test-Path dist\local.scope.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.scope.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskScope -Output (Join-Path $taskRoot 'dist\local.scope.mod')
+ # Driver for that Mod's drag: it plays the drag with posted mouse messages at
+ # the rectangles the Mod logged, then reads the order back from the service.
+ $taskPinOrderDriver=Join-Path $taskRoot 'build\pin-order-driver-package'
+ if(Test-Path -LiteralPath $taskPinOrderDriver){Remove-Item -LiteralPath $taskPinOrderDriver -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskPinOrderDriver 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\pin-order-driver.cpp -o (Join-Path $taskPinOrderDriver 'native\pin-order-driver.dll')
+ if($LASTEXITCODE){throw 'Pin order driver build failed'}
+ ('{"format":2,"id":"dev.pin-order-driver","name":"Pin order drag driver","version":"0.1.0","capabilities":["log","services"],"native":{"api":1,"entry":"native/pin-order-driver.dll"}}') | Set-Content -LiteralPath (Join-Path $taskPinOrderDriver 'mod.json') -Encoding ascii
+ if(Test-Path dist\dev.pin-order-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.pin-order-driver.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskPinOrderDriver -Output (Join-Path $taskRoot 'dist\dev.pin-order-driver.mod')
+ # Driver for the per-cycle capture (TC_SERVICE_SIM_CAPTURE): the level runs its
+ # own test, and this only arms the capture and reads the ring back, so the rows
+ # it reports are cycles rather than frames.  It never navigates anything - the
+ # example.byte-adder autotest loads the level.
+ $taskScopeDriver=Join-Path $taskRoot 'build\scope-capture-driver-package'
+ if(Test-Path -LiteralPath $taskScopeDriver){Remove-Item -LiteralPath $taskScopeDriver -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskScopeDriver 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\scope-capture-driver.cpp -o (Join-Path $taskScopeDriver 'native\scope-capture-driver.dll')
+ if($LASTEXITCODE){throw 'Scope capture driver build failed'}
+ ('{"format":2,"id":"dev.scope-capture-driver","name":"Per-cycle capture driver","version":"0.1.0","capabilities":["log","services"],"native":{"api":1,"entry":"native/scope-capture-driver.dll"}}') | Set-Content -LiteralPath (Join-Path $taskScopeDriver 'mod.json') -Encoding ascii
+ if(Test-Path dist\dev.scope-capture-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.scope-capture-driver.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskScopeDriver -Output (Join-Path $taskRoot 'dist\dev.scope-capture-driver.mod')
  # Single-byte adder with declared (1 gate, 1 delay) statistics.
  New-Item -ItemType Directory -Force examples\byte-adder\native | Out-Null
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk examples\byte-adder\plugin.cpp -o examples\byte-adder\native\byte-adder.dll
@@ -140,6 +268,17 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  Copy-Item examples\byte-adder\native\byte-adder.dll (Join-Path $taskByteAdder 'native') -Force
  if(Test-Path dist\example.byte-adder.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.byte-adder.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskByteAdder -Output (Join-Path $taskRoot 'dist\example.byte-adder.mod')
+ # Probe for the two 0-pin component shapes (a source and a sink): it reuses the
+ # byte-adder level runner and only replaces the registration, so the log says
+ # whether the game imported the scaffolds and whether the callbacks ran.
+ $taskPinShape=Join-Path $taskRoot 'build\pin-shape-probe-package'
+ if(Test-Path -LiteralPath $taskPinShape){Remove-Item -LiteralPath $taskPinShape -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskPinShape 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\pin-shape-probe.cpp -o (Join-Path $taskPinShape 'native\pin-shape-probe.dll')
+ if($LASTEXITCODE){throw 'Pin shape probe build failed'}
+ ('{"format":2,"id":"dev.pin-shape-probe","name":"Pin shape probe","version":"0.1.0","capabilities":["log","hook","symbol","component","logic"],"native":{"api":1,"entry":"native/pin-shape-probe.dll"}}') | Set-Content -LiteralPath (Join-Path $taskPinShape 'mod.json') -Encoding ascii
+ if(Test-Path dist\dev.pin-shape-probe.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.pin-shape-probe.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskPinShape -Output (Join-Path $taskRoot 'dist\dev.pin-shape-probe.mod')
  # Diagnostic observer for gate/delay score investigation (dev only).
  $taskCostWatch=Join-Path $taskRoot 'build\cost-watch-package'
  New-Item -ItemType Directory -Force (Join-Path $taskCostWatch 'native') | Out-Null
@@ -268,6 +407,7 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
   [pscustomobject]@{Dir='raw';Id='dev.hook-chain-raw';Mode='TC_PROBE_RAW';Tag=$null;Priority=$null;Extra=@()},
   [pscustomobject]@{Dir='dup';Id='dev.hook-chain-dup';Mode='TC_PROBE_DUP';Tag=$null;Priority=$null;Extra=@()},
   [pscustomobject]@{Dir='events';Id='dev.hook-chain-events';Mode='TC_PROBE_EVENTS';Tag=$null;Priority=$null;Extra=@()},
+  [pscustomobject]@{Dir='cursor';Id='dev.hook-chain-cursor';Mode='TC_PROBE_CURSOR';Tag=$null;Priority=$null;Extra=@()},
   [pscustomobject]@{Dir='crash';Id='dev.hook-chain-crash';Mode='TC_PROBE_CRASH';Tag=$null;Priority=$null;Extra=@()}
  )
  foreach($taskProbe in $taskChainProbes){
@@ -305,10 +445,24 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'Game model test build failed'}
  & .\build\game-model-test.exe
  if($LASTEXITCODE){throw 'Game model tests failed'}
+ # The save redirect's decision table: a game build the loader cannot verify must
+ # never stop the game from starting (see src/save_boot.hpp).
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\save-boot.cpp -o build\save-boot-test.exe
+ if($LASTEXITCODE){throw 'Save redirect decision test build failed'}
+ & .\build\save-boot-test.exe
+ if($LASTEXITCODE){throw 'Save redirect decision test failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-model.cpp -o build\component-model-test.exe
  if($LASTEXITCODE){throw 'Component model test build failed'}
  & .\build\component-model-test.exe
  if($LASTEXITCODE){throw 'Component model tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\preview-label-identity.cpp -o build\preview-label-identity-test.exe
+ if($LASTEXITCODE){throw 'Preview label identity test build failed'}
+ & .\build\preview-label-identity-test.exe
+ if($LASTEXITCODE){throw 'Preview label identity tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\io-state-cache.cpp -o build\io-state-cache-test.exe
+ if($LASTEXITCODE){throw 'IO state cache test build failed'}
+ & .\build\io-state-cache-test.exe
+ if($LASTEXITCODE){throw 'IO state cache tests failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Wno-misleading-indentation -static tests\native-component.cpp -o build\native-component-test.exe
  if($LASTEXITCODE){throw 'Declarative component test build failed'}
  & .\build\native-component-test.exe
@@ -351,6 +505,68 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'Game handle test build failed'}
  & .\build\game-handles-test.exe
  if($LASTEXITCODE){throw 'Game handle tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\services.cpp -o build\services-test.exe
+ if($LASTEXITCODE){throw 'Service discovery test build failed'}
+ & .\build\services-test.exe
+ if($LASTEXITCODE){throw 'Service discovery tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\board-objects.cpp -o build\board-objects-test.exe
+ if($LASTEXITCODE){throw 'Board object test build failed'}
+ & .\build\board-objects-test.exe
+ if($LASTEXITCODE){throw 'Board object tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\board-pins.cpp -o build\board-pins-test.exe
+ if($LASTEXITCODE){throw 'Board pin test build failed'}
+ & .\build\board-pins-test.exe
+ if($LASTEXITCODE){throw 'Board pin tests failed'}
+ # The pin-order store behind TC_SERVICE_PIN_ORDER: a fake panel cache with the
+ # game's own record layout, moved by key.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\pin-order.cpp -o build\pin-order-test.exe
+ if($LASTEXITCODE){throw 'Pin order test build failed'}
+ & .\build\pin-order-test.exe
+ if($LASTEXITCODE){throw 'Pin order test failed'}
+ # The per-cycle capture kernel behind TC_SERVICE_SIM_CAPTURE: the ring window,
+ # gap and restart bookkeeping, the trigger, and the source injection that puts
+ # the tick before every `cycle += 1` in the generated program.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -Ivendor tests\scope-capture.cpp -o build\scope-capture-test.exe
+ if($LASTEXITCODE){throw 'Scope capture test build failed'}
+ & .\build\scope-capture-test.exe
+ if($LASTEXITCODE){throw 'Scope capture test failed'}
+ # The component catalogue behind TC_SERVICE_COMPONENT_REGISTRY: declared names,
+ # the compiled shape, refusals and the query table.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-registry.cpp -o build\component-registry-test.exe
+ if($LASTEXITCODE){throw 'Component registry test build failed'}
+ & .\build\component-registry-test.exe
+ if($LASTEXITCODE){throw 'Component registry test failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-geometry.cpp -o build\component-geometry-test.exe
+ if($LASTEXITCODE){throw 'Component geometry test build failed'}
+ & .\build\component-geometry-test.exe
+ if($LASTEXITCODE){throw 'Component geometry tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-render.cpp -o build\component-render-test.exe
+ if($LASTEXITCODE){throw 'Component render test build failed'}
+ & .\build\component-render-test.exe
+ if($LASTEXITCODE){throw 'Component render tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\simulation.cpp -o build\simulation-test.exe
+ if($LASTEXITCODE){throw 'Simulation service test build failed'}
+ & .\build\simulation-test.exe
+ if($LASTEXITCODE){throw 'Simulation service tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\board-edits.cpp -o build\board-edits-test.exe
+ if($LASTEXITCODE){throw 'Board edit test build failed'}
+ & .\build\board-edits-test.exe
+ if($LASTEXITCODE){throw 'Board edit tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-tail.cpp -o build\component-tail-test.exe
+ if($LASTEXITCODE){throw 'Component tail test build failed'}
+ & .\build\component-tail-test.exe
+ if($LASTEXITCODE){throw 'Component tail tests failed'}
+ # The clock Mod's adjustable period (examples/clock): the wave each ladder value
+ # produces, the state/RESET/REFRESH contract, and the period the face draws.  The
+ # plugin is one translation unit, so the test drives its real callbacks.  The
+ # plugin keeps one deliberately unused experimental frame handler, hence
+ # -Wno-unused-function.
+ # -lole32 -lwindowscodecs: the plugin the test includes decodes the game's own
+ # asset/io_state/io_state.png with WIC.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Wno-unused-function -static tests\clock-period.cpp -o build\clock-period-test.exe -lole32 -lwindowscodecs
+ if($LASTEXITCODE){throw 'Clock period test build failed'}
+ & .\build\clock-period-test.exe
+ if($LASTEXITCODE){throw 'Clock period tests failed'}
  # Board handle probe: the unit test above covers the registry in isolation,
  # this pair covers the real level lifetime.  dev.game-handle-probe is the
  # read-only package a player can drop in; the driver build (same source plus
@@ -360,14 +576,14 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  New-Item -ItemType Directory -Force (Join-Path $taskHandleProbe 'native') | Out-Null
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\game-handle-probe.cpp -o (Join-Path $taskHandleProbe 'native\game-handle-probe.dll')
  if($LASTEXITCODE){throw 'Game handle probe build failed'}
- ('{"format":2,"id":"dev.game-handle-probe","name":"Game handle probe","version":"0.1.0","capabilities":["log","events","game_handles"],"native":{"api":1,"entry":"native/game-handle-probe.dll"}}') | Set-Content (Join-Path $taskHandleProbe 'mod.json') -Encoding ascii
+ ('{"format":2,"id":"dev.game-handle-probe","name":"Game handle probe","version":"0.1.0","capabilities":["log","events","game_handles","services"],"native":{"api":1,"entry":"native/game-handle-probe.dll"}}') | Set-Content (Join-Path $taskHandleProbe 'mod.json') -Encoding ascii
  if(Test-Path dist\dev.game-handle-probe.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.game-handle-probe.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskHandleProbe -Output (Join-Path $taskRoot 'dist\dev.game-handle-probe.mod')
  $taskHandleDriver=Join-Path $taskRoot 'build\game-handle-probe-driver-package'
  New-Item -ItemType Directory -Force (Join-Path $taskHandleDriver 'native') | Out-Null
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk -DTC_HANDLE_PROBE_DRIVER=1 tests\game-handle-probe.cpp -o (Join-Path $taskHandleDriver 'native\game-handle-probe.dll')
  if($LASTEXITCODE){throw 'Game handle probe driver build failed'}
- ('{"format":2,"id":"dev.game-handle-probe-driver","name":"Game handle probe driver","version":"0.1.0","capabilities":["log","events","game_handles"],"native":{"api":1,"entry":"native/game-handle-probe.dll"}}') | Set-Content (Join-Path $taskHandleDriver 'mod.json') -Encoding ascii
+ ('{"format":2,"id":"dev.game-handle-probe-driver","name":"Game handle probe driver","version":"0.1.0","capabilities":["log","events","game_handles","services"],"native":{"api":1,"entry":"native/game-handle-probe.dll"}}') | Set-Content (Join-Path $taskHandleDriver 'mod.json') -Encoding ascii
  if(Test-Path dist\dev.game-handle-probe-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.game-handle-probe-driver.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskHandleDriver -Output (Join-Path $taskRoot 'dist\dev.game-handle-probe-driver.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared tests\component-cost-probe.cpp -o build\component-cost-probe.dll
@@ -376,22 +592,40 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'AND component fixture build failed'}
  & .\build\and-component-fixture.exe build\and2_component.data
  if($LASTEXITCODE){throw 'AND component fixture generation failed'}
- foreach($taskBoard in @('single','mixed','multi','not1board','and3board','adderboard','double8board','xor8board','mux8board','asr8board','adder8board')) {
+ & .\build\and-component-fixture.exe build\and2_component_storage.data 1 1 storage
+ if($LASTEXITCODE){throw 'Component storage fixture generation failed'}
+ foreach($taskBoard in @('single','mixed','multi','not1board','and3board','adderboard','double8board','xor8board','mux8board','asr8board','adder8board','src0board','sink0board','wide9board')) {
   & .\build\and-component-fixture.exe build\and2_component.data 1 1 ('nl-'+$taskBoard)
   if($LASTEXITCODE){throw ('Native logic '+$taskBoard+' board generation failed')}
  }
+ # Same board as not1board, but the instance already carries the schema-6 record
+ # a previous release of the storage test component saved.
+ & .\build\and-component-fixture.exe build\and2_component.data 1 1 'nl-not1legacy'
+ if($LASTEXITCODE){throw 'Legacy component storage fixture generation failed'}
  foreach($taskShape in @('not1','and3','adder','double8','xor8','mux8','asr8','adder8')) {
   & .\build\and-component-fixture.exe build\and2_component.data 1 1 ('nl-def-'+$taskShape)
   if($LASTEXITCODE){throw ('Native logic definition '+$taskShape+' generation failed')}
  }
  & node tests\and-component-netlist.js build\and2_component.data
  if($LASTEXITCODE){throw 'AND component netlist test failed'}
+ # The WordWatchee 64 fix, checked against the pinned executable and the game's
+ # own shader source instead of a copy of either (tests/word-watchee-model.js).
+ & node tests\word-watchee-model.js
+ if($LASTEXITCODE){throw 'Word watchee model test failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\and-component-probe.cpp -o build\and-component-probe.dll
  if($LASTEXITCODE){throw 'AND component probe build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-placement-probe.cpp -o build\component-placement-probe.dll
  if($LASTEXITCODE){throw 'Component placement probe build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-persistence-probe.cpp -o build\component-persistence-probe.dll
  if($LASTEXITCODE){throw 'Component persistence probe build failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-storage-probe.cpp -o build\component-storage-probe.dll
+ if($LASTEXITCODE){throw 'Component storage probe build failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-placeholder-probe.cpp -o build\component-placeholder-probe.dll
+ if($LASTEXITCODE){throw 'Component placeholder probe build failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-undo-probe.cpp -o build\component-undo-probe.dll
+ if($LASTEXITCODE){throw 'Component undo probe build failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk tests\component-capacity-probe.cpp -o build\component-capacity-probe.dll
+ if($LASTEXITCODE){throw 'Component capacity probe build failed'}
 } finally {
  $env:SOURCE_DATE_EPOCH = $taskPreviousSourceDateEpoch
  Pop-Location

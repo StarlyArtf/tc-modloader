@@ -1,0 +1,11 @@
+{
+ "format": 2,
+ "id": "local.clock",
+ "name": "时钟源元件",
+ "version": "0.1.0",
+ "author": "TC Mod Loader",
+ "description": "一个纯源时钟元件（0 输入、1 位输出）：每 N 个周期翻转一次，可以给门搭的触发器、计数器和环振电路当节拍。外观按官方常量元件排版并与其同尺寸：左上角方框是当前的 N，右上角是名字，中间是当前输出电平（用游戏自带的 asset/io_state 图块画）。周期可调：点一下左上角方框弹出数值窗口，按游戏数值框的语法填数字或表达式（8、0x10、1+7 都行）后回车即可；N 随原理图一起保存。门级延迟模式开启时，延迟模型会把它的值按单位重放——每周期开头输出一个单位宽的脉冲，于是你能看到真正的门级时序（脉冲逐级传播、边沿被 latch 捕获、窄脉冲被采样/丢失）。元件由声明式接口注册，不占存档里的定义文件。",
+ "requires": [],
+ "capabilities": ["log", "symbol", "component", "logic", "texture", "services", "symbol_alias"],
+ "native": {"api": 1, "entry": "native/clock.dll"}
+}

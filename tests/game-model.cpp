@@ -104,6 +104,13 @@ void writePtr(unsigned char* dst, void* value) {
     std::memcpy(dst, &value, sizeof(value));
 }
 
+// A pin's relative point is written into the descriptor that starts eight bytes
+// into the pin entry: the anchor the SDK's tc::pinPoint() hides.
+void writePinPoint(tc::TCPin& pin, int16_t x, int16_t y) {
+    std::memcpy(pin.bytes + 8 + 2, &x, sizeof(x));
+    std::memcpy(pin.bytes + 8 + 4, &y, sizeof(y));
+}
+
 void fakeGetPrototype(const void* key, void* out) {
     const auto* kind = static_cast<const tc::TCPrototypeKind*>(key);
     assert(kind->tag != tc::kPrototypeKindCustom);
@@ -114,6 +121,9 @@ void fakeGetPrototype(const void* key, void* out) {
     writeU64(inputs[0].bytes + 0x10, 0x11);
     writeU64(inputs[1].bytes + 0x10, 0x22);
     writeU64(outputs[0].bytes + 0x10, 0x33);
+    writePinPoint(inputs[0], -1, -1);
+    writePinPoint(inputs[1], -1, 1);
+    writePinPoint(outputs[0], 2, 0);
 
     auto* prototype = static_cast<tc::TCPrototype*>(out);
     writeU64(prototype->bytes + 0x60, 2);
@@ -786,6 +796,28 @@ int main() {
     if (tc::pinWordSizeRaw(*tc::prototypeInputPin(builtin, 1)) != 0x22 ||
         tc::pinWordSizeRaw(*tc::prototypeOutputPin(builtin, 0)) != 0x33) {
         std::cerr << "pin raw word size mismatch\n";
+        return 1;
+    }
+    // The wrapper has to hide the descriptor anchor: the point is stored eight
+    // bytes into the pin entry, which is exactly what the reader must add.
+    const tc::TCPinPoint in0 = tc::prototypeInputPinPoint(builtin, 0);
+    const tc::TCPinPoint in1 = tc::prototypeInputPinPoint(builtin, 1);
+    const tc::TCPinPoint out0 = tc::prototypeOutputPinPoint(builtin, 0);
+    if (in0.x != -1 || in0.y != -1 || in1.x != -1 || in1.y != 1 ||
+        out0.x != 2 || out0.y != 0) {
+        std::cerr << "pin point mismatch\n";
+        return 1;
+    }
+    if (tc::prototypeInputPinWordSize(builtin, 1) != 0x22 ||
+        tc::prototypeOutputPinWordSize(builtin, 0) != 0x33 ||
+        tc::prototypeInputPinWordSize(builtin, 2) != 0 ||
+        tc::prototypeOutputPinPoint(builtin, 1).x != 0) {
+        std::cerr << "pin accessor mismatch\n";
+        return 1;
+    }
+    if (tc::pinWordSizeIsAuto(0x7fffffffffffffffULL) != true ||
+        tc::pinWordSizeIsAuto(8) != false || tc::kPinWordSizeAuto != 0x7fffffffffffffffULL) {
+        std::cerr << "auto word size constant mismatch\n";
         return 1;
     }
     if (tc::prototypeGateCost(builtin) != 0x130 ||

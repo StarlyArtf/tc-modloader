@@ -27,7 +27,13 @@
         "TC_HOME_END_RVA": "0x44b610",
         "TC_BOARD_INPUT_SAMPLE_RVA": "0x46b593",
         "TC_BOARD_TOOLBAR_END_RVA": "0x4659c1",
-        "TC_BOARD_WINDOW_HOVER_RVA": "0x46b5e2"
+        "TC_BOARD_WINDOW_HOVER_RVA": "0x46b5e2",
+        "TC_BOARD_MENU_END_RVA": "0x45a471"
+      },
+      "layout": {
+        "CUSTOM_TAIL_TABLE_OFFSET": "0x190",
+        "CUSTOM_TAIL_ELEMENT_STRIDE": "0x18",
+        "CUSTOM_TAIL_ELEMENT_HEADER": "0x8"
       },
       "requiredSymbolAliases": [
         "sim.do",
@@ -41,7 +47,14 @@
         "scene.change",
         "board.wire.update",
         "save.count",
+        "save.schematic",
         "save.level",
+        "board.world_to_screen",
+        "options.general",
+        "board.undo",
+        "board.redo",
+        "board.after_place",
+        "board.component_panel",
         "save.path.level",
         "save.path.schematic",
         "runtime.emutls",
@@ -50,7 +63,15 @@
         "ui.invisibleButton",
         "cost.gate",
         "cost.total",
-        "cost.delay"
+        "cost.delay",
+        "io.input.get",
+        "io.input.set",
+        "io.input.flip",
+        "io.constant.set",
+        "io.constant.refresh",
+        "save.custom_tail_set",
+        "ig.set_cursor_pos",
+        "ig.set_cursor_pos_y"
       ],
       "acceptedInstalledLoaders": [
         {

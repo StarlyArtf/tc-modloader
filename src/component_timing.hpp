@@ -32,6 +32,10 @@ struct Registration {
     ~Registration(){registering=nullptr;declaredScope=nullptr;}
 };
 inline std::function<void(const std::string&)> timingLog;
+/* Optional callbacks around compile-graph construction.  They are intentionally
+   empty in the loader; consumers that only observe timing do not mutate boards. */
+inline std::function<void(void*,void*)> beforeGraph;
+inline std::function<void()> afterGraph;
 inline void (*getPrototype)(uint64_t,void*)=nullptr;
 inline void (*destroyPrototype)(void*)=nullptr;
 struct Compile {
@@ -240,7 +244,9 @@ inline void preorder(void* a,void* b,void* c,void* d,void* e,void* f,uint64_t g,
     Compile state;
     struct Restore { Compile* previous; ~Restore(){active=previous;} } restore{active};
     active=&state;
+    if(beforeGraph) { try { beforeGraph(a,b); } catch(...) {} }
     originalPreorder(a,b,c,d,e,f,g,out);
+    if(afterGraph) { try { afterGraph(); } catch(...) {} }
 }
 }
 

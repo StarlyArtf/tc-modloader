@@ -1,0 +1,15 @@
+# Board records captured from a real session (tests/sim-state-probe.cpp,
+# dev.sim-state package).  Regenerate with:
+#   powershell -File tools/extract-board-fixture.ps1 -StateMap build/state-map.txt -Output tests/data/<name>.txt
+# component: kind/x/y/rotation/id/custom from the record, plus the four words the probe
+# decodes around it.  wire: both endpoints, the width and the state slot the game itself reads.
+wire index=0 from=-6,-1 to=-13,-1 width=1 slot=256
+wire index=1 from=-6,1 to=-13,1 width=1 slot=258
+wire index=2 from=12,0 to=-3,0 width=1 slot=260
+board board components=6 wires=3
+component index=0 kind=0x0 x=0 y=0 rotation=0 id=0 custom=0 word28=0 word30=0 word38=0 word40=0
+component index=1 kind=0x3f x=-13 y=0 rotation=0 id=0 custom=0 word28=0 word30=0 word38=0 word40=2
+component index=2 kind=0x4 x=-5 y=0 rotation=0 id=0 custom=0 word28=0 word30=2 word38=3028931862016 word40=1
+component index=3 kind=0x44 x=13 y=0 rotation=0 id=0 custom=0 word28=0 word30=1 word38=3028931916512 word40=0
+component index=4 kind=0x3f x=-13 y=0 rotation=0 id=0 custom=0 word28=0 word30=0 word38=0 word40=2
+component index=5 kind=0x44 x=13 y=0 rotation=0 id=0 custom=0 word28=0 word30=1 word38=3028931916608 word40=0

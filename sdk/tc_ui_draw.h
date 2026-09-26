@@ -40,6 +40,9 @@ struct Table {
     void (*concave)(void*, const Vec2*, int, Color);
     void (*text)(void*, Vec2, Color, const char*, const char*);
     bool (*itemActive)();
+    /* Width/height the current font would use for a string, so a canvas can put
+       a background behind its own text. */
+    void (*calcTextSize)(Vec2*, const char*, const char*, bool, float);
 };
 inline Table& table() { static Table value{}; return value; }
 inline std::string& missing() { static std::string value; return value; }
@@ -51,6 +54,17 @@ inline bool segments(int n) { return n == 0 || (n >= 3 && n <= 4096); }
 
 inline bool drawingReady() { return drawing_detail::table().windowList != nullptr; }
 inline const std::string& drawingMissing() { return drawing_detail::missing(); }
+
+/* Size the current font gives `utf8`.  A canvas measures with the game's own
+   font (igCalcTextSize), so a label with a background behind it is laid out the
+   way the surrounding UI is. */
+inline Vec2 textSize(const char* utf8) {
+    Vec2 size{};
+    if (drawing_detail::table().calcTextSize)
+        drawing_detail::table().calcTextSize(&size, utf8 ? utf8 : "", nullptr, false, 0.f);
+    return size;
+}
+inline Vec2 textSize(const std::string& value) { return textSize(value.c_str()); }
 
 /* Additive capability: failure leaves drawing disabled but ordinary UI usable.
    Resolve into a temporary table, publishing only when ALL exports exist. */
@@ -89,6 +103,7 @@ inline bool loadDrawing(const TCHost* host) {
     TC_DRAW_BIND(concave, "ImDrawList_AddConcavePolyFilled");
     TC_DRAW_BIND(text, "ImDrawList_AddText_Vec2");
     TC_DRAW_BIND(itemActive, "igIsItemActive");
+    TC_DRAW_BIND(calcTextSize, "igCalcTextSize");
 #undef TC_DRAW_BIND
     if (!missingNames.empty()) {
         if (host->log) host->log(host->context, ("UI drawing: missing exports: " + missingNames).c_str());
@@ -138,9 +153,14 @@ public:
         if (!drawing_detail::finite(origin_) || !drawing_detail::finite(toScreen(size))) return;
         list_ = api.windowList();
         if (!list_) return;
-        clicked_ = invisibleButton(id, size);
+        /* One click per physical press.  The engine's InvisibleButton keeps
+           returning true for as long as the button is held (measured: a single
+           press on a punch-tape cell flipped it dozens of times), so the mouse's
+           own press edge decides instead. */
+        const bool pressed = invisibleButton(id, size);
         hovered_ = isItemHovered();
         active_ = api.itemActive();
+        clicked_ = pressed && ui::isMouseClicked(ui::Mouse_Left);
         api.pushClip(list_, origin_, toScreen(size), true);
         pop_ = api.popClip;
     }

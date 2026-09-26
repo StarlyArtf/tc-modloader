@@ -72,7 +72,11 @@ try {
   }
   $taskPlan = & (Join-Path $taskRepo 'tools\release.ps1') -Plan
   $taskPlanText = $taskPlan -join "`n"
-  if ($LASTEXITCODE -or $taskPlanText -notmatch 'TCModLoader-0\.6\.0-win64\.zip' -or
+  # The archive name has to follow VERSION, so this reads it instead of pinning
+  # one release: the hardcoded "0.6.0" turned a version bump into a failing
+  # release contract.
+  $taskVersion = (Get-Content -LiteralPath (Join-Path $taskRepo 'VERSION') -Raw).Trim()
+  if ($LASTEXITCODE -or $taskPlanText -notmatch ('TCModLoader-'+[regex]::Escape($taskVersion)+'-win64\.zip') -or
       $taskPlanText -notmatch 'Compatibility profile: tc-win64-2\.1\.334' -or
       $taskPlanText -notmatch 'SDK ABI target: windows-x64-mingw-ucrt') {
     throw 'Release plan did not resolve the current version, compatibility profile and ABI target'

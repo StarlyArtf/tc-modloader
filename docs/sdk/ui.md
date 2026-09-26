@@ -34,6 +34,15 @@ if (tc::ui::registerBoardPanel("main", "Board panel", draw) != 0) return 4;
 入口的提供者，因此不需要插件参与。若某个插件自己也 Hook 了 `igIsAnyItemActive`（MinHook
 会跟进跳转、把返回地址换掉），宿主改用一次短线栈回溯确认调用点，行为不变。
 
+> **2026-09-23 补充：这个采样回答只换分支，不是棋盘的输入闸门。** 文本框 Mod 想让"鼠标压在
+> 便签缩放节点上"的手势完全不落到棋盘时，实测把这一采样答成"有控件在活动"**不足以**做到：
+> 光标落在**棋盘窗口内**时，该分支（`handle_io_on_board` 里由 `build_board_ui` 那一对标志选出的
+> 路径）依然会调用 `handle_ongoing_action`，拖动会在松开那一帧给棋盘加上一条导线。有效的闸门在
+> `handle_io_on_board` 开头那 8 次鼠标按键读取（`0x1403558c7`..`0x140355935`）：让棋盘读到
+> "没按下"才行（做法、RVA 与真机数字见
+> [../verification.md](../verification.md) 「节点独占鼠标」）。面板那条路径不受影响——面板上的
+> 鼠标不在棋盘窗口内，走的是另一条分支。
+
 细节与边界：
 
 - 面板只在电路板绘制时出现：宿主从电路板自己的每帧代码里调用插槽，关卡关闭就没有
@@ -74,6 +83,96 @@ if (tc::ui::registerBoardPanel("main", "Board panel", draw) != 0) return 4;
 ## 键盘与输入法（2026-09-18 实测）
 
 ## 工具栏插槽（`tc::ui::registerBoardToolbar`）
+
+## 顶部菜单栏插槽（`tc::ui::registerMenuBarItem`）
+
+## 底部元件面板插槽（`tc::ui::registerComponentPanel`）
+
+游戏选中一个元件时，会在底部画出那个元件的面板（原版常量就在这里填**标签**与**常量值**）。
+`TC_UI_SLOT_BOARD_COMPONENT_PANEL` 让 Mod 把自己元件的编辑行画进**同一个面板**，而不是另开一个
+窗口：宿主挂钩游戏自己的元件抽屉，让游戏先排完它的标题、说明与引脚图，然后只对**选中元件的所有者
+Mod** 调用一次回调，并把那个实例 id 传进来（这是唯一能把面板和实例对上号的东西）：
+
+```cpp
+static void rows(void*, const TCFrame*, uint64_t instance, float width, float height) {
+    tc::ui::setCursorPos(tc::ui::Vec2{width * 0.08f, height * 0.52f});
+    tc::ui::text("标签");
+    tc::ui::sameLine();
+    tc::ui::setNextItemWidth(220.f);
+    if (tc::ui::inputText("##label", text, sizeof(text))) commit(instance, text);
+}
+...
+tc::ui::registerComponentPanel("editor", rows, nullptr, host);
+```
+
+- 只有**自己拥有的类型**被选中时才会回调；宿主外面套了 `PushID(mod id)`/`PushID(slot id)`，
+  两个 Mod 用同样的控件标签也不会撞。
+- 回调跑在游戏那个窗口里，坐标是**窗口内局部坐标**：游戏自己的行在上半部分，原版常量的字段在
+  下半部分左侧，照这个位置摆就能和原版的观感一致。
+- **这个窗口里的控件收不到输入**（实测：`inputText`/`radioButton` 画得出来，点上去毫无反应；
+  同一帧里游戏自己的抽屉窗口在这里也报 `IsWindowHovered()==0`，即鼠标底下是抽屉内部的另一个
+  子窗口，插件画在抽屉窗口本体里的 item 永远不会被 hover）。要在面板里放**能用的**控件，就得把
+  它们放进一个 Mod 自己的窗口，位置正好盖在面板那几行上，并且每帧 `tc::ui::setNextWindowFocus()`
+  （和加载器自己的页面容器同一个原因、同一个调用）：
+
+  ```cpp
+  // 行窗口：无标题栏、无背景（游戏面板透出来）、不移动/不缩放/不记设置。
+  tc::ui::setNextWindowPos(tc::ui::Vec2{origin.x + left, origin.y + top},
+                           tc::ui::Cond_Always, tc::ui::Vec2{0.f, 0.f});
+  tc::ui::setNextWindowFocus();
+  if (auto rows = tc::ui::Window("###rows", nullptr,
+                                 tc::ui::Window_NoTitleBar | tc::ui::Window_NoResize |
+                                 tc::ui::Window_NoMove | tc::ui::Window_NoScrollbar |
+                                 tc::ui::Window_NoCollapse | tc::ui::Window_AlwaysAutoResize |
+                                 tc::ui::Window_NoSavedSettings | tc::ui::Window_NoBackground)) {
+      tc::ui::text("标签");
+      tc::ui::sameLine();
+      tc::ui::setNextItemWidth(fieldWidth);
+      tc::ui::inputText("##label", text, sizeof(text));
+      if (tc::ui::isItemDeactivatedAfterEdit()) commit(instance, text);   // 离开字段即提交
+  }
+  ```
+
+  `origin` 是面板内容原点，取 `igGetCursorScreenPos()` 减去 `igGetCursorPosX/Y()`（实测可用），
+  比假设抽屉在屏幕上的位置可靠。`local.float-ops` 就是这么做的，真机闭环见
+  `tests/float-panel-playtest.ps1`。
+- 一个 Mod 只注册一个这样的插槽（面板一次只显示一个元件），按传进来的实例 id 决定画哪几行。
+- 老加载器没有这个插槽时返回 -1，Mod 应当退化成"没有编辑器"而不是失败；`local.float-ops` 的
+  实现与截图见 [../verification.md](../verification.md) 的同名小节。
+
+---
+
+游戏在电路板上方那条横栏（菜单、保存、提示按钮 + 右端分数）里也可以挂插件控件。
+`TC_UI_SLOT_BOARD_MENU` 让宿主把控件画在**游戏自己那排按钮之后、同一行上**：
+
+```cpp
+static void barItem(void*, const TCFrame*, float, float) {
+    if (tc::ui::button("Ping")) doSomething();
+}
+...
+tc::ui::registerMenuBarItem("bar", barItem, nullptr, host);
+```
+
+关键点是注入位置：宿主 hook 引擎的 `igPopStyleColor`，只在
+`build_buttons__presenterZboard95uiZmenu95bar_u187` 内部、RVA `0x45a471`
+（该函数清掉自己样式作用域时**第一个真正执行**的弹出点；探针
+`TC_MODLOADER_LOG_MENU=1` 实测这一步在两个关卡里都走到，而更早的 `0x45a435` 属于可选的
+"返回关卡"按钮标签，普通关卡不会执行）调用 `igSameLine(0, -1)` 后画插件控件。因此：
+
+- **样式自动一致**：绘制发生在 `Button / ButtonHovered / ButtonActive` 三色尚未弹出的时刻，
+  所以插件用普通 `tc::ui::button()` 得到与游戏条目相同的观感（该栏的按钮平时就是"无底色、
+  悬停才亮"）；`FramePadding / FrameRounding / ItemSpacing` 在该点之前已经被弹出，插件控件的
+  内边距来自当时的样式——真机截图上字号与基线都与相邻图标一致，粗细由插件自己决定（想要完全
+  一致的紧凑内边距，可以在回调里用 `pushStyleVar`，或在后续版本把注入点再往前挪一格）；
+- **排在同一行**：`igSameLine(0, -1)` 用样式里的 `ItemSpacing` 接在最后一个按钮右边；
+- **字体**：与工具列一样借用游戏的正文字体（该栏自己的标签在图标字体作用域里画，直接画会没有字形）；
+- **隔离与顺序**：宿主用 `PushID(mod id)` + `PushID(slot id)` 包住回调，所有插件按
+  `Mod id → 插槽 id` 排序绘制，可复现；
+- **上限**：沿用每插件 8 个插槽的规则；`slot_id` 非法返回 −2，重复 −3，宿主过旧 −1。
+
+示例：`examples/board-panel` 在注册侧栏面板之外还注册了一个 `Ping (bar)` 控件；真机证据见
+[验证体系](../verification.md)。这条接口覆盖的是**电路板**的顶栏（主菜单的按钮外观见
+`tc_game_ui.h`，主菜单页面见上一节）。
 
 把控件画进**游戏自己的工具栏**（电路板左侧那排工具按钮）里，做成"游戏里本来就有的工具"
 那种样子：一个小按钮，鼠标悬停才展开弹窗。

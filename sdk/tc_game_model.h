@@ -557,6 +557,54 @@ inline uint64_t pinWordSizeRaw(const TCPin& pin) {
     return value;
 }
 
+/* Word size values are the raw words the game stores.  AUTO_SIZE asks the game
+   to derive the width from the connected net; it is the same constant the
+   word-size getters receive as their third argument. */
+inline constexpr uint64_t kPinWordSizeAuto = 0x7fffffffffffffffULL;
+inline bool pinWordSizeIsAuto(uint64_t raw) { return raw == kPinWordSizeAuto; }
+
+/* A pin's schematic offset relative to its component's own position.  The
+   coordinate pair lives two bytes into the pin *descriptor*, and the descriptor
+   starts eight bytes into the 0x38-byte pin entry the helpers return - that
+   anchor is the one piece of arithmetic this wrapper exists to hide.  The
+   layout was verified against the per-kind offsets in
+   docs/research/component-pipeline.md section 9 and re-measured from the real
+   engine by tests/kind-list-probe.cpp (see docs/research/board-object-fields.md). */
+struct TCPinPoint {
+    int32_t x;
+    int32_t y;
+};
+static_assert(sizeof(TCPinPoint) == 8, "Pin point ABI");
+
+inline TCPinPoint pinPoint(const TCPin& pin) {
+    const unsigned char* descriptor = pin.bytes + 8;
+    int16_t x = 0;
+    int16_t y = 0;
+    memcpy(&x, descriptor + 2, sizeof(x));
+    memcpy(&y, descriptor + 4, sizeof(y));
+    return TCPinPoint{x, y};
+}
+
+inline TCPinPoint prototypeInputPinPoint(const TCPrototype& p, uint64_t index) {
+    const TCPin* pin = prototypeInputPin(p, index);
+    return pin ? pinPoint(*pin) : TCPinPoint{0, 0};
+}
+
+inline TCPinPoint prototypeOutputPinPoint(const TCPrototype& p, uint64_t index) {
+    const TCPin* pin = prototypeOutputPin(p, index);
+    return pin ? pinPoint(*pin) : TCPinPoint{0, 0};
+}
+
+inline uint64_t prototypeInputPinWordSize(const TCPrototype& p, uint64_t index) {
+    const TCPin* pin = prototypeInputPin(p, index);
+    return pin ? pinWordSizeRaw(*pin) : 0;
+}
+
+inline uint64_t prototypeOutputPinWordSize(const TCPrototype& p, uint64_t index) {
+    const TCPin* pin = prototypeOutputPin(p, index);
+    return pin ? pinWordSizeRaw(*pin) : 0;
+}
+
 inline TCNimString prototypeName(const TCPrototype& p) {
     TCNimString value{};
     memcpy(&value.length, p.bytes + kPrototypeNameOffset, sizeof(value.length));

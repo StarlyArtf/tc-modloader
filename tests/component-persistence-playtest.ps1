@@ -1,8 +1,19 @@
+param([ValidateSet('inplace','insert')][string]$Mode = 'inplace')
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
 $taskFixture = Join-Path $taskRepo 'build\and2_component.data'
-$taskSolution = Join-Path $taskRepo 'build\and2_solution.data'
+# The inplace route needs the fixture whose custom tail already carries the
+# sentinel pair; the insert route starts from the plain solution, whose tail is
+# empty, and lets the game's own Table setter allocate and grow the table.
+$taskSolution = Join-Path $taskRepo $(if($Mode -eq 'insert') {
+  'build\and2_solution.data'
+} else {
+  'build\and2_solution_storage.data'
+})
+# 0x013579BDF2468ACE / 0x02468ACE13579BDF, the same pair the fixture uses.
+$taskFirstValue = [uint64]0x13579BDF2468ACE
+$taskSecondValue = [uint64]0x2468ACE13579BDF
 foreach($taskFile in @($taskFixture,$taskSolution)) {
   if(!(Test-Path -LiteralPath $taskFile)) { throw "Missing $taskFile; run build.ps1 first" }
 }
@@ -30,13 +41,15 @@ if($LASTEXITCODE){throw 'Component persistence probe package apply failed'}
 
 $taskCircuit = Join-Path $taskSchema 'circuit.data'
 Copy-Item -LiteralPath $taskSolution -Destination $taskCircuit -Force
-$taskHash = (Get-FileHash -LiteralPath $taskCircuit).Hash
+$taskInitialHash = (Get-FileHash -LiteralPath $taskCircuit).Hash
 $taskPreviousProfile = $env:USERPROFILE
 $taskPreviousAppData = $env:APPDATA
+$taskPreviousMode = $env:TC_PERSISTENCE_MODE
 try {
   $env:USERPROFILE = $taskProfile
   $env:APPDATA = Join-Path $taskProfile 'AppData\Roaming'
-  foreach($taskRun in @(1,2)) {
+  $env:TC_PERSISTENCE_MODE = $Mode
+  foreach($taskRun in $(if($Mode -eq 'insert') { @(1,2,3) } else { @(1,2) })) {
     $taskResult = Join-Path $taskData 'result.txt'
     if(Test-Path -LiteralPath $taskResult) { Remove-Item -LiteralPath $taskResult -Force }
     $taskProcess = Start-Process -FilePath (Join-Path $taskRoot 'Turing Complete.exe') -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru
@@ -50,18 +63,31 @@ try {
     }
     $taskText = [IO.File]::ReadAllText($taskResult)
     if(!$taskText.StartsWith('PASS ')) { throw "Persistence run $taskRun failed: $taskText" }
+    if($Mode -eq 'insert') {
+      # Run 1 must have inserted into the fixture's empty table and grown it;
+      # runs 2 and 3 assert the exact value the game deserialized from the file.
+      $taskExpect = switch($taskRun) {
+        1 { "PASS insert inserted value=$taskFirstValue" }
+        2 { "readback $taskFirstValue then updated value=$taskSecondValue" }
+        3 { "readback $taskSecondValue stable value=$taskSecondValue" }
+      }
+      if(!$taskText.Contains($taskExpect)) {
+        throw "Persistence run $taskRun asserted '$taskExpect' but reported: $taskText"
+      }
+    }
     if(!$taskProcess.HasExited) {
       [void]$taskProcess.CloseMainWindow()
       if(!$taskProcess.WaitForExit(3000)) { Stop-Process -Id $taskProcess.Id }
     }
     "run $taskRun`: $taskText"
   }
-  if((Get-FileHash -LiteralPath $taskCircuit).Hash -ne $taskHash) {
-    throw 'Saved schematic changed unexpectedly across the reload test'
+  if((Get-FileHash -LiteralPath $taskCircuit).Hash -eq $taskInitialHash) {
+    throw 'The first launch did not persist the changed custom-component tail value'
   }
-  'PASS custom component id and three wires survive two game launches'
+  "PASS custom component tail value survives save plus restart (mode=$Mode)"
   "Evidence: $taskTest"
 } finally {
   $env:USERPROFILE = $taskPreviousProfile
   $env:APPDATA = $taskPreviousAppData
+  $env:TC_PERSISTENCE_MODE = $taskPreviousMode
 }
