@@ -1111,9 +1111,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/hook-chain.ps1
 
 ```text
 Hook chain sim.do joined (priority 0)                       <- 插件侧
-Hook chain sim.do installed with 3 link(s): dev.hook-chain-a@0, dev.hook-chain-b@0, dev.hook-chain-a@10
+Hook chain sim.do installed with 4 link(s): @-2147483647, dev.hook-chain-a@0, dev.hook-chain-b@0, dev.hook-chain-a@10
 PASS hook chain: three links ran in priority/mods order, edits reached the game function, and it still ran once
 ```
+
+最前面的 `@-2147483647` 是加载器自己的链节（仿真控制与 `sim.do` 事件），2026-09-27 更新时把用例的断言
+从"恰好 3 个链节"改成"三个 Mod 链节都在、且按优先级顺序"，避免加载器自己加链节就让用例变红。
 
 **脚本**（`tests/native.ps1`）：冲突场景改成两个包抢同一个普通目标——第一个
 `raw plain-hook ok=1`，第二个 `Hook rejected: phase, target or conflict` 且 `ok=0`；

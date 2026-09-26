@@ -69,8 +69,11 @@ if (status != TC_HOOK_OK) return 2;   // TC_HOOK_ERR_TARGET = 本构建没有这
 与包的启用顺序无关；日志会写清链上的成员：
 
 ```text
-Hook chain sim.do installed with 3 link(s): dev.hook-chain-a@0, dev.hook-chain-b@0, dev.hook-chain-a@10
+Hook chain sim.do installed with 4 link(s): @-2147483647, dev.hook-chain-a@0, dev.hook-chain-b@0, dev.hook-chain-a@10
 ```
+
+`@-2147483647` 是加载器自己的链节（`kLoaderLinkPriority`）：仿真控制与 `sim.do` 事件都挂在它上面，
+永远排在最前；Mod 自己的链节排在后面，按上面的顺序规则定位。
 
 三条语义：
 

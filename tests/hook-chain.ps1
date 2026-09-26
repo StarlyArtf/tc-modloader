@@ -38,8 +38,23 @@ foreach($taskMode in @('chain','skip','raw','events','cursor','crash')) {
   $taskText=$taskResult -join "`n"
   if($taskMode -eq 'chain') {
     # The loader, not the plugin, owns the detour: the install line is the proof
-    # that one detour serves all three links.
-    if($taskText -notmatch 'Hook chain sim\.do installed with 3 link\(s\)') {throw 'The loader did not install one sim.do chain for three links'}
+    # that one detour serves every link.  The loader keeps a link of its own at
+    # INT_MIN (simulation control + the sim.do event), so the assertion is about
+    # the three Mod links and their priority order, not about the raw total.
+    if($taskText -notmatch 'Hook chain sim\.do installed with (\d+) link\(s\): ([^\r\n]*)') {
+      throw 'The loader did not install a sim.do chain'
+    }
+    $taskLinks=$Matches[2]
+    foreach($taskExpected in @('dev.hook-chain-a@0','dev.hook-chain-b@0','dev.hook-chain-a@10')) {
+      if($taskLinks -notmatch [regex]::Escape($taskExpected)) {
+        throw "The sim.do chain is missing $taskExpected : $taskLinks"
+      }
+    }
+    $taskOrder=@('dev.hook-chain-a@0','dev.hook-chain-b@0','dev.hook-chain-a@10') |
+      ForEach-Object { $taskLinks.IndexOf($_) }
+    if($taskOrder[0] -gt $taskOrder[1] -or $taskOrder[1] -gt $taskOrder[2]) {
+      throw "The sim.do chain is not in priority order: $taskLinks"
+    }
   }
   if($taskMode -eq 'skip' -and $taskText -notmatch 'swallow=1') {throw 'The skipping link never ran'}
   if($taskMode -eq 'raw') {
