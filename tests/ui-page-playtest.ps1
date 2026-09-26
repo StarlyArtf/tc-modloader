@@ -151,7 +151,9 @@ try {
     # mouse messages do not reach the game's UI.
     $taskButtons = Join-Path $Sandbox 'buttons.txt'
     if (!(Test-Path -LiteralPath $taskButtons)) { throw "Missing $taskButtons; run the playtest with -ProbeButtons first" }
-    $taskEntries = @(Get-Content -LiteralPath $taskButtons | Where-Object { $_ -notmatch '^Mods ' })
+    # The loader's own entries (Mods, 存档) come first; the package's page is what
+    # this case drives.
+    $taskEntries = @(Get-Content -LiteralPath $taskButtons | Where-Object { $_ -notmatch '^Mods ' -and $_ -notmatch '^Saves ' })
     if ($OpenSecondPage -and $taskEntries.Count -lt 2) { throw 'Expected two page entries on the home page' }
     $taskOpen = if ($OpenSecondPage) { $taskEntries[$taskEntries.Count - 1] } else { $taskEntries[0] }
     if (!$taskOpen) { throw 'No page-entry button was logged by the loader' }
@@ -232,7 +234,7 @@ if ($DriverMode) {
   # Without the driver the point is the registry: both plugins must have their
   # own entry on the home page, under the same page id and with the same widget
   # labels, which is the ID-isolation precondition.
-  $taskEntries = $taskButtonLines | Where-Object { $_ -notmatch 'home button Mods ' }
+  $taskEntries = $taskButtonLines | Where-Object { $_ -notmatch 'home button Mods ' -and $_ -notmatch 'home button Saves ' }
   if (($taskEntries | Measure-Object).Count -lt 2) {
     $taskLines | Select-Object -Last 25
     throw 'The home page should show one entry per registered page'
