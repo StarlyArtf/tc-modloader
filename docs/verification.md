@@ -2778,3 +2778,36 @@ red   ghost 4  0 44 1696 / red   after 1  0 3 424
 
 **部署**：`dist\tc-loader.dll` 与 `D:\p\game_engine.dll` 同哈希（`C5EB93…`），上一版现场备份为
 `D:\p\game_engine.dll.bak-20260926-221735-before-clipboard-record-lifecycle`。
+
+# 0.8.0 完整 game 层结果（2026-09-27）
+
+发布后按 `tools/test.ps1 -Tier game` 跑了完整的 64 条真机用例：**56 通过 / 8 失败**。失败项逐条看过
+日志，没有一条指向加载器的产品行为；分成三类：
+
+**一、主菜单多了一个加载器入口，改掉了驱动程序的编号（已修 2 条）**
+
+0.8.0 在主菜单 `Mods` 之下加了「存档」入口，而几个用例的驱动按"首页第 N 个条目"点击：
+
+| 用例 | 现象 | 处理 |
+|---|---|---|
+| `ui-page-driver` | 驱动点到 `Saves`，插件页从未绘制 | 已修：探测阶段跳过加载器自己的条目（`Mods`、`Saves`），重跑**通过** |
+| `ui-keyboard` | 同上（探针把 `Saves` 的坐标写进了 `keyboard-entry.txt`） | 已修：同上，重跑**通过** |
+
+**二、驱动仍按首页条目编号进入关卡（未修完，需要继续）**
+
+`test.enter-board` 驱动按"首页第 N 个 igInvisibleButton"点击（用例配置的是编号 `2`）。它在
+`tests/enter-board.cpp` 里已经改成跳过 `Mods`/`Saves`，但重跑后仍点到 `capture` 而不是进入关卡——
+说明编号的差还来自别处（可能是插件页条目与游戏自身条目的相对顺序），需要跟着一次实测的候选清单修：
+受影响的用例是 `word-watchee`、`punch-tape-no-dump`、`native-logic`（它用 `custom-or` 的进入流程）
+以及 `float-catalogue-game`（同一条进入流程）。它们失败在"没有进入关卡/没有生成源码转储"这一步，
+不是加载器行为。
+
+**三、依赖本机真实安装里的备份文件（环境相关，未修）**
+
+`component-render-text-box` 与 `wire-palette-tool` 在准备沙箱时把 `D:\p\tc-modloader-data\blobs\`
+整个目录当成文件去复制（`Copy-Item` 报 "无法将容器复制到叶子"）：它们从**真实安装**的
+`state.json` 里查某个资源文件的备份哈希，而这份安装里没有对应条目。换一台曾经用这些用例跑过
+`apply` 的开发机就会通过；这属于用例的取数路径问题，不是加载器问题。
+
+**结论**：发布产物（0.8.0 的安装器/玩家包/源码包）与 fast、host 两层以及真机冒烟（元件存档持久化）
+都通过；game 层的这 6 条待办集中在**驱动程序的首页编号**与**用例取数路径**，下一次真机维护时一并处理。

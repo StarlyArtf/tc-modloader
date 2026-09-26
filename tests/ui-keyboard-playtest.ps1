@@ -84,7 +84,9 @@ if ($Probe) {
   # one (there is exactly one page in this package).
   $taskButton = $taskLines | Where-Object {
     $_ -match 'home button (\S+) x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) game=(\d+)x(\d+) window=(\d+)x(\d+)' -and
-    $Matches[1] -ne 'Mods'
+    # Skip the loader's own entries (Mods and the 存档 page): the probe wants the
+    # package's page, which is the next one along.
+    $Matches[1] -ne 'Mods' -and $Matches[1] -ne 'Saves'
   } | Select-Object -First 1
   if (!$taskButton) { $taskLines | Select-Object -Last 20; throw 'The loader never logged a page entry rectangle' }
   $null = $taskButton -match 'home button (\S+) x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) game=(\d+)x(\d+) window=(\d+)x(\d+)'

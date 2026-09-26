@@ -88,7 +88,12 @@ static bool hookInvisible(const char* id,TCEnterBoardV2 size,int flags) {
     const auto rva=(uintptr_t)__builtin_return_address(0)-(uintptr_t)GetModuleHandleW(nullptr);
     const bool onHome=rva>=0x449df0 && rva<0x44b610;
     const bool inScope=onHome || (targetCount>1 && stage>0);
-    if (!entered && inScope) {
+    /* The loader draws entries of its own on the home page (Mods, and since
+       0.8.0 the 存档 page).  They are not part of the candidate numbering this
+       driver's cases configure - counting them shifted every target by one and
+       made the drivers press the wrong entry. */
+    const bool loaderEntry=onHome&&id&&(std::strcmp(id,"Mods")==0||std::strcmp(id,"Saves")==0);
+    if (!entered && inScope && !loaderEntry) {
         if (!startTick) startTick=GetTickCount64();
         if (!stageTick) stageTick=startTick;
         /* Two presses a frame apart, a few seconds in: the same sequence the
