@@ -1,4 +1,4 @@
-﻿# Real-machine playtest for the Board handle registry (sdk/tc_handle_api.h).
+# Real-machine playtest for the Board handle registry (sdk/tc_handle_api.h).
 #
 # tests/game-handles.cpp proves the registry in isolation; this playtest proves
 # the half only the real game can produce - a level lifetime.  The driver build
@@ -97,7 +97,7 @@ if ($taskFatal) { $taskFatal | Select-Object -First 8; throw 'The probe or the l
 
 if ($Example) {
   foreach ($taskExpected in @(
-      'Game handle probe: armed (read-only)',
+      'Game handle probe: Board v3/v4, command/lifecycle/transaction v1 armed',
       'PROBE: Board unavailable on the main menu (unavailable)',
       'Native loaded: dev.game-handle-probe')) {
     if (!$taskText.Contains($taskExpected)) {
@@ -155,6 +155,16 @@ if (!$taskMenuIndex -or !$taskFirstLevelIndex -or $taskFirstLevelIndex -lt $task
   throw 'The probe never reported the empty main menu before the first level'
 }
 
+# The hook argument is a borrowed Nim string.  The event must expose its text
+# during the callback instead of satisfying the broad prefix check with the old
+# `(none)` placeholder.
+$taskLevelNames = @($taskLines | Select-String -Pattern 'PROBE: level\.load name=([^ ]+)' |
+  ForEach-Object { $_.Matches[0].Groups[1].Value })
+if ($taskLevelNames.Count -lt 2 -or $taskLevelNames -contains '(none)') {
+  $taskLines | Select-Object -Last 25
+  throw "Level-load events did not carry both real level names: $($taskLevelNames -join ', ')"
+}
+
 # Both levels, from the plugin's own lines: resolve() must land on the board the
 # event carried, the handle must validate, and the two must not share a
 # generation or a token.
@@ -196,6 +206,226 @@ foreach ($taskLine in $taskLines) {
 if ($taskHandles.Count -lt 2) {
   $taskLines | Select-Object -Last 25
   throw "The probe issued $($taskHandles.Count) handles, expected one per level"
+}
+$taskSnapshots = @($taskLines | Where-Object {
+  $_ -match 'PROBE: snapshot status=0 version=1 frame=-?\d+ cycle=-?\d+ selected-components=\d+ selected-wires=\d+ flags=15'
+})
+if ($taskSnapshots.Count -lt 2) {
+  $taskLines | Where-Object { $_ -match 'PROBE: snapshot' } | Select-Object -First 5
+  throw "The probe captured $($taskSnapshots.Count) complete Board snapshots, expected one per level"
+}
+$taskObjectSnapshots = @($taskLines | Where-Object {
+  $_ -match 'PROBE: objects status=0 components=(\d+) wires=(\d+) written=(\d+) resolved=(\d+) generation=(\d+)'
+})
+if ($taskObjectSnapshots.Count -lt 2) {
+  $taskLines | Where-Object { $_ -match 'PROBE: objects' } | Select-Object -First 5
+  throw "The probe captured $($taskObjectSnapshots.Count) complete object snapshots, expected one per level"
+}
+foreach($taskObjectLine in $taskObjectSnapshots){
+  if($taskObjectLine -notmatch 'components=(\d+) wires=(\d+) written=(\d+) resolved=(\d+)'){throw "Bad object snapshot line: $taskObjectLine"}
+  $taskExpectedChildren=[int64]$Matches[1]+[int64]$Matches[2]
+  if([int64]$Matches[3] -ne $taskExpectedChildren -or [int64]$Matches[4] -ne $taskExpectedChildren){throw "Object handles were not all written and resolved: $taskObjectLine"}
+}
+if(!($taskLines | Where-Object { $_ -match 'PROBE: child handle next-frame valid=0' })){
+  throw 'A Component/Wire handle survived beyond its snapshot frame'
+}
+$taskBoardV4=@($taskLines | Where-Object { $_ -match 'PROBE: board v4=4 prefix=1' })
+if($taskBoardV4.Count -lt 1){throw 'Board V4 did not repeat the V3 service prefix'}
+$taskBoardV5=@($taskLines | Where-Object { $_ -match 'PROBE: board v5=5 prefix=1' })
+if($taskBoardV5.Count -lt 1){throw 'Board V5 did not repeat the V4 service prefix'}
+$taskBoardV6=@($taskLines | Where-Object { $_ -match 'PROBE: board v6=6 prefix=1' })
+if($taskBoardV6.Count -lt 1){throw 'Board V6 did not repeat the V5 service prefix'}
+$taskComponents=@($taskLines | Where-Object {
+  $_ -match 'PROBE: component info status=0 read=(\d+) of=(\d+) unique-ids=(\d+)'
+})
+if($taskComponents.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: component info' } | Select-Object -First 5
+  throw "The probe read $($taskComponents.Count) complete component sets, expected one per level"
+}
+# Every object the enumeration issued has to come back with a real record, and
+# the ids the game keeps on those records have to be unique within a level.
+foreach($taskComponentLine in $taskComponents){
+  if($taskComponentLine -notmatch 'read=(\d+) of=(\d+) unique-ids=(\d+) custom=(\d+) kind0=(\d+) xy0=(-?\d+),(-?\d+) rotation0=(\d+) id0=(\d+)'){
+    throw "Bad component info line: $taskComponentLine"
+  }
+  if([int64]$Matches[1] -ne [int64]$Matches[2] -or [int64]$Matches[1] -lt 1){
+    throw "Components were not all readable: $taskComponentLine"
+  }
+  if([int64]$Matches[3] -ne [int64]$Matches[1]){throw "Component ids were not unique: $taskComponentLine"}
+  if([int64]$Matches[4] -gt [int64]$Matches[1]){throw "More custom components than components: $taskComponentLine"}
+}
+# Every board's component sequence carries one zero-filled entry at index 0
+# (kind 0, which is not a kind the game defines).  It is not a component, so the
+# probe asserts the histogram instead of pretending the first entry is one.
+$taskComponentKinds=@($taskLines | Where-Object { $_ -match 'PROBE: component kinds ' })
+if($taskComponentKinds.Count -lt 2){throw "The probe did not report component kind histograms"}
+if(!(@($taskComponentKinds | Where-Object { $_ -notmatch 'PROBE: component kinds 0:1\s*$' })).Count){
+  throw 'No level reported a real component kind, so the record fields were never decoded'
+}
+foreach($taskKindLine in $taskComponentKinds){
+  if($taskKindLine -match 'PROBE: component kinds 0:([2-9]|\d\d)'){
+    throw "More than one zero-filled placeholder entry: $taskKindLine"
+  }
+}
+# Board V5 pins: the shapes asserted here are the pinned build's own entries for
+# these two kinds (build/kinds.txt: 0x3c "Input" 0 in/1 out at (1,0) w1,
+# 0x44 "Output" 1 in at (-1,0) w1).  A wrong prototype lookup or a wrong pin
+# anchor cannot produce both lines.
+$taskPinLines=@($taskLines | Where-Object { $_ -match 'PROBE: pins ' })
+if($taskPinLines.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: pins|PROBE: component pins' } | Select-Object -First 5
+  throw "The probe read $($taskPinLines.Count) component pin sets, expected one per real component"
+}
+foreach($taskExpectedPin in @(
+    'PROBE: pins \d+ kind=0x3c in=0 out=1 p0=o\(1,0,w1\)',
+    'PROBE: pins \d+ kind=0x44 in=1 out=0 p0=i\(-1,0,w1\)')){
+  if(!($taskLines | Where-Object { $_ -match $taskExpectedPin })){
+    $taskLines | Where-Object { $_ -match 'PROBE: pins' } | Select-Object -First 5
+    throw "Missing component pin evidence: $taskExpectedPin"
+  }
+}
+$taskPinSummary=@($taskLines | Where-Object {
+  $_ -match 'PROBE: component pins status=\d+ read=(\d+) of=(\d+) pins=(\d+) expected=(\d+) zero=(\d+) auto=(\d+)'
+})
+if($taskPinSummary.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: component pins' } | Select-Object -First 5
+  throw "The probe summarised $($taskPinSummary.Count) pin reads, expected one per level"
+}
+$taskPinRefusal=$false
+$taskPinPlaceholder=$false
+foreach($taskPinLine in $taskPinSummary){
+  if($taskPinLine -notmatch 'read=(\d+) of=(\d+) pins=(\d+) expected=(\d+) zero=(\d+)'){
+    throw "Bad pin summary line: $taskPinLine"
+  }
+  # Every component must resolve to a prototype and hand back exactly the pins
+  # that prototype declares.
+  if([int64]$Matches[1] -ne [int64]$Matches[2]){throw "A component had no prototype: $taskPinLine"}
+  if([int64]$Matches[3] -ne [int64]$Matches[4]){throw "Pins were not all readable: $taskPinLine"}
+  # kind 0 is a real (empty) entry in the game's own prototype table, so the
+  # zero-filled placeholder resolves to zero pins rather than being invented
+  # into a component.
+  if([int64]$Matches[5] -ge 1){$taskPinPlaceholder=$true}
+  if([int64]$Matches[3] -ge 1){$taskPinRefusal=$true}
+}
+if(!$taskPinPlaceholder -or !$taskPinRefusal){
+  throw 'The V5 pin read did not show both an empty-prototype entry and a component with real pins'
+}
+$taskWires=@($taskLines | Where-Object {
+  $_ -match 'PROBE: wire info status=0 read=(\d+) of=(\d+) endpoint=(\d+) width=(\d+) slot=(\d+)'
+})
+if($taskWires.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: wire info' } | Select-Object -First 5
+  throw "The probe read $($taskWires.Count) complete wire sets, expected one per level"
+}
+# Wires are read by sequence index, and the width/state-slot fields have to be
+# inside the ranges the pinned build produced when they were verified.
+foreach($taskWireLine in $taskWires){
+  if($taskWireLine -notmatch 'read=(\d+) of=(\d+) endpoint=(\d+) width=(\d+) slot=(\d+) xy0=(-?\d+),(-?\d+)->(-?\d+),(-?\d+) width0=(\d+) slot0=(\d+)'){
+    throw "Bad wire info line: $taskWireLine"
+  }
+  if([int64]$Matches[1] -ne [int64]$Matches[2]){throw "Wires were not all readable: $taskWireLine"}
+  if([int64]$Matches[3] -ne [int64]$Matches[1]){throw "Wire endpoints were not reported: $taskWireLine"}
+  if([int64]$Matches[4] -ne [int64]$Matches[1]){throw "Wire widths were not reported: $taskWireLine"}
+  if([int64]$Matches[5] -ne [int64]$Matches[1]){throw "Wire state slots were not reported: $taskWireLine"}
+  if([int64]$Matches[1] -gt 0 -and ([int64]$Matches[10] -lt 1 -or [int64]$Matches[10] -gt 64)){
+    throw "A wire width was outside 1..64: $taskWireLine"
+  }
+}
+if(!($taskLines | Where-Object { $_ -match 'PROBE: child read next-frame component=-3 wire=-2' })){
+  throw 'A V4 read accepted an object handle that outlived its frame'
+}
+# Board V6: the campaign level's wire must resolve to the two pins it visibly
+# connects - the output pin component's input port at (9,0) and the input pin
+# component's output port at (-9,0) (build/kinds.txt: 0x44 in0=(-1,0),
+# 0x3c out0=(1,0), components at (10,0) and (-10,0)).
+$taskWireEnds=@($taskLines | Where-Object {
+  $_ -match 'PROBE: wire ends status=0 end0=\(9,0,dir0,pin0,kind=0x44\) end1=\(-9,0,dir1,pin0,kind=0x3c\)'
+})
+if($taskWireEnds.Count -lt 1){
+  $taskLines | Where-Object { $_ -match 'PROBE: wire ends' } | Select-Object -First 5
+  throw 'The wire ends did not resolve to the pins the geometry predicts'
+}
+# tc.simulation: the state read has to report the cycle and the state buffer, and
+# the value read through a wire's own slot has to obey the mask rule.
+$taskSimStates=@($taskLines | Where-Object {
+  $_ -match 'PROBE: sim state status=0 cycle=-?\d+ frame=-?\d+ state-size=(\d+) flags=(\d+)'
+})
+if($taskSimStates.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: sim state' } | Select-Object -First 5
+  throw "The probe read $($taskSimStates.Count) simulation states, expected one per level"
+}
+foreach($taskSimLine in $taskSimStates){
+  if($taskSimLine -notmatch 'state-size=(\d+) flags=(\d+)'){throw "Bad simulation state line: $taskSimLine"}
+  if([int64]$Matches[1] -lt 1){throw "The simulation state buffer was not reported: $taskSimLine"}
+  # cycle | engine frame | state buffer
+  if([int64]$Matches[2] -ne 7){throw "The simulation state flags are wrong: $taskSimLine"}
+}
+$taskSimValues=@($taskLines | Where-Object {
+  $_ -match 'PROBE: sim value status=0 raw-status=0 slot=\d+ width=(\d+) value=(\d+) raw=(\d+) masked=(\d+) agree=1'
+})
+if($taskSimValues.Count -lt 1){
+  $taskLines | Where-Object { $_ -match 'PROBE: sim value' } | Select-Object -First 5
+  throw 'The probe never read a wire value through the simulation service'
+}
+foreach($taskSimValue in $taskSimValues){
+  if($taskSimValue -notmatch 'width=(\d+) value=(\d+) raw=(\d+) masked=(\d+)'){throw "Bad simulation value line: $taskSimValue"}
+  $taskWidth=[int64]$Matches[1];$taskValue=[int64]$Matches[2];$taskRaw=[int64]$Matches[3];$taskMasked=[int64]$Matches[4]
+  if($taskWidth -lt 1 -or $taskWidth -gt 64){throw "A wire width outside 1..64 was probed: $taskSimValue"}
+  $taskExpected=if($taskWidth -ge 64){$taskRaw}else{$taskRaw -band ((1L -shl $taskWidth) - 1)}
+  if($taskValue -ne $taskExpected -or $taskMasked -ne $taskExpected){
+    throw "The value read did not follow the mask rule: $taskSimValue"
+  }
+}
+# The level.load moment is not the settled board; the V4 generator of this
+# service has to keep working on a later frame, including the placeholder entry.
+$taskSettled=@($taskLines | Where-Object {
+  $_ -match 'PROBE: settled objects status=0 components=(\d+) wires=(\d+) read=(\d+) unique-ids=(\d+) empty=(\d+) kinds='
+})
+if($taskSettled.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: settled objects' } | Select-Object -First 5
+  throw "The probe re-enumerated $($taskSettled.Count) settled boards, expected one per level"
+}
+foreach($taskSettledLine in $taskSettled){
+  if($taskSettledLine -notmatch 'components=(\d+) wires=(\d+) read=(\d+) unique-ids=(\d+) empty=(\d+)'){
+    throw "Bad settled board line: $taskSettledLine"
+  }
+  if([int64]$Matches[3] -ne [int64]$Matches[1]){throw "A settled board was not fully readable: $taskSettledLine"}
+  if([int64]$Matches[4] -ne [int64]$Matches[1]){throw "A settled board had duplicate component ids: $taskSettledLine"}
+  if([int64]$Matches[5] -gt 1){throw "A settled board had more than one placeholder entry: $taskSettledLine"}
+}
+$taskCommands=@($taskLines | Where-Object { $_ -match 'PROBE: command complete state=3 result=0 submitted=-?\d+ completed=-?\d+' })
+if($taskCommands.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: command' } | Select-Object -First 8
+  throw "The command bus completed $($taskCommands.Count) requests, expected one per level"
+}
+$taskEntered=@($taskLines | Where-Object { $_ -match 'PROBE: lifecycle kind=1 sequence=\d+ frame=-?\d+ board-valid=1' })
+$taskLeft=@($taskLines | Where-Object { $_ -match 'PROBE: lifecycle kind=2 sequence=\d+ frame=-?\d+ board-valid=0' })
+if($taskEntered.Count -lt 2 -or $taskLeft.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: lifecycle' } | Select-Object -First 10
+  throw "Lifecycle service observed entered=$($taskEntered.Count), left=$($taskLeft.Count); expected two of each"
+}
+$taskTransactions=@($taskLines | Where-Object { $_ -match 'PROBE: transaction complete state=4 result=0 staged=2 completed=2' })
+if($taskTransactions.Count -lt 2){
+  $taskLines | Where-Object { $_ -match 'PROBE: transaction' } | Select-Object -First 8
+  throw "The transaction service committed $($taskTransactions.Count) staged stop+save batches, expected two"
+}
+# The structure-change event: the probe changes the board once (a built-in AND
+# through the command bus) after its own transaction finished, and the loader
+# must raise OBJECTS_CHANGED exactly once for that edit.  Live counts come from
+# the public read path and skip the zero-filled placeholder.
+$taskEdits=@($taskLines | Where-Object {
+  $_ -match 'PROBE: edit state=3 result=0 live-before=0 live-after=1'
+})
+if($taskEdits.Count -lt 1){
+  $taskLines | Where-Object { $_ -match 'PROBE: edit' } | Select-Object -First 5
+  throw 'The board edit through the command bus did not add exactly one live component'
+}
+$taskLifecycleCounts=@($taskLines | Where-Object {
+  $_ -match 'PROBE: lifecycle objects-changed=1 selection-changed=0'
+})
+if($taskLifecycleCounts.Count -lt 1){
+  $taskLines | Where-Object { $_ -match 'PROBE: lifecycle objects' } | Select-Object -First 5
+  throw 'The board edit did not raise exactly one OBJECTS_CHANGED event'
 }
 $taskFirst = $taskHandles[0]
 $taskSecond = $taskHandles[$taskHandles.Count - 1]
@@ -245,5 +475,5 @@ $taskHandles | Select-Object -First 4 | Format-Table -AutoSize | Out-String -Wid
 "PASS Board handles: the menu answered UNAVAILABLE, each level issued a handle that resolved to " +
 "its own LEVEL_LOAD board and validated, the reserved COMPONENT kind was refused, leaving the " +
 "level invalidated the old handle (validate 0, resolve STALE, query UNAVAILABLE), and the second " +
-"level got a new generation and token"
+"level got a new generation and token; Board V3 handles, command/lifecycle V1, and transactional stop+save batches all passed"
 "Sandbox: $Sandbox"

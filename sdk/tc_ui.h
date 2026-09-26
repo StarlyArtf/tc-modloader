@@ -86,8 +86,10 @@ enum : int {
     Key_Tab = 512,
     Key_LeftArrow, Key_RightArrow, Key_UpArrow, Key_DownArrow,
     Key_PageUp, Key_PageDown, Key_Home, Key_End, Key_Insert, Key_Delete,
-    Key_Backspace, Key_Space, Key_Enter, Key_Escape,
-    Key_0 = 536, Key_1, Key_2, Key_3, Key_4, Key_5, Key_6, Key_7, Key_8, Key_9,
+Key_Backspace, Key_Space, Key_Enter, Key_Escape,
+Key_LeftCtrl = 524, Key_LeftShift, Key_LeftAlt, Key_LeftSuper,
+Key_RightCtrl, Key_RightShift, Key_RightAlt, Key_RightSuper,
+Key_0 = 536, Key_1, Key_2, Key_3, Key_4, Key_5, Key_6, Key_7, Key_8, Key_9,
     Key_A = 546, Key_B, Key_C, Key_D, Key_E, Key_F, Key_G, Key_H, Key_I, Key_J,
     Key_K, Key_L, Key_M, Key_N, Key_O, Key_P, Key_Q, Key_R, Key_S, Key_T, Key_U,
     Key_V, Key_W, Key_X, Key_Y, Key_Z,
@@ -112,6 +114,10 @@ struct Table {
     void (*end)();
     void (*setNextWindowPos)(Vec2, int, Vec2);
     void (*setNextWindowSize)(Vec2, int);
+    /* Brings the next window to the front of the window order.  Optional: it is
+       what makes a plugin's own window hoverable while the game's own window is
+       on top of it, the same call the loader's page container uses. */
+    void (*setNextWindowFocus)();
     void (*setNextWindowBgAlpha)(float);
     void (*setWindowFontScale)(float);
     float (*getWindowWidth)();
@@ -216,6 +222,12 @@ inline bool load(const TCHost* host) {
     TC_UI_BIND(setNextWindowPos, "igSetNextWindowPos");
     TC_UI_BIND(setNextWindowSize, "igSetNextWindowSize");
     TC_UI_BIND(setNextWindowBgAlpha, "igSetNextWindowBgAlpha");
+    /* Optional: a build without it loses only the "bring my window to the
+       front" request, so it must not fail the whole table. */
+    {
+        void* tc_ui_entry = host->engine_proc(host->context, "igSetNextWindowFocus");
+        std::memcpy(&table().setNextWindowFocus, &tc_ui_entry, sizeof(tc_ui_entry));
+    }
     TC_UI_BIND(setWindowFontScale, "igSetWindowFontScale");
     TC_UI_BIND(getWindowWidth, "igGetWindowWidth");
     TC_UI_BIND(getWindowHeight, "igGetWindowHeight");
@@ -433,6 +445,76 @@ inline int registerBoardToolbar(const char* slot_id,
     return host->register_ui_slot(host->context, &definition);
 }
 
+/* A control in the game's own top menu bar (see TC_UI_SLOT_BOARD_MENU).  The
+   callback runs once per frame while a board is on screen, right after the
+   game's own buttons on the same line, with the bar's width/height available:
+   draw one compact control there, exactly as with registerBoardToolbar.
+
+     tc::ui::registerMenuBarItem("ping", [](void*, const TCFrame*, float, float) {
+         if (tc::ui::button("Ping")) doSomething();
+     });
+
+   The bar's own button style is still pushed at that point, so an ordinary
+   tc::ui::button() already matches the game's entries.  The host wraps the call
+   in PushID(mod id)/PushID(slot id), so two plugins may use the same labels. */
+inline int registerMenuBarItem(const char* slot_id,
+                               void (*draw)(void*, const TCFrame*, float, float),
+                               void* user = nullptr, const TCHost* host = nullptr) {
+    if (!host || !slot_id || !draw) return -2;
+    if (host->size < offsetof(TCHost, register_ui_slot) + sizeof(void*) ||
+        !host->register_ui_slot)
+        return -1;
+    const std::size_t idLength = std::strlen(slot_id);
+    if (idLength == 0 || idLength >= 64 || std::strstr(slot_id, "###")) return -2;
+    TCUiSlotDefinition definition{};
+    definition.size = sizeof(definition);
+    definition.kind = TC_UI_SLOT_BOARD_MENU;
+    definition.slot_id = slot_id;
+    definition.title = slot_id;
+    definition.draw = draw;
+    definition.user = user;
+    return host->register_ui_slot(host->context, &definition);
+}
+
+/* Rows inside the game's own component drawer (see
+   TC_UI_SLOT_BOARD_COMPONENT_PANEL) - the panel along the bottom that the game
+   shows for the component the player has selected, where a built-in Constant's
+   label and value fields live.  This is where a Mod's editor for its own
+   components belongs: the game's own rows have already been laid out and the
+   cursor sits under them, inside that window, so the callback draws ordinary
+   widgets row by row, in the same column:
+
+     tc::ui::registerComponentPanel("fp32-value", [](void*, const TCFrame*, float, float) {
+         tc::ui::text("label");            // or textDisabled, for the game's own look
+         tc::ui::sameLine();
+         tc::ui::setNextItemWidth(240.f);
+         if (tc::ui::inputText("##label", text, sizeof(text))) commit();
+     }, this);
+
+   Only the Mod's own selected component triggers the callback, and the host
+   wraps it in PushID(mod id)/PushID(slot id), so labels never collide.  A
+   loader that predates the component panel returns -1. */
+inline int registerComponentPanel(const char* slot_id,
+                                  void (*draw)(void*, const TCFrame*, uint64_t, float, float),
+                                  void* user = nullptr, const TCHost* host = nullptr) {
+    if (!host || !slot_id || !draw) return -2;
+    if (host->size < offsetof(TCHost, register_ui_slot) + sizeof(void*) ||
+        !host->register_ui_slot)
+        return -1;
+    const std::size_t idLength = std::strlen(slot_id);
+    if (idLength == 0 || idLength >= 64 || std::strstr(slot_id, "###")) return -2;
+    TCUiSlotDefinition definition{};
+    definition.size = sizeof(definition);
+    definition.kind = TC_UI_SLOT_BOARD_COMPONENT_PANEL;
+    definition.slot_id = slot_id;
+    definition.title = slot_id;
+    definition.user = user;
+    /* The drawer's slot carries the instance it is showing; the plain `draw`
+       field stays null so the host never calls it without one. */
+    definition.draw_component = draw;
+    return host->register_ui_slot(host->context, &definition);
+}
+
 /* ---------------------------------------------------------------------------
    Window and panel scopes
    ------------------------------------------------------------------------ */
@@ -572,6 +654,12 @@ inline void setNextWindowPos(Vec2 position, int cond = Cond_Always, Vec2 pivot =
 }
 inline void setNextWindowSize(Vec2 size, int cond = Cond_Always) {
     if (table().setNextWindowSize) table().setNextWindowSize(size, cond);
+}
+/* Brings the next window to the front.  A plugin window opened from inside one
+   of the game's own windows needs this to be reachable at all: without it the
+   game's window stays above (see the page container in src/native.hpp). */
+inline void setNextWindowFocus() {
+    if (table().setNextWindowFocus) table().setNextWindowFocus();
 }
 inline float windowWidth() { return table().getWindowWidth ? table().getWindowWidth() : 0.f; }
 

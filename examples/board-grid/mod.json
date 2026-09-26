@@ -1,0 +1,13 @@
+{
+  "format": 2,
+  "id": "local.board-grid",
+  "name": "板面网格（可开关）",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "把游戏本来就有的板面坐标网格画出来：引脚相隔一个单位、导线在整数坐标上拐弯、元件都摆在整数格上，但游戏从不画它。网格按板面坐标画（用游戏自己的 world_pos_to_screen_pos 做相机变换），因此缩放/平移时自动跟随；线画在主视口的背景绘制层，也就是游戏自己的框选矩形所在的层——盖在板面之上、所有面板之下。开关放在游戏自己的设置页「设置 → 常规」里（钩 build_general_options 追加一行复选框），状态保存在 Mod 自己的数据目录。",
+  "capabilities": ["log", "symbol", "hook", "status"],
+  "native": {
+    "api": 1,
+    "entry": "native/board-grid.dll"
+  }
+}

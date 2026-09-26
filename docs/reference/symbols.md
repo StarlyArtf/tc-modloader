@@ -30,12 +30,15 @@ sim_do__modelZsimulationZcompile95thread_u3036
 | `sim.setting.set` | 函数 | `void(uint8_t, int64_t)` |
 | `sim.state.read` | 函数 | 读仿真状态位（波形探针用导线的偏移/位宽调用） |
 | `level.load` | 函数 | `void(void* boardModel, const TCNimString* name)` |
-| `level.loaded` | 函数 | 游戏认为已加载的关卡对象 |
+| `level.loaded` | 数据 | 关卡名的 Nim 字符串（`{length, data}`）；`length > 0` 即"当前有板面"。**不要当函数调用**（0.6.0 的表格曾标成函数，照着调会直接跳进字符串头） |
 | `scene.change` | 函数 | 场景切换 |
 | `board.wire.update` | 函数 | `bool(void*, void*, void*, uint32_t point, uint8_t colour)` |
+| `board.world_to_screen` | 函数 | `Vec2(Vec2 world)`：读全局 `ubo_view_model` 里的相机，返回**归一化**屏幕坐标；游戏自己的 `draw_simple_rect` 会把它乘上 `ImGuiIO.DisplaySize`（`io+8`）再画。板面网格 Mod 用它把网格画在板面坐标系上 |
+| `options.general` | 函数 | `void(void* presenter)`：设置页「常规」那一页；板面网格 Mod 钩它并追加一行开关 |
 | `save.count` | 数据 | `const int64_t*` 保存次数 |
 | `save.path.level` | 数据 | 关卡路径的 emutls 控制块 |
 | `save.path.schematic` | 数据 | 原理图路径的 emutls 控制块 |
+| `save.custom_tail_set` | 函数 | `void(void* table, int64_t key, int64_t value)`：自定义元件尾部键值表自己的 `[]=`。游戏的反序列化器就是按这个形状重建 `0x4e` 记录的（`get_component__modelZsave95mongerZversionsZv7_u5+0x4cb`）。插件一般不该直接调它，`tc.component.storage` 的持久化路径已经封装好 |
 | `runtime.emutls` | 函数 | `void*(void*)`：取当前线程的 emutls 槽 |
 | `ui.fonts` | 数据 | 游戏字体表（第 2 项是正文面） |
 | `ui.pushFont` | 函数 | `void(unsigned char index)` |
@@ -66,8 +69,11 @@ if (status != TC_HOOK_OK) return 2;   // TC_HOOK_ERR_TARGET = 本构建没有这
 与包的启用顺序无关；日志会写清链上的成员：
 
 ```text
-Hook chain sim.do installed with 3 link(s): dev.hook-chain-a@0, dev.hook-chain-b@0, dev.hook-chain-a@10
+Hook chain sim.do installed with 4 link(s): @-2147483647, dev.hook-chain-a@0, dev.hook-chain-b@0, dev.hook-chain-a@10
 ```
+
+`@-2147483647` 是加载器自己的链节（`kLoaderLinkPriority`）：仿真控制与 `sim.do` 事件都挂在它上面，
+永远排在最前；Mod 自己的链节排在后面，按上面的顺序规则定位。
 
 三条语义：
 
@@ -84,6 +90,21 @@ Hook chain sim.do installed with 3 link(s): dev.hook-chain-a@0, dev.hook-chain-b
 |---|---|---|---|
 | `TC_HOOK_SIM_DO` | `sim.do` | `void(void*, uint8_t, int64_t)` | 例：`example.cycle-guard` 限制单次运行周期数 |
 | `TC_HOOK_LEVEL_LOAD` | `level.load` | `void(void*, const void*)` | 例：`example.waveform-demo` 取板模型做导线探针 |
+| `TC_HOOK_SET_CURSOR_POS` | `ig.set_cursor_pos` | `void(ImVec2)` | 游戏自己的面板用它逐行摆放列表；`local.punch-tape` 在这里把纸带下方整体推下去，`local.pin-order` 在这里画引脚把手 |
+| `TC_HOOK_SET_CURSOR_POS_Y` | `ig.set_cursor_pos_y` | `void(float)` | 同上，一次只给 Y：面板用它锚"下一个条目"那一行 |
+
+后两个点由引擎提供、被游戏的所有面板共用，所以判定"这次调用属于哪个面板"要看链给出的
+**调用者**：`tc::hook::calledFrom(call, 面板函数地址, 函数长度)`。链节可以改 `x`/`y`——
+改动会送到游戏自己的函数（这就是"让下面的内容整体下移"的做法）；不想被别的链节影响，
+就按调用者过滤，例如
+
+```cpp
+static int anchorLink(TCHookCall* call) {
+    auto* args = tc::hook::setCursorPosArgs(call);
+    if (args && tc::hook::calledFrom(call, panel, panelSize)) args->y += extraHeight;
+    return 0;
+}
+```
 
 只有**已经实测过签名**的函数才会进这个目录。推广一个新点的步骤：
 
@@ -93,5 +114,9 @@ Hook chain sim.do installed with 3 link(s): dev.hook-chain-a@0, dev.hook-chain-b
 4. 在 `src/symbol_profile.hpp` 里确认别名存在；
 5. 把钩这个目标的 Mod 迁到链上（否则它会被 `Hook rejected: … chain point` 拦下），
    再在 `tests/hook-chain.cpp` 里加一个场景。
+
+链上的 `TCHookCall` 还带一个 `caller`（游戏那次调用的返回地址，插件自己发的调用为
+nullptr）。加它的时候是**追加在结构末尾**的，所以旧插件按自己编译时的偏移读不到它也不会
+读错；`tests/abi.ps1` 的基线为此记录了一次 `sizeof.TCHookCall` 56 → 64 的变化。
 
 `board.wire.update` 目前只有别名、没有链：界面驱动直接钩它做实验，推广时按上面五步走。

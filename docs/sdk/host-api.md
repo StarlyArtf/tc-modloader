@@ -70,10 +70,12 @@ tc::reportStatus(host, 2, "board model not resolved");     // 红色，写在 Mo
 | `resolve_alias(context, "sim.do")` | 按稳定别名取地址（本构建的符号画像），见 [symbols.md](../reference/symbols.md) |
 | `register_hook_chain(context, hook_id, priority, callback, user)` | 加入加载器拥有的钩子链；多个 Mod 可共用同一目标 |
 | `add_event_listener(context, kinds, callback, user)` | 订阅宿主事件（关卡加载、场景切换、仿真命令、保存） |
+| `query_service(context, id, version, out, size)` | 查询独立版本的游戏服务，见 [services.md](services.md) |
 
 ## Hook 游戏函数
 
-`resolve_symbol` 可以解析数据和函数地址，但 `create_hook` 只接受 EXE 函数符号。
+`resolve_symbol` 可以解析数据和函数地址，但 `create_hook` 只接受其中的 EXE 函数符号；它也接受
+`engine_proc` 返回、且地址确实落在原引擎模块可执行页内的导出。任意地址和数据页都会被拒绝。
 
 ```cpp
 using SimDo = void (*)(void*, uint8_t, int64_t);

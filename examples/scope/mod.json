@@ -1,0 +1,12 @@
+{
+  "format": 2,
+  "id": "local.scope",
+  "name": "示波器（逐周期）",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "在电路板右侧显示一个示波器面板：按周期（不是按帧）采样板子上的导线。通道来自 tc.sim.channel（每条有状态槽的导线 = 一条通道），数据来自 tc.sim.capture（加载器往编译出的程序里插的逐周期 tick），所以快跑时一个周期都不漏，‘gaps’ 一直是 0。面板有：Arm/Stop、时基（cycles/px）、左右平移、触发（通道 / 上升 / 下降 / 任意沿 / 按值）、两条游标 A、B（画布上左键点 A、右键点 B）读出 dt 与各通道在游标处的值、按位宽画的数据带，以及把当前窗口导出成 VCD。",
+  "requires": [],
+  "capabilities": ["log", "status", "ui_slot", "services", "game_handles", "events"],
+  "native": {"api": 1, "entry": "native/scope.dll"}
+}
+

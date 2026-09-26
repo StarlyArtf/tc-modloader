@@ -12,7 +12,11 @@
      * hovering is decided *geometrically* (is the mouse inside the tile's
        rectangle), not from ImGui's item state: a popup drawn over the tile takes
        the item hover away, and a popup that closes on hover loss flickers every
-       frame;
+       frame.  Geometry alone is not enough either - a window *above* the tile
+       (another Mod's panel, the game's own dialog) must win, or hovering the
+       covered spot still opened the tool underneath (measured: the punch tape's
+       mask window over the wire palette's tile), so ToolTile also asks
+       IsWindowHovered() before it reports a hover;
      * a hover popup must stay open while the mouse is on the tile *or* inside
        the popup, and must not be torn down in the middle of a drag - HoverPopup
        encodes exactly that, and places itself beside the tile so it never covers
@@ -87,17 +91,23 @@ public:
             return;
         }
         const Vec2 mouse = canvas_.mousePosition();
-        hovered_ = mouse.x >= 0.f && mouse.y >= 0.f && mouse.x < style_.size &&
-                   mouse.y < style_.size;
-        clicked_ = canvas_.clicked();
+        /* Geometry decides the tile, but only while the tile's own window is the
+           one under the mouse: a window above it (another Mod's panel, the game's
+           own dialog) has to win, otherwise hovering a covered tile still opened
+           the tool underneath.  IsWindowHovered() is exactly "the mouse is over
+           this window and nothing above blocks it". */
+        const bool inside = mouse.x >= 0.f && mouse.y >= 0.f && mouse.x < style_.size &&
+                            mouse.y < style_.size;
+        hovered_ = inside && ui::isWindowHovered(0);
+        clicked_ = hovered_ && canvas_.clicked();
         canvas_.rectFilled({0.f, 0.f}, canvas_.size(),
                            packColour(hovered_ ? style_.hovered : style_.background),
                            style_.rounding);
     }
 
     bool drawn() const { return static_cast<bool>(canvas_) || fallback_; }
-    /* True while the mouse is inside the tile's rectangle, whatever is drawn on
-       top of it.  Use this, not ImGui hover, to keep a popup open. */
+    /* True while the mouse is inside the tile's rectangle *and* no window above
+       the tile is under it.  Use this, not ImGui hover, to keep a popup open. */
     bool hovered() const { return hovered_; }
     bool clicked() const { return clicked_; }
     Vec2 origin() const { return canvas_ ? canvas_.origin() : Vec2{0.f, 0.f}; }

@@ -30,7 +30,8 @@ if ([long]$taskProfile.files.executable.size -lt 1 -or [long]$taskProfile.files.
 
 $taskKnownRvas = @(
   'TC_MENU_END_RVA', 'TC_HOME_START_RVA', 'TC_HOME_END_RVA',
-  'TC_BOARD_INPUT_SAMPLE_RVA', 'TC_BOARD_TOOLBAR_END_RVA', 'TC_BOARD_WINDOW_HOVER_RVA'
+  'TC_BOARD_INPUT_SAMPLE_RVA', 'TC_BOARD_TOOLBAR_END_RVA', 'TC_BOARD_WINDOW_HOVER_RVA',
+  'TC_BOARD_MENU_END_RVA'
 )
 $taskRvaNames = @($taskProfile.rvas.PSObject.Properties.Name)
 if ((($taskRvaNames | Sort-Object) -join "`n") -cne (($taskKnownRvas | Sort-Object) -join "`n")) {
@@ -39,6 +40,22 @@ if ((($taskRvaNames | Sort-Object) -join "`n") -cne (($taskKnownRvas | Sort-Obje
 foreach ($taskName in $taskRvaNames) {
   Assert-Identifier $taskName 'RVA macro'
   if ([string]$taskProfile.rvas.$taskName -notmatch '^0x[0-9a-fA-F]+$') { throw "Invalid RVA value for $taskName" }
+}
+
+# Record layout offsets.  These are the offsets the loader's own record reads
+# use (a custom component's tail table and one of its elements).  A build the
+# profile does not describe leaves them undefined, and src/component_tail.hpp
+# then reports persistent configuration as unavailable instead of guessing.
+$taskKnownLayout = @(
+  'CUSTOM_TAIL_TABLE_OFFSET', 'CUSTOM_TAIL_ELEMENT_STRIDE', 'CUSTOM_TAIL_ELEMENT_HEADER'
+)
+$taskLayoutNames = @($taskProfile.layout.PSObject.Properties.Name)
+if ((($taskLayoutNames | Sort-Object) -join "`n") -cne (($taskKnownLayout | Sort-Object) -join "`n")) {
+  throw 'Current profile must declare exactly the record layout set expected by this source tree'
+}
+foreach ($taskName in $taskLayoutNames) {
+  Assert-Identifier $taskName 'layout macro'
+  if ([string]$taskProfile.layout.$taskName -notmatch '^0x[0-9a-fA-F]+$') { throw "Invalid layout value for $taskName" }
 }
 
 $taskAliases = @($taskProfile.requiredSymbolAliases | ForEach-Object { [string]$_ })
@@ -71,6 +88,9 @@ $taskLines = @(
 )
 foreach ($taskName in $taskKnownRvas) {
   $taskLines += ('#define ' + $taskName + ' ' + [string]$taskProfile.rvas.$taskName + 'ULL')
+}
+foreach ($taskName in $taskKnownLayout) {
+  $taskLines += ('#define TC_LAYOUT_' + $taskName + ' ' + [string]$taskProfile.layout.$taskName + 'ULL')
 }
 foreach ($taskLoader in $taskProfile.acceptedInstalledLoaders) {
   $taskMacro = [string]$taskLoader.macro

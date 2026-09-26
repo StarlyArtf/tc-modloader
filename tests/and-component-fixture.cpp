@@ -15,6 +15,18 @@ namespace {
 
 constexpr uint64_t kAndComponentId = 0x414E44325F303031ULL;
 constexpr uint64_t kInnerComponentId = 0x414E44325F303032ULL;
+constexpr uint64_t kNot1ComponentId = 0x4E4F54315F303031ULL;
+/* The custom-tail keyspace the host stores a configuration in
+   (src/component_tail.hpp): "TCM3" in the high 32 bits, field number below. */
+constexpr uint64_t kTailMagic = 0x54434D33ULL;
+constexpr uint32_t kTailFormat = 1, kTailTypeId = 2, kTailSchemaLength = 3, kTailChecksum = 4;
+constexpr uint32_t kTailChunkBase = 0x1000;
+constexpr uint32_t kLegacySchema = 6;
+/* The bytes a "previous release" of the storage test component saved, and the
+   value the migration turns them into.  Kept in one place so the probe, the
+   fixture and the playtest cannot drift apart. */
+constexpr uint8_t kLegacyConfig[4] = {0x0f, 0x1e, 0x2d, 0x3c};
+constexpr uint8_t kMigratedConfig[4] = {0xa5, 0x5a, 0x0f, 0xf0};
 constexpr uint16_t kInputPin = 0x4F;
 constexpr uint16_t kOutputPin = 0x51;
 constexpr uint16_t kAndGate = 0x04;
@@ -57,6 +69,14 @@ struct Writer {
     void sequence_i64(const std::vector<int64_t>& values) {
         u16(static_cast<uint16_t>(values.size()));
         for (int64_t value : values) i64(value);
+    }
+
+    void settings(const std::vector<std::pair<std::string,std::string>>& values) {
+        u16(static_cast<uint16_t>(values.size()));
+        for (const auto& value : values) {
+            string(value.first);
+            string(value.second);
+        }
     }
 
     void sequence_u8(const std::vector<uint8_t>& values) {
@@ -418,7 +438,9 @@ void addV13Pin(Writer& writer, uint16_t kind, int16_t x, int16_t y,
 
 void addV13CustomInstance(Writer& writer, int16_t x=-5, int16_t y=0,
                          uint64_t identity=0x2222222222222222ULL,
-                         uint64_t custom_id=kAndComponentId) {
+                         uint64_t custom_id=kAndComponentId,
+                         const std::vector<std::pair<std::string,std::string>>& settings={},
+                         const std::vector<std::pair<int64_t,int64_t>>& custom_data={}) {
     writer.u16(0x4E);
     writer.i16(x);
     writer.i16(y);
@@ -433,12 +455,46 @@ void addV13CustomInstance(Writer& writer, int16_t x=-5, int16_t y=0,
     writer.u8(0);
     writer.u8(0);
     writer.u16(0);
-    writer.u16(0);
+    writer.settings(settings);
     writer.i64(static_cast<int64_t>(custom_id));
-    writer.u16(0);
+    writer.u16(static_cast<uint16_t>(custom_data.size()));
+    for (const auto& value : custom_data) {
+        writer.i64(value.first);
+        writer.i64(value.second);
+    }
 }
 
 std::string topology="single";
+/* FNV-1a over the configuration bytes - the same function the host verifies a
+   stored record with.  A fixture whose checksum did not match would be refused
+   as torn, which is a different test than the one this fixture is for. */
+uint64_t tailChecksum(const uint8_t* bytes, size_t count) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < count; ++i) { hash ^= bytes[i]; hash *= 0x100000001b3ULL; }
+    return hash;
+}
+int64_t tailKey(uint32_t field) {
+    return static_cast<int64_t>((kTailMagic << 32) | field);
+}
+/* The record an older release of the storage-test component left in the
+   circuit: schema 6, four bytes, checksummed.  The loader has to offer it to
+   the definition's migration instead of discarding it - and has to leave it
+   exactly where it is when the migration keeps or refuses it. */
+std::vector<std::pair<int64_t, int64_t>> legacyTailRecord() {
+    int64_t chunk = 0;
+    for (size_t i = 0; i < sizeof(kLegacyConfig); ++i)
+        chunk |= static_cast<int64_t>(kLegacyConfig[i]) << (8 * i);
+    return {
+        {tailKey(kTailFormat), 1},
+        {tailKey(kTailTypeId), static_cast<int64_t>(kNot1ComponentId)},
+        {tailKey(kTailSchemaLength),
+         static_cast<int64_t>((static_cast<uint64_t>(kLegacySchema) << 32) |
+                              sizeof(kLegacyConfig))},
+        {tailKey(kTailChecksum),
+         static_cast<int64_t>(tailChecksum(kLegacyConfig, sizeof(kLegacyConfig)))},
+        {tailKey(kTailChunkBase), chunk},
+    };
+}
 // Boards for tests/custom-or-playtest.ps1.  They contain only gates: the level
 // itself already supplies its input and output components, and duplicating
 // them in the schematic would put two output components on one net (the level
@@ -516,9 +572,91 @@ std::vector<uint8_t> buildNativeLogicBoard(const std::string& kind) {
         addWire(writer, -13, 1, {0x0007, 0xC001, 0x0000});       // b -> Mod in1
         addWire(writer, -3, -1, {0x0003, 0x0000});               // Mod out -> NOT
         addWire(writer, 3, -1, {0x0009, 0x4001, 0x0000});        // NOT -> Output
+    } else if(kind=="src0board") {
+        // A source: the Mod component has no input pins, so its output is
+        // combined with the level's input through a native OR gate.  Two things
+        // have to hold for the run to be worth anything: the component drives
+        // *something*, and the level's own test must not fail on the first cycle
+        // (a failing test stops the simulation, and then the callback count says
+        // nothing - measured on not_gate, where a source cannot satisfy the
+        // level's NOT).  or_gate expects OR(a,b) with a = b = the level input,
+        // so a source that drives 0 leaves OR(input, 0) = input and the test
+        // passes while the component keeps running.
+        //   level input (-13,0) -> OR in0 (3,-4)
+        //   component out (-3,-1) -> OR in1 (3,-2)
+        //   OR out (6,-3) -> level output (12,0)
+        //   level input (-13,-1) -> OR1 in0 ; level input (-13,1) -> OR1 in1
+        //   OR1 out -> OR2 in0          ; component out -> OR2 in1
+        //   OR2 out -> level output
+        // Both ports of the level's input are wired because or_gate's test
+        // reads them as its two operands; the second OR is what the source
+        // hangs off, with its steady 0 leaving OR(input, 0) = input.
+        writer.i64(3);
+        addV13CustomInstance(writer, -5, 0, 0x2222222222222222ULL, 0x535243305F303031ULL);
+        addV13Pin(writer, 0x06 /* OR */, 0, -6, 0x4444444444444444ULL, "", 1);
+        addV13Pin(writer, 0x06 /* OR */, 7, -6, 0x5555555555555555ULL, "", 1);
+        writer.i64(5);
+        addWire(writer, -13, -1, {0xC006, 0x000C, 0x0000});          // level input a -> OR1 in0
+        addWire(writer, -13, 1, {0xC006, 0x000C, 0x0000});           // level input b -> OR1 in1
+        addWire(writer, 2, -6, {0x0004, 0xC001, 0x0000});            // OR1 out -> OR2 in0
+        addWire(writer, -3, -1, {0x0009, 0xC004, 0x0000});           // component out -> OR2 in1
+        addWire(writer, 9, -6, {0x0003, 0x4006, 0x0000});            // OR2 out -> level output
+    } else if(kind=="sink0board") {
+        // A sink: the Mod component has no output pins, so the level's input
+        // feeds the component on one port and a native NOT gate on the other -
+        // not_gate expects NOT(input), so the level's own test passes while the
+        // component runs next to it.
+        //   level input (-12,-1) -> NOT (3,0)
+        //   level input (-12,1)  -> component in0 (-6,0)
+        //   NOT out (6,0) -> level output (12,0)
+        writer.i64(1);
+        addV13CustomInstance(writer, -5, 0, 0x2222222222222222ULL, 0x534E4B305F303031ULL);
+        addV13Pin(writer, 0x03, 4, 0, 0x4444444444444444ULL, "", 1);
+        writer.i64(3);
+        addWire(writer, -12, -1, {0xC004, 0x000F, 0x4005, 0x0000});  // level input -> NOT in
+        addWire(writer, -12, 1, {0x0006, 0xC001, 0x0000});           // level input -> component in0
+        addWire(writer, 6, 0, {0x0006, 0x0000});                     // NOT out -> level output
+    } else if(kind=="wide9board") {
+        // A nine-input V2 component: pins at (-7,-4)..(-7,4) for an instance at
+        // (-5,0), which is the geometry the declarative path reports (three
+        // inputs put pins at (-2,-1)..(-2,1) relative to the instance).  All nine
+        // are fed from the level's own input device, one wire per pin; the wires
+        // overlap in the corridor at x=-12, which is the same net and therefore
+        // the same signal.
+        //   level input (-13,-1) -> component in0..in8
+        //   level input (-13,-1)/(-13,1) -> OR1 -> OR2 <- component out -> level output
+        // Two instances of the same type: the second one carries no wires.  A
+        // component whose internals are the bridge's scaffold is compiled even
+        // without external connections (its driver has an unconnected input),
+        // which is what makes "two instances, independent state" testable
+        // without doubling the wiring.
+        writer.i64(4);
+        addV13CustomInstance(writer, -5, 0, 0x2222222222222222ULL, 0x574944395F303031ULL);
+        addV13Pin(writer, 0x06 /* OR */, 0, -6, 0x4444444444444444ULL, "", 1);
+        addV13Pin(writer, 0x06 /* OR */, 7, -6, 0x5555555555555555ULL, "", 1);
+        addV13CustomInstance(writer, -5, 20, 0x3333333333333333ULL, 0x574944395F303031ULL);
+        writer.i64(14);
+        for(int i=0;i<9;++i) {
+            const int y=-4+i;
+            const int dy=y+1;
+            /* A zero-length segment is the path terminator, so the row that sits
+               on the port's own line simply skips the vertical step. */
+            if(dy==0) addWire(writer, -13, -1, {0x0001, 0x0005, 0x0000});
+            else addWire(writer, -13, -1, {0x0001,
+                static_cast<uint16_t>(dy>0?(0x4000|dy):(0xC000|(-dy))),
+                0x0005, 0x0000});
+        }
+        addWire(writer, -13, -1, {0xC006, 0x000C, 0x0000});          // level input a -> OR1 in0
+        addWire(writer, -13, 1, {0xC006, 0x000C, 0x0000});           // level input b -> OR1 in1
+        addWire(writer, 2, -6, {0x0004, 0xC001, 0x0000});            // OR1 out -> OR2 in0
+        addWire(writer, -3, -1, {0x0009, 0xC004, 0x0000});           // component out -> OR2 in1
+        addWire(writer, 9, -6, {0x0003, 0x4006, 0x0000});            // OR2 out -> level output
     } else {
         // input -> single Mod instance -> output
         const bool notBoard=kind=="not1board";
+        /* Same shape and wiring as not1board, but the instance already carries
+           the record an older schema wrote; see legacyTailRecord(). */
+        const bool notLegacyBoard=kind=="not1legacy";
         const bool and3Board=kind=="and3board";
         const bool adderBoard=kind=="adderboard";
         const bool double8Board=kind=="double8board";
@@ -528,15 +666,18 @@ std::vector<uint8_t> buildNativeLogicBoard(const std::string& kind) {
         const bool adder8Board=kind=="adder8board";
         writer.i64(1);
         addV13CustomInstance(writer, -5, adderBoard?1:0, 0x2222222222222222ULL,
-                             notBoard?0x4E4F54315F303031ULL:
+                             (notBoard||notLegacyBoard)?kNot1ComponentId:
                              and3Board?0x414E44335F303031ULL:
                              adderBoard?0x414444525F303031ULL:
                              double8Board?0x44424C385F303031ULL:
                              xor8Board?0x584F52385F303031ULL:
                              mux8Board?0x4D5558385F303031ULL:
                              asr8Board?0x415352385F303031ULL:
-                             adder8Board?0x414444385F303031ULL:kAndComponentId);
-        if(notBoard) {
+                             adder8Board?0x414444385F303031ULL:kAndComponentId,
+                             {},
+                             notLegacyBoard?legacyTailRecord():
+                                            std::vector<std::pair<int64_t,int64_t>>{});
+        if(notBoard||notLegacyBoard) {
             // not_gate level: one input pin at (-12,0), output pin at (12,0).
             writer.i64(2);
             addWire(writer, -12, 0, {0xC001, 0x0006, 0x0000});
@@ -629,7 +770,10 @@ std::vector<uint8_t> buildLevelPayload(bool builtin_and) {
     if (builtin_and)
         addV13Pin(writer, kAndGate, -5, 0, 0x2222222222222222ULL, "", 1);
     else
-        addV13CustomInstance(writer);
+        addV13CustomInstance(writer,-5,0,0x2222222222222222ULL,kAndComponentId,
+                             {},topology=="storage"
+                                 ?std::vector<std::pair<int64_t,int64_t>>{{0x54434D3343464701LL,0x13579BDF2468ACE}}
+                                 :std::vector<std::pair<int64_t,int64_t>>{});
     addV13Pin(writer, 0x44, 13, 0, 0x3333333333333333ULL, "Output", 8);
     if(series) addV13CustomInstance(writer,3,0,0x5555555555555555ULL);
     if(parallel) {
@@ -776,9 +920,10 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> level_encoded;
         level_encoded.push_back(13);  // level solution save-format version
         writeLiteralSnappy(level_raw, level_encoded);
+        const bool storage=topology=="storage";
         level_output = output.parent_path() /
-                       (builtin_and ? "and2_solution_builtin.data"
-                                    : "and2_solution.data");
+                       (builtin_and ? (storage?"and2_solution_storage_builtin.data":"and2_solution_builtin.data")
+                                    : (storage?"and2_solution_storage.data":"and2_solution.data"));
         std::ofstream level_file(level_output,
                                  std::ios::binary | std::ios::trunc);
         level_file.write(reinterpret_cast<const char*>(level_encoded.data()),

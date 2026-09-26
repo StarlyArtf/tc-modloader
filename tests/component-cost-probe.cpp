@@ -73,6 +73,96 @@ std::map<int, int> delay_calls;
 std::map<int, int64_t> delay_result;
 bool have_scores = false;
 int64_t score_gates = 0;
+
+/* ---- optional per-cycle state sampling (gate-delay M2 evidence) -----------
+
+   With TC_GATE_DELAY_SAMPLE=1 the probe stops asking for the whole 8-cycle run
+   at once, steps the simulation one cycle at a time through
+   TC_SERVICE_SIMULATION and records the low state slots after each step.  The
+   report then names the slots that moved - which is how "the ring really
+   oscillates under the delay model" is told from "the board is a constant
+   driven acyclic circuit and never moves".  Off by default: the cost case's own
+   output must not change. */
+bool sampling = false;
+bool have_sim = false;
+tc::simulation::Api sim_api{};
+int64_t sample_cycles = 8;
+uint32_t sample_slots = 512;
+int64_t target_cycle = 0;
+std::vector<std::vector<unsigned char>> sample_rows;
+/* Which cycle each sampled row landed on.  A row that skipped a cycle is what
+   makes a two-unit oscillation look constant at cycle boundaries, so the report
+   has to show it. */
+std::vector<int64_t> sample_row_cycles;
+
+bool sampleRow() {
+    if (!have_sim) return false;
+    std::vector<TCSimChannelV1> channels(sample_slots);
+    std::vector<uint64_t> values(sample_slots, 0);
+    for (uint32_t at = 0; at < sample_slots; ++at) {
+        channels[at].size = sizeof(TCSimChannelV1);
+        channels[at].version = TCSIM_CHANNEL_VERSION_1;
+        channels[at].byte_offset = at;
+        channels[at].bits = 8;
+    }
+    int64_t cycle = -1;
+    uint32_t stable = 0;
+    if (tc::simulation::sample(sim_api, channels.data(), sample_slots, values.data(), &cycle,
+                               &stable) != TC_SIMULATION_OK)
+        return false;
+    std::vector<unsigned char> row(sample_slots, 0);
+    for (uint32_t at = 0; at < sample_slots; ++at)
+        row[at] = static_cast<unsigned char>(values[at] & 0xff);
+    sample_rows.push_back(std::move(row));
+    sample_row_cycles.push_back(cycle);
+    return true;
+}
+
+void appendSamplingReport(std::ostringstream& report) {
+    if (!sampling) return;
+    report << "sampled cycles=" << sample_rows.size() << " slots=" << sample_slots << "\n";
+    report << "  at cycles=";
+    for (size_t row = 0; row < sample_row_cycles.size(); ++row)
+        report << sample_row_cycles[row] << (row + 1 == sample_row_cycles.size() ? "" : ",");
+    report << "\n";
+    if (sample_rows.empty()) {
+        report << "changed slots=0\n";
+        return;
+    }
+    std::vector<uint32_t> changed;
+    std::vector<uint32_t> moves;
+    for (uint32_t at = 0; at < sample_slots; ++at) {
+        uint32_t moved = 0;
+        for (size_t row = 1; row < sample_rows.size(); ++row)
+            if (sample_rows[row][at] != sample_rows[row - 1][at]) ++moved;
+        if (moved) {
+            changed.push_back(at);
+            moves.push_back(moved);
+        }
+    }
+    report << "changed slots=" << changed.size() << "\n";
+    for (size_t i = 0; i < changed.size() && i < 12; ++i) {
+        const uint32_t at = changed[i];
+        report << "  slot " << at << " moves=" << moves[i] << " seq=";
+        for (size_t row = 0; row < sample_rows.size(); ++row)
+            report << static_cast<int>(sample_rows[row][at])
+                   << (row + 1 == sample_rows.size() ? "" : ",");
+        report << "\n";
+    }
+    if (changed.size() > 12) report << "  (" << (changed.size() - 12) << " more)\n";
+    /* The board's own slots sit at the bottom of the buffer; print them whatever
+       they did, so "the ring did not move" can be told from "the ring moved but
+       in a pattern the change counter missed" and from "the sample read nothing
+       at all". */
+    report << "first slots:\n";
+    for (uint32_t at = 256; at < 272 && at < sample_slots; ++at) {
+        report << "  slot " << at << " seq=";
+        for (size_t row = 0; row < sample_rows.size(); ++row)
+            report << static_cast<int>(sample_rows[row][at])
+                   << (row + 1 == sample_rows.size() ? "" : ",");
+        report << "\n";
+    }
+}
 int64_t score_delay = 0;
 uint8_t score_flag = 0;
 int score_calls = 0;
@@ -148,9 +238,19 @@ bool hookedInvisible(const char* id, V2 size, int flags) {
 
 struct BoardComponent {
     uint16_t kind = 0;
+    int16_t x = 0;
+    int16_t y = 0;
+    uint8_t rotation = 0;
     uint64_t id = 0;
     int64_t gates = 0;
     int64_t delay = 0;
+};
+
+struct BoardWire {
+    int16_t x1 = 0;
+    int16_t y1 = 0;
+    int16_t x2 = 0;
+    int16_t y2 = 0;
 };
 
 std::vector<BoardComponent> readBoard(void* context) {
@@ -166,7 +266,30 @@ std::vector<BoardComponent> readBoard(void* context) {
             static_cast<unsigned char*>(component_data) + 8 + i * 0x238;
         BoardComponent entry;
         std::memcpy(&entry.kind, component, sizeof(entry.kind));
+        std::memcpy(&entry.x, component + 2, sizeof(entry.x));
+        std::memcpy(&entry.y, component + 4, sizeof(entry.y));
+        std::memcpy(&entry.rotation, component + 6, sizeof(entry.rotation));
         std::memcpy(&entry.id, component + 0x188, sizeof(entry.id));
+        out.push_back(entry);
+    }
+    return out;
+}
+
+std::vector<BoardWire> readWires(void* context) {
+    std::vector<BoardWire> out;
+    auto* base = static_cast<unsigned char*>(context);
+    uint64_t wires = 0;
+    void* wire_data = nullptr;
+    std::memcpy(&wires, base + 0x98, sizeof(wires));
+    std::memcpy(&wire_data, base + 0xa0, sizeof(wire_data));
+    if (!wire_data || wires > 10000) return out;
+    for (uint64_t i = 0; i < wires; ++i) {
+        auto* wire = static_cast<unsigned char*>(wire_data) + 8 + i * 0x68;
+        BoardWire entry;
+        std::memcpy(&entry.x1, wire + 0x18, sizeof(entry.x1));
+        std::memcpy(&entry.y1, wire + 0x1a, sizeof(entry.y1));
+        std::memcpy(&entry.x2, wire + 0x1c, sizeof(entry.x2));
+        std::memcpy(&entry.y2, wire + 0x1e, sizeof(entry.y2));
         out.push_back(entry);
     }
     return out;
@@ -208,9 +331,33 @@ static void frame(void*, const TCFrame* value) {
         before_delay = score_delay;
         have_before = have_scores;
         cycle_before = mod.simulation.cycle();
+        if (sampling && have_sim) {
+            /* One cycle per request, then sample: the per-cycle view the
+               gate-delay evidence needs. */
+            tc::simulation::setSlice(sim_api, 1);
+            target_cycle = cycle_before + 1;
+            mod.simulation.run(model, target_cycle);
+            stage_time = current_time;
+            stage = 3;
+            return;
+        }
         mod.simulation.run(model, 8);
         stage_time = current_time;
         stage = 2;
+        return;
+    }
+    if (stage == 3) {
+        if (mod.simulation.cycle() < target_cycle) return;
+        sampleRow();
+        if (static_cast<int64_t>(sample_rows.size()) >= sample_cycles ||
+            current_time > stage_time + 30.0) {
+            cycle_after = mod.simulation.cycle();
+            stage_time = current_time;      /* report after the usual settle */
+            stage = 2;
+            return;
+        }
+        target_cycle = mod.simulation.cycle() + 1;
+        mod.simulation.run(model, target_cycle);
         return;
     }
     if (current_time < stage_time + 3.0) return;
@@ -235,6 +382,7 @@ static void frame(void*, const TCFrame* value) {
     if (have_prototype) mod.components.releasePrototype(prototype);
 
     const auto board = readBoard(model);
+    const auto wires = readWires(model);
     // Compile the actual board through the game's synchronous wrapper. The
     // direct load_level path does not refresh the UI score, so that stale
     // display must never be used as the assertion for this test.
@@ -255,10 +403,16 @@ static void frame(void*, const TCFrame* value) {
            << " delay=" << prototype_delay << "\n";
     report << "board components=" << board.size() << "\n";
     for (const auto& entry : board) {
-        report << "  kind=0x" << std::hex << entry.kind << std::dec;
+        report << "  kind=0x" << std::hex << entry.kind << std::dec
+               << " at=" << entry.x << "," << entry.y
+               << " rotation=" << static_cast<unsigned>(entry.rotation);
         if (entry.kind == 0x4e) report << " id=" << entry.id;
         report << "\n";
     }
+    report << "board wires=" << wires.size() << "\n";
+    for (size_t i = 0; i < wires.size(); ++i)
+        report << "  wire[" << i << "]=" << wires[i].x1 << "," << wires[i].y1
+               << " -> " << wires[i].x2 << "," << wires[i].y2 << "\n";
     report << "get_cost calls by kind:\n";
     for (const auto& entry : cost_calls) {
         const auto result = cost_result[entry.first];
@@ -279,6 +433,7 @@ static void frame(void*, const TCFrame* value) {
     report << "before sim: gates=" << before_gates << " delay=" << before_delay
            << " cycle=" << cycle_before << "\n";
     report << "after sim: cycle=" << cycle_after << "\n";
+    appendSamplingReport(report);
 
     finish(report.str());
 }
@@ -303,6 +458,17 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         std::string text;
         if (mode_file) std::getline(mode_file, text);
         if (!text.empty()) mode = text;
+    }
+    {
+        const char* value = std::getenv("TC_GATE_DELAY_SAMPLE");
+        sampling = value && value[0] && value[0] != '0';
+        have_sim = tc::simulation::table(h, &sim_api);
+        std::ifstream cycles_file(folder / "sample_cycles.txt");
+        int64_t cycles = 0;
+        if (cycles_file >> cycles && cycles > 0) sample_cycles = cycles;
+        std::ifstream slots_file(folder / "sample_slots.txt");
+        int64_t slots = 0;
+        if (slots_file >> slots && slots > 0) sample_slots = static_cast<uint32_t>(slots);
     }
     // Optional declared design cost: same order as a real Mod, which imports
     // the definition and then rewrites the cached statistics before the final

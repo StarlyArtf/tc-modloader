@@ -94,8 +94,12 @@ static void onEvent(TCEvent* event) {
     if (event->kind == TC_EVENT_SCENE_CHANGE)
         line += " scene=" + std::to_string(event->flags) +
                 (tc::events::sceneContext(event) ? " subject=1" : " subject=0");
-    if (event->kind == TC_EVENT_LEVEL_LOAD)
+    if (event->kind == TC_EVENT_LEVEL_LOAD) {
         line += event->subject ? " subject=1" : " subject=0";
+        line += " name=" + std::string(tc::events::levelName(event)
+                                            ? tc::events::levelName(event)
+                                            : "(none)");
+    }
     say(line);
 }
 #endif
@@ -157,6 +161,37 @@ static void rawProbe() {
 }
 #endif
 
+#ifdef TC_PROBE_CURSOR
+/* Two links on the same cursor points, the way the punch tape and the pin-order
+   Mod use them: the first one edits the line the game is about to place, the
+   second one only looks - and both are told where the call came from. */
+static int cursorPanelLink(TCHookCall* call) {
+    if (auto* args = tc::hook::setCursorPosArgs(call)) {
+        const void* panelLine = host->resolve_symbol(host->context, "tc_test_panel_line");
+        const bool panel = tc::hook::calledFrom(call, panelLine, 0x400);
+        say(std::string("cursor panel=") + (panel ? "1" : "0") + " x=" +
+            std::to_string(static_cast<int>(args->x)) + " y=" +
+            std::to_string(static_cast<int>(args->y)) + " panelLine=" +
+            std::to_string(reinterpret_cast<uintptr_t>(panelLine)) + " caller=" +
+            std::to_string(reinterpret_cast<uintptr_t>(call->caller)));
+        /* Only the panel's own calls move: the same rule the punch-tape Mod uses
+           so that a plugin's own cursor work is left alone. */
+        if (panel) args->y += 1.f;
+    }
+    return 0;
+}
+static int cursorLineLink(TCHookCall* call) {
+    auto* args = tc::hook::setCursorPosYArgs(call);
+    if (!args) return 0;
+    const void* panelLine = host->resolve_symbol(host->context, "tc_test_panel_line");
+    const bool panel = tc::hook::calledFrom(call, panelLine, 0x400);
+    say(std::string("cursorY panel=") + (panel ? "1" : "0") + " y=" +
+        std::to_string(static_cast<int>(args->y)));
+    if (panel) args->y += 1.f;
+    return 0;
+}
+#endif
+
 extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
     if (!h || h->api_version != TC_MOD_API_VERSION || h->size < TC_HOST_BASE_SIZE || !out ||
         out->size < sizeof(TCPlugin))
@@ -185,6 +220,15 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
 #endif
 #ifdef TC_PROBE_RAW
     rawProbe();
+#endif
+#ifdef TC_PROBE_CURSOR
+    {
+        const int pos = tc::hook::addSetCursorPos(h, 0, &cursorPanelLink, nullptr);
+        const int line = tc::hook::addSetCursorPosY(h, 0, &cursorLineLink, nullptr);
+        say(std::string("cursor joined pos=") + tc::hook::errorText(pos) + " line=" +
+            tc::hook::errorText(line));
+        if (pos != TC_HOOK_OK || line != TC_HOOK_OK) return 2;
+    }
 #endif
 #ifdef TC_PROBE_DUP
     rawButtonAttempt();

@@ -37,6 +37,18 @@ inline int addSimDo(const TCHost* host, int32_t priority, TCHookCallback callbac
 inline int addLevelLoad(const TCHost* host, int32_t priority, TCHookCallback callback, void* user) {
     return add(host, TC_HOOK_LEVEL_LOAD, priority, callback, user);
 }
+/* The engine's own cursor placement, which the game's panels use to lay a list
+   out line by line.  Joining it is how a Mod draws inside such a panel (the
+   callback runs while that panel's window is current) or makes room for
+   something taller than the panel planned (change the y it is about to use). */
+inline int addSetCursorPos(const TCHost* host, int32_t priority, TCHookCallback callback,
+                           void* user) {
+    return add(host, TC_HOOK_SET_CURSOR_POS, priority, callback, user);
+}
+inline int addSetCursorPosY(const TCHost* host, int32_t priority, TCHookCallback callback,
+                            void* user) {
+    return add(host, TC_HOOK_SET_CURSOR_POS_Y, priority, callback, user);
+}
 /* The game's own function for a hook point, without removing the chain: calling
    it goes through the chain like any other caller would.  Handy when a plugin
    wants to reuse the game's behaviour (the cycle-guard toolbar does this to
@@ -44,6 +56,8 @@ inline int addLevelLoad(const TCHost* host, int32_t priority, TCHookCallback cal
 inline void* callPoint(const TCHost* host, uint32_t hook_id) {
     const char* alias = hook_id == TC_HOOK_SIM_DO      ? "sim.do"
                         : hook_id == TC_HOOK_LEVEL_LOAD ? "level.load"
+                        : hook_id == TC_HOOK_SET_CURSOR_POS ? "ig.set_cursor_pos"
+                        : hook_id == TC_HOOK_SET_CURSOR_POS_Y ? "ig.set_cursor_pos_y"
                                                         : nullptr;
     return alias ? resolveAlias(host, alias) : nullptr;
 }
@@ -56,6 +70,25 @@ inline TCHookSimDoArgs* simDoArgs(TCHookCall* call) {
 inline TCHookLevelLoadArgs* levelLoadArgs(TCHookCall* call) {
     return call && call->hook_id == TC_HOOK_LEVEL_LOAD ? static_cast<TCHookLevelLoadArgs*>(call->args)
                                                       : nullptr;
+}
+inline TCHookSetCursorPosArgs* setCursorPosArgs(TCHookCall* call) {
+    return call && call->hook_id == TC_HOOK_SET_CURSOR_POS
+               ? static_cast<TCHookSetCursorPosArgs*>(call->args)
+               : nullptr;
+}
+inline TCHookSetCursorPosYArgs* setCursorPosYArgs(TCHookCall* call) {
+    return call && call->hook_id == TC_HOOK_SET_CURSOR_POS_Y
+               ? static_cast<TCHookSetCursorPosYArgs*>(call->args)
+               : nullptr;
+}
+/* True when the game called this point from inside that function; both cursor
+   points are shared by every panel, so the caller is how a Mod recognises the
+   one it cares about. */
+inline bool calledFrom(const TCHookCall* call, const void* function, size_t size) {
+    if (!call || !call->caller || !function) return false;
+    const auto at = reinterpret_cast<uintptr_t>(call->caller);
+    const auto begin = reinterpret_cast<uintptr_t>(function);
+    return at >= begin && at < begin + size;
 }
 /* Runs the rest of the chain and then the game's own function, returning true if
    the call had already been consumed.  Only useful when a link wants to look at

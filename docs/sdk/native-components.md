@@ -31,13 +31,17 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host, TCPlugin*) {
 ## 契约
 
 - `inputs` / `outputs` 的数组顺序就是回调的 `inputs[]` / `outputs[]` 顺序。
-- 每方向 1–8 脚，每脚 1–64 位，总输入 ≤128 位；门数和延迟为非负且不超过 `INT64_MAX`。
+- 每方向 0–8 脚（两个方向不能同时为 0：纯源无输入、纯汇无输出都可以，见 [research/custom-component-pins.md](../research/custom-component-pins.md)），每脚 1–64 位，总输入 ≤128 位；门数和延迟为非负且不超过 `INT64_MAX`。
 - 名称和引脚名为 UTF-8；`shapeSvg` 可选。不提供时使用游戏默认形状。
 - 引脚名指针只需在 `registerWith` 调用期间有效；回调及 `user` 在插件运行期间有效。
 - 仅在 `tc_mod_load` 期间调用。无需先加载 `TCMod` 或传入虚构的目录。
 - 同 ID 已存在时拒绝，不覆盖其它元件；注册失败会移除本次新建的原型。
   插件初始化最终失败时，本插件通过此接口创建的原型也会移除。
 - 不支持热卸载；存档保存稳定 ID，再次启动由同一 Mod 重新注册定义。
+- 需要随存档保存的配置（而不是只活在当前这次运行里）走 `tc.component.types` 的
+  `config_schema` / `default_config`，再用 `tc.component.storage` 读写：宿主把配置写进元件记录
+  自己拥有的键值表，游戏随原理图一起保存，重启后绑定阶段自动回读。详见
+  [services.md](services.md#tccomponentstorage配置与仿真状态快照)。
 - `CYCLE` 和 `REFRESH` 都应写输出。只有 `CYCLE` 提交 `state[8]`，刷新不推进状态。
 - 声明延迟影响统计与分数，不会自动把输出延后几个周期。
 
