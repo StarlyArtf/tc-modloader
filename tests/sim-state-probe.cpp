@@ -8,9 +8,13 @@
 
 #include "../sdk/tc_mod.h"
 #include "../sdk/tc_custom_logic.h"
+#include "../simcore/include/tcsim/board.hpp"
+#include "../simcore/include/tcsim/devices.hpp"
+#include "../simcore/include/tcsim/engine.hpp"
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -61,6 +65,43 @@ double elapsed = 0;
 int stage = 0;
 double stage_time = 0;
 bool done = false;
+/* Deep mode (TC_SIM_STATE_DEEP=1) dumps what S2 needs to know: the whole
+   component record, the tables its unknown pointers lead to, and which game
+   call site reads which state offset.  The write test
+   (TC_SIM_STATE_WRITE=1) then answers the question S2's write-back contract
+   rests on: if we put a value in the state array ourselves, does it stay
+   there, and does the game keep reading it? */
+bool deep_dump = false;
+bool write_test = false;
+/* Where does the game keep the cycle counter?  `sim_get_cycle` reads it, the
+   simulation thread increments it, and ownership of it is what S2's advance
+   control needs (the user has allowed touching it).  TC_SIM_STATE_CYCLE=1 scans
+   the model the sim.do chain hands over for an int64 that equals the current
+   cycle and then goes up by exactly one: same method as finding the state
+   slots.  Read-only. */
+bool cycle_probe = false;
+int64_t probe_last_cycle = -2;
+std::vector<size_t> probe_candidates;
+std::map<size_t, std::pair<int64_t, int64_t>> probe_hits;
+std::string cycle_report;
+/* Drive mode (TC_SIM_STATE_DRIVE=1) is S2 in one experiment: build a netlist
+   from the live board, run simcore for that circuit, and put *our* value into
+   the game's state array.  TC_SIM_STATE_INVERT=1 writes the opposite of the
+   value we computed, which is how the probe proves the slot shows what we wrote
+   rather than what the game's own program wrote a moment earlier. */
+bool drive_test = false;
+bool drive_invert = false;
+int drive_cycles = 4;
+int drive_remaining = 0;
+int64_t drive_next_cycle = -1;
+tcsim::Engine* drive_engine = nullptr;
+tcsim::BuildResult drive_build;
+std::ostringstream drive_log;
+int64_t write_cycle = -1;
+std::vector<uint64_t> write_offsets;
+std::map<uint64_t, unsigned char> write_before;
+std::map<uint64_t, unsigned char> write_after;
+std::map<uint64_t, uint64_t> write_reads_after;
 int64_t desired_cycle = 1;
 int test_frame = -1;
 int test_button_index = 0;
@@ -72,6 +113,9 @@ void* output_history_global = nullptr;
 unsigned char* smallBuffer(void* global);
 
 constexpr uint64_t kCustomComponentId = 0x414E44325F303031ULL;
+/* Pattern the write test puts into the state array: 1010_0101, so a 1-bit slot
+   reads back as 1 and a stale byte is obvious. */
+constexpr unsigned char kWriteMarker = 0xA5;
 
 void customLogicOr(tc::TCCustomLogicIO* io) {
     io->outputs[0] = (io->inputs[0] | io->inputs[1]) & 1;
@@ -112,12 +156,45 @@ std::vector<int64_t> snapshot_cycles;
 std::mutex read_mutex;
 std::map<int64_t, uint64_t> state_read_counts;
 std::map<int64_t, uint64_t> state_read_last;
+/* Which game code reads which slot: the drawing path and the simulation path
+   ask for different offsets, and telling them apart is what answers "if we
+   write this slot, does the board show it?".  Key is (byte offset, caller). */
+std::map<std::pair<int64_t, uintptr_t>, uint64_t> state_read_callers;
+std::map<int64_t, uint64_t> state_read_last_caller;
+/* Thread split: the render thread reads a slot to draw it, the simulation
+   thread reads it to evaluate a component.  Knowing which is which is what
+   says whether a slot is a write-back target. */
+std::map<std::pair<int64_t, uint32_t>, uint64_t> state_read_threads;
+uint32_t main_thread_id = 0;
 std::mutex gss_mutex;
 std::map<std::string, std::pair<uint64_t, uint64_t>> gss_stats;
 std::map<std::string, uint64_t> gss_last1;
 
 void log(const std::string& message) {
     if (host) host->log(host->context, message.c_str());
+}
+
+/* The write test's targets: every wire's own state byte (the record at +0x38
+   is the offset the game's own reader uses, verified by tc.sim.channel), plus
+   the low node window the observations showed the renderer reading. */
+void collectWriteTargets() {
+    write_offsets.clear();
+    if (model) {
+        const auto* base = static_cast<const unsigned char*>(model);
+        uint64_t wires = 0;
+        void* wire_data = nullptr;
+        std::memcpy(&wires, base + 0x98, sizeof(wires));
+        std::memcpy(&wire_data, base + 0xa0, sizeof(wire_data));
+        if (wire_data && wires <= 64) {
+            for (uint64_t index = 0; index < wires; ++index) {
+                const auto* wire = static_cast<const unsigned char*>(wire_data) + 8 + index * 0x68;
+                uint64_t slot = 0;
+                std::memcpy(&slot, wire + 0x38, 8);
+                if (slot + 8 <= kSimulationStateSize) write_offsets.push_back(slot);
+            }
+        }
+    }
+    for (uint64_t offset = 256; offset < 272; ++offset) write_offsets.push_back(offset);
 }
 
 std::string hex(void* value) {
@@ -162,6 +239,117 @@ unsigned char* smallBuffer(void* global) {
     return buffer;
 }
 
+/* A pointer read out of a record is only followed when the whole range is one
+   committed, readable region - the same rule src/board_objects.hpp uses, kept
+   local so this probe stays a single translation unit. */
+bool readableRegion(const void* address, size_t bytes) {
+    if (!address || !bytes) return false;
+    MEMORY_BASIC_INFORMATION region{};
+    if (VirtualQuery(address, &region, sizeof(region)) != sizeof(region)) return false;
+    if (region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    const auto* begin = static_cast<const unsigned char*>(region.BaseAddress);
+    const auto offset = static_cast<size_t>(static_cast<const unsigned char*>(address) - begin);
+    return offset + bytes <= region.RegionSize;
+}
+
+std::string hexBytes(const unsigned char* bytes, size_t count) {
+    std::ostringstream out;
+    for (size_t index = 0; index < count; ++index) {
+        char buffer[4];
+        std::snprintf(buffer, sizeof(buffer), "%02x", bytes[index]);
+        out << buffer;
+    }
+    return out.str();
+}
+
+/* ---------------------------------------------------------------------------
+   S2's board -> netlist step, running live: the pin geometry comes from the
+   game's own prototype table, the records from the board, and simcore does the
+   rest.  Nothing here reads an emitted program. */
+
+bool prototypeGeometry(const tcsim::BoardComponent& component, tcsim::KindPins& out) {
+    tc::TCPrototype prototype{};
+    if (!mod.game.getPrototype(component.kind, component.custom_id, prototype)) return false;
+    const uint64_t inputs = tc::prototypeInputCount(prototype);
+    const uint64_t outputs = tc::prototypeOutputCount(prototype);
+    if (inputs > 8 || outputs > 4) return false;
+    out = tcsim::KindPins{};
+    out.kind = component.kind;
+    out.name = tc::prototypeNameCStr(prototype);
+    out.input_count = static_cast<uint8_t>(inputs);
+    out.output_count = static_cast<uint8_t>(outputs);
+    for (uint64_t index = 0; index < inputs; ++index) {
+        const tc::TCPinPoint point = tc::prototypeInputPinPoint(prototype, index);
+        out.in_x[index] = static_cast<int8_t>(point.x);
+        out.in_y[index] = static_cast<int8_t>(point.y);
+        const uint64_t raw = tc::prototypeInputPinWordSize(prototype, index);
+        out.in_bits[index] = tc::pinWordSizeIsAuto(raw) || raw == 0
+                                 ? 1
+                                 : static_cast<uint16_t>(raw < 64 ? raw : 64);
+    }
+    for (uint64_t index = 0; index < outputs; ++index) {
+        const tc::TCPinPoint point = tc::prototypeOutputPinPoint(prototype, index);
+        out.out_x[index] = static_cast<int8_t>(point.x);
+        out.out_y[index] = static_cast<int8_t>(point.y);
+        const uint64_t raw = tc::prototypeOutputPinWordSize(prototype, index);
+        out.out_bits[index] = tc::pinWordSizeIsAuto(raw) || raw == 0
+                                  ? 1
+                                  : static_cast<uint16_t>(raw < 64 ? raw : 64);
+    }
+    return true;
+}
+
+/* Reads a net's current byte out of the game's state array, the way the game's
+   own reader would. */
+uint64_t readNetByte(const std::vector<uint64_t>& slots) {
+    if (slots.empty()) return 0;
+    unsigned char* buffer = *reinterpret_cast<unsigned char**>(state_global);
+    if (!buffer) return 0;
+    if (state_read_original) return state_read_original(static_cast<int64_t>(slots[0])) & 0xffu;
+    return buffer[slots[0]] & 0xffu;
+}
+
+void writeNetByte(const std::vector<uint64_t>& slots, uint64_t value) {
+    unsigned char* buffer = *reinterpret_cast<unsigned char**>(state_global);
+    if (!buffer) return;
+    for (uint64_t slot : slots) {
+        if (slot < kSimulationStateSize) buffer[slot] = static_cast<unsigned char>(value & 1u);
+    }
+}
+
+/* Scans the model for the cycle counter: every aligned u64 that reads as the
+   current cycle is a candidate, and one that goes up by exactly one on the next
+   cycle is the field.  Bounded to the first page, which is where the game's own
+   simulation structs live. */
+void probeCycleField() {
+    if (!cycle_probe || !model) return;
+    const int64_t cycle = mod.simulation.cycle();
+    if (cycle < 0 || cycle == probe_last_cycle) return;
+    const auto* base = static_cast<const unsigned char*>(model);
+    std::vector<size_t> hits;
+    for (size_t offset = 0; offset + 8 <= 0x800; offset += 8) {
+        int64_t value = 0;
+        std::memcpy(&value, base + offset, 8);
+        if (value == cycle) hits.push_back(offset);
+    }
+    if (probe_last_cycle >= 0 && cycle == probe_last_cycle + 1) {
+        for (size_t offset : hits) {
+            if (std::find(probe_candidates.begin(), probe_candidates.end(), offset) == probe_candidates.end()) continue;
+            probe_hits[offset] = {cycle - 1, cycle};
+        }
+    }
+    probe_candidates = hits;
+    probe_last_cycle = cycle;
+    if (probe_hits.empty()) return;
+    std::ostringstream text;
+    text << "cycle_field model=" << hex(model) << " candidates_this_cycle=" << hits.size() << "\n";
+    for (const auto& entry : probe_hits) {
+        text << "cycle_field offset=0x" << std::hex << entry.first << std::dec << " value=" << entry.second.first
+             << "->" << entry.second.second << "\n";
+    }
+    cycle_report = text.str();
+}
+
 bool hookedUpdate(void* m, void* context, void* input, uint32_t point,
                   uint8_t fifth) {
     model = m;
@@ -196,9 +384,14 @@ int interceptedSimDo(TCHookCall* call) {
 
 uint64_t hookedStateReadU64(int64_t index) {
     uint64_t value = state_read_original ? state_read_original(index) : 0;
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) -
+                             reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     std::lock_guard<std::mutex> lock(read_mutex);
     ++state_read_counts[index];
     state_read_last[index] = value;
+    ++state_read_callers[{index, caller}];
+    state_read_last_caller[index] = caller;
+    ++state_read_threads[{index, static_cast<uint32_t>(GetCurrentThreadId())}];
     return value;
 }
 
@@ -394,6 +587,40 @@ void finish() {
                 report << "\n";
             }
         }
+        if (deep_dump && wire_data && wires <= 64) {
+            for (uint64_t i = 0; i < wires; ++i) {
+                const auto* wire =
+                    static_cast<const unsigned char*>(wire_data) + 8 + i * 0x68;
+                int16_t x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                uint32_t width = 0;
+                uint64_t slot = 0;
+                std::memcpy(&x1, wire + 0x18, 2);
+                std::memcpy(&y1, wire + 0x1a, 2);
+                std::memcpy(&x2, wire + 0x1c, 2);
+                std::memcpy(&y2, wire + 0x1e, 2);
+                std::memcpy(&width, wire + 0x30, 4);
+                std::memcpy(&slot, wire + 0x38, 8);
+                report << "deep_wire " << i << " from=" << x1 << "," << y1 << " to=" << x2 << "," << y2
+                       << " width=" << width << " slot=" << slot << "\n";
+            }
+        }
+        if (deep_dump && component_data && components <= 64) {
+            for (uint64_t i = 0; i < components; ++i) {
+                const auto* component =
+                    static_cast<const unsigned char*>(component_data) + 8 + i * 0x238;
+                report << "deep_component " << i << " bytes=" << hexBytes(component, 0x1a0) << "\n";
+                for (size_t offset : {size_t{0x28}, size_t{0x30}, size_t{0x38}, size_t{0x40}}) {
+                    uint64_t value = 0;
+                    std::memcpy(&value, component + offset, 8);
+                    report << "deep_component " << i << " word@0x" << std::hex << offset << std::dec
+                           << "=" << value;
+                    if (readableRegion(reinterpret_cast<const void*>(value), 0x40)) {
+                        report << " pointee=" << hexBytes(reinterpret_cast<const unsigned char*>(value), 0x40);
+                    }
+                    report << "\n";
+                }
+            }
+        }
     }
 
     {
@@ -420,6 +647,56 @@ void finish() {
         }
     }
 
+    if (deep_dump) {
+        std::lock_guard<std::mutex> lock(read_mutex);
+        report << "main_thread=" << main_thread_id << "\n";
+        std::map<int64_t, std::pair<uint64_t, uint64_t>> by_slot;
+        for (const auto& entry : state_read_threads) {
+            const int64_t offset = entry.first.first;
+            const bool render = entry.first.second == main_thread_id;
+            auto& counts = by_slot[offset];
+            if (render) counts.first += entry.second;
+            else counts.second += entry.second;
+        }
+        report << "deep_read_slots=" << by_slot.size() << "\n";
+        uint64_t printed = 0;
+        for (const auto& entry : by_slot) {
+            if (printed++ >= 160) break;
+            report << "read_slot " << entry.first << " render=" << entry.second.first
+                   << " other=" << entry.second.second << "\n";
+        }
+        printed = 0;
+        report << "deep_read_callers=" << state_read_callers.size() << "\n";
+        for (const auto& entry : state_read_callers) {
+            if (printed++ >= 160) break;
+            report << "read_caller offset=" << entry.first.first << " caller_rva=0x" << std::hex
+                   << entry.first.second << std::dec << " calls=" << entry.second << "\n";
+        }
+    }
+
+    if (write_test) {
+        report << "write_test cycle=" << write_cycle << " slots=" << write_offsets.size() << "\n";
+        for (uint64_t offset : write_offsets) {
+            report << "write_slot " << offset << " marker=" << static_cast<int>(kWriteMarker)
+                   << " before=" << static_cast<int>(write_before[offset])
+                   << " after=" << static_cast<int>(write_after[offset])
+                   << " reads_after=" << write_reads_after[offset] << "\n";
+        }
+    }
+
+    if (drive_test) {
+        report << "drive_invert=" << (drive_invert ? 1 : 0) << " cycles=" << drive_cycles << "\n";
+        report << drive_log.str();
+    }
+    if (cycle_probe) {
+        report << "cycle_probe=1\n";
+        if (cycle_report.empty()) {
+            report << "cycle_field none: no aligned word in the first page tracked the cycle\n";
+        } else {
+            report << cycle_report;
+        }
+    }
+
     const auto folder = std::string(host->data_directory_utf8);
     std::ofstream(folder + "/state-map.txt") << report.str();
     log("sim-state: saved state-map.txt; snapshots=" +
@@ -433,9 +710,11 @@ static void frame(void*, const TCFrame* value) {
     if (!started) {
         started = true;
         start_time = value->time_seconds;
+        main_thread_id = static_cast<uint32_t>(GetCurrentThreadId());
     }
     elapsed = value->time_seconds - start_time;
     if (done || !model || elapsed < 5.0) return;
+    probeCycleField();
 
     if (stage == 0) {
         loadLevel();
@@ -500,6 +779,134 @@ static void frame(void*, const TCFrame* value) {
         return;
     }
 
+    if (stage == 4) {
+        if (!write_test) {
+            if (drive_test) {
+                stage = 6;
+                return;
+            }
+            finish();
+            return;
+        }
+        unsigned char* buffer = *reinterpret_cast<unsigned char**>(state_global);
+        if (!buffer) {
+            write_test = false;
+            finish();
+            return;
+        }
+        collectWriteTargets();
+        for (uint64_t offset : write_offsets) {
+            if (offset >= kSimulationStateSize) continue;
+            write_before[offset] = buffer[offset];
+            buffer[offset] = kWriteMarker;
+        }
+        write_cycle = mod.simulation.cycle();
+        stage = 5;
+        stage_time = elapsed;
+        log("sim-state: wrote marker into " + std::to_string(write_offsets.size()) +
+            " slots at cycle " + std::to_string(write_cycle));
+        mod.simulation.run(model, write_cycle + 2);
+        return;
+    }
+
+    if (stage == 5) {
+        const int64_t cycle = mod.simulation.cycle();
+        if (cycle < write_cycle + 2 && elapsed < stage_time + 10.0) return;
+        unsigned char* buffer = *reinterpret_cast<unsigned char**>(state_global);
+        for (uint64_t offset : write_offsets) {
+            write_after[offset] = buffer ? buffer[offset] : 0;
+            uint64_t reads = 0;
+            {
+                std::lock_guard<std::mutex> lock(read_mutex);
+                for (const auto& entry : state_read_threads) {
+                    if (entry.first.first == static_cast<int64_t>(offset)) reads += entry.second;
+                }
+            }
+            write_reads_after[offset] = reads;
+        }
+        if (drive_test) {
+            stage = 6;
+            return;
+        }
+        finish();
+        return;
+    }
+
+    /* S2: our engine drives the board's slots. */
+    if (stage == 6) {
+        const auto* board_bytes = static_cast<const unsigned char*>(model);
+        const tcsim::BoardView view = tcsim::readBoard(board_bytes);
+        tcsim::BuildOptions build_options;
+        build_options.gate_delay = tcsim::ArcDelay{tcsim::kTicksPerUnit, tcsim::kTicksPerUnit};
+        drive_build = tcsim::buildNetList(view, &prototypeGeometry, build_options);
+        drive_log << "netlist nets=" << drive_build.netlist.netCount()
+                  << " devices=" << drive_build.netlist.deviceCount()
+                  << " sources=" << drive_build.source_nets.size()
+                  << " observed=" << drive_build.observed_nets.size()
+                  << " unconnected_pins=" << drive_build.unconnected_pins
+                  << " fatal=" << (drive_build.fatal() ? 1 : 0) << "\n";
+        for (const tcsim::BuildNote& note : drive_build.notes) {
+            drive_log << "note: " << note.text << (note.fatal ? " [fatal]" : "") << "\n";
+        }
+        if (drive_build.fatal()) {
+            finish();
+            return;
+        }
+        drive_engine = new tcsim::Engine(drive_build.netlist, tcsim::EngineOptions{});
+        drive_remaining = drive_cycles;
+        stage = 7;
+        return;
+    }
+    if (stage == 7) {
+        if (!drive_engine) {
+            finish();
+            return;
+        }
+        const int64_t cycle = mod.simulation.cycle();
+        /* Feed the nets the game drives from the game's own array, run one
+           cycle of our simulator, then publish our values back. */
+        for (tcsim::NetId net : drive_build.source_nets) {
+            const uint64_t value = readNetByte(drive_build.slots_of_net[net]);
+            drive_engine->addStimulus(drive_engine->now(), net, tcsim::BitVector(1, value ? tcsim::Logic::kOne
+                                                                                          : tcsim::Logic::kZero));
+        }
+        drive_engine->runUntil(drive_engine->now() + tcsim::kTicksPerUnit * 8);
+        std::ostringstream row;
+        row << "cycle " << cycle << " engine=" << drive_engine->now();
+        for (size_t net_index = 0; net_index < drive_build.netlist.netCount(); ++net_index) {
+            const tcsim::NetId net = static_cast<tcsim::NetId>(net_index);
+            uint64_t value = drive_engine->netValue(net).size() && drive_engine->netValue(net)[0] == tcsim::Logic::kOne
+                                 ? 1
+                                 : 0;
+            const bool is_source = std::find(drive_build.source_nets.begin(), drive_build.source_nets.end(), net) !=
+                                   drive_build.source_nets.end();
+            if (drive_invert && !is_source) value ^= 1u;
+            const uint64_t before = readNetByte(drive_build.slots_of_net[net]);
+            writeNetByte(drive_build.slots_of_net[net], value);
+            const uint64_t after = readNetByte(drive_build.slots_of_net[net]);
+            row << " net" << net_index << "=" << value << " program=" << before << " read=" << after;
+        }
+        drive_log << row.str() << "\n";
+        if (--drive_remaining <= 0) {
+            delete drive_engine;
+            drive_engine = nullptr;
+            finish();
+            return;
+        }
+        drive_next_cycle = cycle + 1;
+        mod.simulation.run(model, drive_next_cycle);
+        stage = 8;
+        stage_time = elapsed;
+        return;
+    }
+    if (stage == 8) {
+        if (mod.simulation.cycle() < drive_next_cycle && elapsed < stage_time + 5.0) {
+            return;
+        }
+        stage = 7;
+        return;
+    }
+
     finish();
 }
 
@@ -509,6 +916,15 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     if (!mod.load(h) || !mod.valid() || !mod.components.valid()) return 2;
 
     const std::string folder = h->data_directory_utf8;
+    deep_dump = std::getenv("TC_SIM_STATE_DEEP") != nullptr;
+    write_test = std::getenv("TC_SIM_STATE_WRITE") != nullptr;
+    drive_test = std::getenv("TC_SIM_STATE_DRIVE") != nullptr;
+    drive_invert = std::getenv("TC_SIM_STATE_INVERT") != nullptr;
+    cycle_probe = std::getenv("TC_SIM_STATE_CYCLE") != nullptr;
+    if (const char* cycles = std::getenv("TC_SIM_STATE_CYCLES")) {
+        const int parsed = std::atoi(cycles);
+        if (parsed > 0) drive_cycles = parsed;
+    }
     {
         std::ifstream logic(folder + "/logic.txt");
         if (logic) std::getline(logic, custom_logic);

@@ -23,20 +23,20 @@ void log(const std::string& message) {
     if (host) host->log(host->context, message.c_str());
 }
 
-// The public TCPin* returned by the helpers needs +8 bytes to reach the real
-// 0x38-byte descriptor whose +2 holds the relative point (see docs/sdk/game-model.md).
+// Uses the public pin accessors only: the descriptor anchor and the word-size
+// field are what they exist to hide.  Re-running this probe is therefore also a
+// real-machine check of the wrapper - the dumped pin data must stay identical.
 void readPin(const tc::TCPrototype& prototype, bool input, uint64_t index,
              std::ostringstream& out) {
-    tc::TCPin* pin = input ? tc::prototypeInputPin(prototype, index)
-                           : tc::prototypeOutputPin(prototype, index);
-    if (!pin) return;
-    const auto* descriptor = reinterpret_cast<const unsigned char*>(pin) + 8;
-    int16_t x = 0;
-    int16_t y = 0;
-    memcpy(&x, descriptor + 2, sizeof(x));
-    memcpy(&y, descriptor + 4, sizeof(y));
-    out << " " << (input ? "in" : "out") << index << "=(" << x << "," << y
-        << ",w" << tc::pinWordSizeRaw(*pin) << ")";
+    const bool present = input ? tc::prototypeInputPin(prototype, index) != nullptr
+                               : tc::prototypeOutputPin(prototype, index) != nullptr;
+    if (!present) return;
+    const tc::TCPinPoint point = input ? tc::prototypeInputPinPoint(prototype, index)
+                                       : tc::prototypeOutputPinPoint(prototype, index);
+    const uint64_t word = input ? tc::prototypeInputPinWordSize(prototype, index)
+                                : tc::prototypeOutputPinWordSize(prototype, index);
+    out << " " << (input ? "in" : "out") << index << "=(" << point.x << "," << point.y
+        << ",w" << word << ")";
 }
 
 }  // namespace

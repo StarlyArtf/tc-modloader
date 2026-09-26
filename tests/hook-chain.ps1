@@ -15,9 +15,10 @@ $taskProbes=@{
   skip=@(@{dll='skip';id='dev.hook-chain-skip'})
   raw=@(@{dll='raw';id='dev.hook-chain-raw'})
   events=@(@{dll='events';id='dev.hook-chain-events'})
+  cursor=@(@{dll='cursor';id='dev.hook-chain-cursor'})
   crash=@(@{dll='crash';id='dev.hook-chain-crash'})
 }
-foreach($taskMode in @('chain','skip','raw','events','crash')) {
+foreach($taskMode in @('chain','skip','raw','events','cursor','crash')) {
   $taskFixture=Join-Path $taskRepo ('build\hook-chain-test-'+$taskMode+'-'+[guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force (Join-Path $taskFixture 'mods') | Out-Null
   Copy-Item (Join-Path $taskRepo 'build\hook-chain-host.exe') (Join-Path $taskFixture 'Turing Complete.exe')
@@ -49,6 +50,13 @@ foreach($taskMode in @('chain','skip','raw','events','crash')) {
     foreach($taskNeedle in @('Event source level\.load: ok','Event source sim\.do: ok','Event source scene\.change armed','Event source save armed')) {
       if($taskText -notmatch $taskNeedle) {throw "The loader did not arm an event source: $taskNeedle"}
     }
+  }
+  if($taskMode -eq 'cursor') {
+    # The engine's cursor calls are chain points now: the caller the chain hands
+    # over is what lets two Mods (the punch tape and the pin-order handles) share
+    # them, and an edit to the position must reach the game's own function.
+    if($taskText -notmatch 'Hook chain ig\.set_cursor_pos installed with 1 link') {throw 'The loader did not install the cursor chain'}
+    if($taskText -notmatch 'PASS cursor chain') {throw 'The cursor chain assertions did not pass'}
   }
   if($taskMode -eq 'crash') {
     $taskFault=Join-Path $taskFixture 'tc-modloader-data\fault.log'

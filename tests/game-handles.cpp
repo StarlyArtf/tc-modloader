@@ -9,8 +9,15 @@ int main(){
  require(handles.current(TC_GAME_OBJECT_BOARD,&first)==TC_HANDLE_OK,"current board unavailable");
  require(handles.resolve(&first,&resolved)==TC_HANDLE_OK&&resolved==&boardA,"first board did not resolve");
  require(handles.valid(&first)==1,"live board reported stale");
+ handles.beginFrame(10);uint64_t childGeneration=0;TCGameHandle component{};int componentValue=9;
+ require(handles.beginChildSnapshot(&first,10,&childGeneration)==TC_HANDLE_OK,"child snapshot did not bind to board/frame");
+ require(handles.issueChild(TC_GAME_OBJECT_COMPONENT,&componentValue,childGeneration,&component)==TC_HANDLE_OK,"component handle was not issued");
+ require(handles.resolve(&component,&resolved)==TC_HANDLE_OK&&resolved==&componentValue,"component handle resolved incorrectly");
+ handles.beginFrame(11);
+ require(handles.valid(&component)==0,"component handle survived its snapshot frame");
+ require(handles.valid(&first)==1,"advancing a child frame invalidated the Board handle");
  TCGameHandle wrong=first;wrong.kind=TC_GAME_OBJECT_WIRE;
- require(handles.resolve(&wrong,&resolved)==TC_HANDLE_ERR_KIND,"wrong handle kind accepted");
+ require(handles.resolve(&wrong,&resolved)==TC_HANDLE_ERR_STALE,"forged child handle accepted");
  handles.enterBoard(&boardB,20);
  require(handles.valid(&first)==0,"old generation remained valid");
  require(handles.current(TC_GAME_OBJECT_BOARD,&second)==TC_HANDLE_OK,"second board unavailable");
@@ -30,5 +37,5 @@ int main(){
  require(handles.leaveBoardOnSceneChange(90),"a later scene change kept the handle");
  require(handles.valid(&third)==0,"the handle survived leaving the level");
  require(handles.current(TC_GAME_OBJECT_BOARD,&third)==TC_HANDLE_ERR_UNAVAILABLE,"the registry still has a board after leaving");
- std::cout<<"PASS game handles: issue, resolve, type guard, generation invalidation, board-scene entry and scene leave\n";
+ std::cout<<"PASS game handles: Board lifetime plus frame-scoped Component/Wire issuance and invalidation\n";
 }

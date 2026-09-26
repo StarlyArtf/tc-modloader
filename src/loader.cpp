@@ -1,8 +1,17 @@
 #include "core.hpp"
 #include "compat.hpp"
 #include "native.hpp"
+#include "pin_order.hpp"
+#if defined(TC_PIN_PATCH_ONLY) || defined(TC_PIN_PATCH_PLUGIN)
+#include "io_state_cache.hpp"
+#include "preview_label_identity.hpp"
+#endif
 #include "saves.hpp"
-#ifdef TC_PIN_PATCH_ONLY
+#ifdef TC_PIN_PATCH_PLUGIN
+#include "../sdk/tc_mod_api.h"
+static const TCHost* pinPatchHost=nullptr;
+#endif
+#if defined(TC_PIN_PATCH_ONLY) && !defined(TC_PIN_PATCH_PLUGIN)
 /* Exported marker of the standalone patch build, so the loader's installer can
    tell this file apart from an unknown engine and simply replace it.  An export
    name is used rather than a string: the linker is free to pool literal
@@ -29,7 +38,15 @@ template<class T> T api(const char* name){auto p=GetProcAddress(engine,name);if(
 static std::unique_ptr<tc::Core> core;
 static std::unique_ptr<tc::NativeRuntime> nativeRuntime;
 static bool attempted=false, compatible=false, homeSeen=false, firstDraw=true;
+/* Filled in by DllMain before anything else runs; see save_boot.hpp. */
+static tc_save_boot::Result saveRedirect;
+/* The reason a game this loader cannot drive gets a native message box instead
+   of an in-game page: every RVA this build knows (the main menu's draw hook
+   among them) is stale in that situation, so the loader's own UI may never be
+   called at all.  Shown once per (loader version + game hash) - the marker file
+   it writes is also what support can ask for. */
 static bool managerOpen=false;
+static bool savesOpen=false;
 static bool boardSeen=false;
 static uint64_t homeLastSeen=0, boardLastSeen=0;
 static uint64_t pageOpenedAt=0;
@@ -37,6 +54,22 @@ static int debugFrames=0;
 static std::string error;
 static std::set<std::string> selected;
 static tc::fs::path gameRoot;
+static void reportUnsupportedBuild(const std::string& error){
+ try{
+  const std::string stamp=std::string(TC_MODLOADER_VERSION_STRING)+" "+
+      tc::hash(tc::read(gameRoot/L"Turing Complete.exe"))+" "+
+      tc::hash(tc::read(gameRoot/L"tc_game_engine.dll"));
+  const auto marker=tc::fs::path(gameRoot)/L"tc-modloader-data"/L"unsupported-build.txt";
+  bool show=true;
+  try{if(tc::fs::exists(marker)&&tc::read(marker)==stamp)show=false;}catch(...){}
+  try{tc::atomic(marker,stamp);}catch(...){}
+  if(!show)return;
+  const std::wstring text=L"TC Mod Loader 与这份游戏不匹配，本次运行不会加载任何 Mod。\n\n"+[&]{
+   std::wstring wide;for(char c:error)wide+=(wchar_t)(unsigned char)c;return wide;}()+
+   L"\n\n请安装与当前游戏版本匹配的加载器，或先运行安装器卸载加载器。\n详情见 tc-modloader-data\\loader.log。";
+  MessageBoxW(nullptr,text.c_str(),L"TC Mod Loader",MB_ICONWARNING|MB_OK|MB_SETFOREGROUND|MB_TOPMOST);
+ }catch(...){}
+}
 static std::unique_ptr<tc::SaveProfiles> saves;
 /* The log is append-only and a long session with a chatty mod can grow it without
    bound (the live game directory was at 6.9 MB when this was added), so it is
@@ -46,6 +79,9 @@ static std::unique_ptr<tc::SaveProfiles> saves;
    a plain append. */
 static constexpr uint64_t kLogLimit=8ull*1024*1024;
 static void log(const std::string& msg){try{
+#ifdef TC_PIN_PATCH_PLUGIN
+ if(pinPatchHost&&pinPatchHost->log){pinPatchHost->log(pinPatchHost->context,msg.c_str());return;}
+#endif
  static uint64_t written=0;static int sinceCheck=0;static bool measured=false;
  auto path=gameRoot/L"tc-modloader-data"/L"loader.log";
  if(!measured){measured=true;std::error_code error;written=gameRoot.empty()?0:tc::fs::file_size(path,error);if(error)written=0;}
@@ -266,6 +302,7 @@ static void hookTextUnformatted(const char* text,const char* text_end,int flags)
  }
  if(textUnformattedOriginal)textUnformattedOriginal(text,text_end,flags);
 }
+#if defined(TC_PIN_PATCH_ONLY) || defined(TC_PIN_PATCH_PLUGIN)
 /* Component previews: pin names that do not fit become a number and a table.
 
    Measured on this build: the bottom panel's component preview - the same
@@ -336,6 +373,7 @@ static int previewLabelBoxCount=0;
 static PreviewLabelBox previewLabelFresh[previewLabelBoxMax];
 static int previewLabelFreshCount=0;
 static unsigned long long previewLabelTick=0,previewLabelListTick=~0ull;
+static unsigned long long previewLabelTableTick=~0ull;
 static float previewLabelNumberScale=0.60f;
 static int previewLabelRings=1;
 /* The part of the panel the picture itself uses, numbers included: the table goes
@@ -360,6 +398,19 @@ static bool previewLabelFromEditor=false;
    waits for the picture to settle, so the change reads as a clean swap instead of
    one frame of overlapping names and a stale table. */
 static bool previewLabelPictureChanged=false;
+static bool previewLabelSamePin(const PreviewLabelBox& previous,
+                                const PreviewLabelBox& current){
+ return tc::preview_labels::samePin(
+  previous.hasBar,previous.pinX,previous.pinY,previous.outwardX,previous.outwardY,
+  previous.centreX,previous.centreY,
+  current.hasBar,current.pinX,current.pinY,current.outwardX,current.outwardY,
+  current.centreX,current.centreY);
+}
+static int previewLabelPreviousPin(const PreviewLabelBox& current){
+ for(int i=0;i<previewLabelBoxCount;++i)
+  if(previewLabelSamePin(previewLabelBoxes[i],current))return i;
+ return -1;
+}
 static float previewWindowFontScale(){
  void* window=previewGetCurrentWindow?previewGetCurrentWindow():nullptr;
  if(!window)return 1.f;
@@ -637,8 +688,8 @@ static void previewLabelTable(){
  if(setWindowFontScaleOriginal)setWindowFontScaleOriginal(restore);
 }
 /* Called for every name the preview draws: the first call of a new frame promotes
-   what the last frame collected, numbers the pins that do not fit and draws the
-   list. */
+   what the last frame collected and numbers its pins.  The list is drawn after
+   this frame has supplied all of its current names (see previewLabelPin). */
 static void previewLabelFrame(bool fromEditor){
  if(previewLabelListTick==previewLabelTick)return;
  previewLabelListTick=previewLabelTick;
@@ -651,10 +702,13 @@ static void previewLabelFrame(bool fromEditor){
  for(int i=0;i<previewLabelBoxCount;++i)previewLabelBoxes[i]=previewLabelFresh[i];
  previewLabelFreshCount=0;
  previewLabelNumber();
- if(!previewLabelFromEditor&&!changed)previewLabelTable();
+ /* The table is drawn after the last current-frame pin is collected below.
+    That lets an edited input/output name appear in this frame instead of
+    rendering the previous frame's cached text. */
+ if(changed)previewLabelTableTick=previewLabelTick;
 }
-static void previewLabelRemember(float centreX,float centreY,float width,float height,
-                                 const char* text){
+static int previewLabelRemember(float centreX,float centreY,float width,float height,
+                                const char* text){
  /* The bar the preview drew just before this name says where the pin is, which edge
     it is on and which way leads away from the part. */
  float pinX=centreX,pinY=centreY,outwardX=0.f,outwardY=0.f,barLength=0.f;
@@ -682,23 +736,26 @@ static void previewLabelRemember(float centreX,float centreY,float width,float h
   }
  }
  previewLabelBarPending=false;
+ PreviewLabelBox current{};
+ current.centreX=centreX;current.centreY=centreY;current.width=width;current.height=height;
+ current.hasBar=hasBar;
+ current.pinX=pinX;current.pinY=pinY;current.outwardX=outwardX;current.outwardY=outwardY;
+ current.barLength=barLength;
+ std::snprintf(current.text,sizeof(current.text),"%.63s",text);
  for(int i=0;i<previewLabelFreshCount;++i)
-  if(std::fabs(previewLabelFresh[i].centreX-centreX)<0.5f&&
-     std::fabs(previewLabelFresh[i].centreY-centreY)<0.5f){
+  if(previewLabelSamePin(previewLabelFresh[i],current)){
    previewLabelFresh[i].width=width;previewLabelFresh[i].height=height;
    std::snprintf(previewLabelFresh[i].text,sizeof(previewLabelFresh[i].text),"%.63s",text);
    previewLabelFresh[i].hasBar=hasBar;
    previewLabelFresh[i].pinX=pinX;previewLabelFresh[i].pinY=pinY;
    previewLabelFresh[i].outwardX=outwardX;previewLabelFresh[i].outwardY=outwardY;
    previewLabelFresh[i].barLength=barLength;
-   return;
+   return i;
   }
- if(previewLabelFreshCount>=previewLabelBoxMax)return;
+ if(previewLabelFreshCount>=previewLabelBoxMax)return -1;
  PreviewLabelBox& box=previewLabelFresh[previewLabelFreshCount++];
- box.centreX=centreX;box.centreY=centreY;box.width=width;box.height=height;box.number=0;
- box.hasBar=hasBar;
- box.pinX=pinX;box.pinY=pinY;box.outwardX=outwardX;box.outwardY=outwardY;box.barLength=barLength;
- std::snprintf(box.text,sizeof(box.text),"%.63s",text);
+ box=current;box.number=0;
+ return previewLabelFreshCount-1;
 }
 /* One pin of the preview: a name that does not fit its pin is not drawn there,
    the pin shows its number instead.  True means "drawn here", so the hook drops
@@ -716,14 +773,9 @@ static bool previewLabelPin(const char* text,bool fromEditor){
  /* Either signal says "this is the foundry's appearance editor": the call that
     draws its names, or the call that draws its pin bars. */
  previewLabelFrame(fromEditor||previewLabelBarEditor);
- previewLabelRemember(centreX,centreY,size.x,size.y,text);
- int number=0;
- for(int i=0;i<previewLabelBoxCount;++i)
-  if(std::fabs(previewLabelBoxes[i].centreX-centreX)<2.f&&
-     std::fabs(previewLabelBoxes[i].centreY-centreY)<2.f){
-  number=previewLabelBoxes[i].number;
-  break;
- }
+ const int freshIndex=previewLabelRemember(centreX,centreY,size.x,size.y,text);
+ const int previousIndex=freshIndex>=0?previewLabelPreviousPin(previewLabelFresh[freshIndex]):-1;
+ const int number=previousIndex>=0?previewLabelBoxes[previousIndex].number:0;
  if(previewLabelLogged<16){
   ++previewLabelLogged;
   char line[192];
@@ -738,16 +790,14 @@ static bool previewLabelPin(const char* text,bool fromEditor){
     the overlapping name this whole thing exists to remove - and its number appears
     on the next frame, when the pins are known. */
  if(number<=0){previewLabelPictureChanged=true;return true;}
+ /* The current prototype already contains edits made in the component panel.
+    Copy its text into the stable, numbered row before the table is drawn. */
+ std::snprintf(previewLabelBoxes[previousIndex].text,
+               sizeof(previewLabelBoxes[previousIndex].text),"%.63s",text);
  char label[16];
  std::snprintf(label,sizeof(label),"%d",number);
- float markerX=centreX,markerY=centreY;
- for(int i=0;i<previewLabelBoxCount;++i)
-  if(std::fabs(previewLabelBoxes[i].centreX-centreX)<2.f&&
-     std::fabs(previewLabelBoxes[i].centreY-centreY)<2.f){
-   markerX=previewLabelBoxes[i].markerX;
-   markerY=previewLabelBoxes[i].markerY;
-   break;
-  }
+ const float markerX=previewLabelBoxes[previousIndex].markerX;
+ const float markerY=previewLabelBoxes[previousIndex].markerY;
  const float restore=previewWindowFontScale();
  if(setWindowFontScaleOriginal)setWindowFontScaleOriginal(previewLabelNumberScale);
  /* The picture's own text is dim; a number has a single digit or two to be read
@@ -759,6 +809,21 @@ static bool previewLabelPin(const char* text,bool fromEditor){
  previewTextUnformatted(label,nullptr);
  if(previewPopStyleColor)previewPopStyleColor(1);
  if(setWindowFontScaleOriginal)setWindowFontScaleOriginal(restore);
+ /* For a label-only edit the pin count is unchanged.  At this point the last
+    expected pin has supplied its current text, so the table can use the live
+    names in the same rendered frame.  Structural pin changes still take the
+    normal one settling frame. */
+ if(!previewLabelFromEditor&&!previewLabelPictureChanged&&
+    previewLabelFreshCount>=previewLabelBoxCount&&
+    previewLabelTableTick!=previewLabelTick){
+  previewLabelTableTick=previewLabelTick;
+  V2 resume{};previewGetCursorScreenPos(&resume);
+  previewLabelTable();
+  /* Drawing the table at the end must not move the cursor seen by the game's
+     caller; the old first-pin placement was naturally overwritten by the next
+     pin's SetCursorPos, but the last pin has no such reset after it. */
+  previewSetCursorScreenPos(resume);
+ }
  return true;
 }
 /* ImGui's text entry point.  The preview reaches it through the engine's export
@@ -826,6 +891,112 @@ static void hookAddRectFilled(void* self,V2 minimum,V2 maximum,unsigned colour,
  }
  if(addRectFilledOriginal)addRectFilledOriginal(self,minimum,maximum,colour,rounding,flags);
 }
+#endif
+/* The left IO panel renders three cached sequences ("input state", "output
+   state" and the workshop's memory group) instead of reading the board, and
+   this build rebuilds them in exactly one place: load_level_frontend, which
+   calls get_io_states once while a level is loaded.  An edit made inside the
+   component workshop - a renamed pin, a pin added or removed - therefore never
+   reaches that panel until the level is loaded again, which is what "leave the
+   workshop and come back to see it" was.  The editor does call
+   reload_this_custom_prototype for such an edit, so that call is remembered
+   here and the cache is rebuilt right before the panel's next draw, through
+   the game's own get_io_states and its managed copy/destroy (string ownership
+   stays with the game).
+
+   This is loader-side rather than Mod-side because everything that reads the
+   panel - the panel itself, and a Mod that reorders its pins - depends on the
+   cache being the board's pins; an edit must not depend on which Mods are
+   enabled.  The rebuild happens before the pin order is applied, so the order
+   is re-applied to the fresh cache in the same frame.
+
+   These addresses and the context offsets in io_state_cache.hpp are pinned by
+   the executable compatibility hash, just like the preview call sites above. */
+#ifndef TC_PIN_PATCH_PLUGIN
+static constexpr uintptr_t TC_RELOAD_CUSTOM_PROTOTYPE_RVA=0x2e8cd0;
+static constexpr uintptr_t TC_BUILD_IO_STATE_VIEW_RVA=0x45ea20;
+static constexpr uintptr_t TC_GET_IO_STATES_RVA=0x2e50e0;
+static constexpr uintptr_t TC_COPY_IO_STATE_GROUP_RVA=0x2d8a10;
+static constexpr uintptr_t TC_DESTROY_IO_STATES_RVA=0x2d9060;
+static std::atomic<bool> ioStateNamesDirty{false};
+static void (*reloadCustomPrototypeOriginal)(void*)=nullptr;
+static void (*buildIoStateViewOriginal)(void*,void*,double,void*,double)=nullptr;
+static void hookReloadCustomPrototype(void* presenter){
+ if(reloadCustomPrototypeOriginal)reloadCustomPrototypeOriginal(presenter);
+ ioStateNamesDirty.store(true,std::memory_order_release);
+}
+static bool refreshIoStateCache(void* board,void* context){
+ /* Development aid: TC_MODLOADER_NO_IO_REFRESH=1 leaves the cache alone, so a
+    run that misbehaves with the rebuild can be compared against one without. */
+ if(GetEnvironmentVariableW(L"TC_MODLOADER_NO_IO_REFRESH",nullptr,0)>0)return false;
+ const auto base=reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+ const auto generate=reinterpret_cast<void(*)(void*,void*)>(base+TC_GET_IO_STATES_RVA);
+ const auto copy=reinterpret_cast<void(*)(void*,const void*)>(base+TC_COPY_IO_STATE_GROUP_RVA);
+ const auto destroy=reinterpret_cast<void(*)(void*)>(base+TC_DESTROY_IO_STATES_RVA);
+ if(!generate||!copy||!destroy)return false;
+ return tc::io_state_cache::refresh(board,context,generate,copy,destroy);
+}
+/* One detour for the panel's own build entry: first the cache an edit made
+   stale, then a Mod's pin order, then the panel. */
+static void hookBuildIoStateView(void* board,void* context,double height,
+                                 void* layout,double scale){
+ if(ioStateNamesDirty.exchange(false,std::memory_order_acq_rel)){
+  if(refreshIoStateCache(board,context))
+   log("IO panel cache rebuilt (a custom prototype was reloaded)");
+  else
+   log("IO panel cache rebuild failed: the game's io state helpers are missing");
+ }
+#ifndef TC_PIN_PATCH_ONLY
+ /* TC_SERVICE_PIN_ORDER.  The panel draws three cached sequences, and the order
+    of those elements *is* the order the player sees, so a Mod's order is
+    applied to the live array here - before the panel walks it, and after the
+    rebuild above (which puts the cache back into the panel's own order). */
+ tc::pin_order::store().apply(context);
+ /* Development aid.  TC_MODLOADER_PIN_ORDER_LOG=1 reports the first panels this
+    hook sees, so a Mod that reports "nothing to order" can be told apart from a
+    panel that never reached the hook; =dump or =2 adds the raw structure of the
+    cached groups whenever that structure changes, which is what the layout in
+    pin_order.hpp is read from (and what a rebuild that does not look like the
+    measured one shows up as). */
+ {
+  wchar_t mode[16]{};
+  const DWORD length=GetEnvironmentVariableW(L"TC_MODLOADER_PIN_ORDER_LOG",mode,16);
+  if(length>0&&length<16){
+   static int seen=0;
+   if(seen++<3)log(std::string("IO panel pin order: build_io_state_view context=")+
+                   std::to_string(reinterpret_cast<uintptr_t>(context)));
+   /* The raw structure is dumped whenever it *changes* (at most 24 times), not
+      only when asked for: a panel whose cached groups and the entries it draws
+      disagree is exactly the report this dump answers, and asking a player to
+      set an environment variable first is how the evidence gets lost. */
+   const bool dumpMode=true;
+   if(dumpMode){
+    static std::string previous;
+    static int dumps=0;
+    const std::vector<std::string> lines=tc::pin_order::store().describe(context);
+    bool hasEntries=false;
+    for(const std::string& line:lines)
+     if(line.find("count=")!=std::string::npos&&line.find("count=0")==std::string::npos)
+      hasEntries=true;
+    /* The shape, not the order: a rebuild with the same pins must not print
+       again, but one that adds, drops or re-lays a group must. */
+    std::string shape;
+    for(const std::string& line:lines){
+     const size_t at=line.find(" group ");
+     if(at!=std::string::npos)shape+=line.substr(at)+"\n";
+    }
+    if(hasEntries&&shape!=previous&&dumps<24){
+     previous=shape;
+     ++dumps;
+     for(const std::string& line:lines)log(line);
+    }
+   }
+  }
+ }
+#endif
+ if(buildIoStateViewOriginal)buildIoStateViewOriginal(board,context,height,layout,scale);
+}
+#endif
 /* Text is drawn from more than one thread in this build, so the hook only
    records; a frame's own thread flushes the record. */
 struct TextTraceRow {std::array<char,208> text{};};
@@ -916,8 +1087,49 @@ static void hookEndChild(){
  if(endChildOriginal)endChildOriginal();
  if(compatible&&nativeRuntime&&rva==TC_BOARD_TOOLBAR_END_RVA){
   try{nativeRuntime->boardToolFrame();}catch(const std::exception&e){log(std::string("Board tool error: ")+e.what());}catch(...){}
- }
 }
+}
+/* The top menu bar (TC_UI_SLOT_BOARD_MENU).  build_buttons draws the bar's own
+   entries with a style it pushes for the row: frame padding, rounding, item
+   spacing, window border hover padding and the three button colours.  The first
+   thing it does after the loop is pop that style (igPopStyleColor, RVA
+   0x45a43f), and that point is *unconditional* - unlike the label of the last,
+   optional "return to level" button, which is where the first attempt hooked and
+   never fired in a plain level.  The plugin controls are therefore drawn from the
+   pop's call site, before the pop runs, so they sit inside exactly that style
+   scope and - with the SameLine the runtime submits first - on the bar's own
+   row. */
+static void (*popStyleColorOriginal)(int)=nullptr;
+static void hookPopStyleColor(int count){
+ const auto rva=(uintptr_t)__builtin_return_address(0)-(uintptr_t)GetModuleHandleW(nullptr);
+ /* Development aid: list the style pops the menu bar itself makes, so the
+    unconditional one can be told apart from the optional buttons' labels. */
+ if(GetEnvironmentVariableW(L"TC_MODLOADER_LOG_MENU",nullptr,0)>0&&rva>=0x459000&&rva<0x45d000){
+  static std::set<uintptr_t> seen;
+  if(seen.size()<32&&seen.insert(rva).second){
+   char text[64];std::snprintf(text,sizeof(text),"0x%llx",(unsigned long long)rva);
+   log(std::string("igPopStyleColor from rva=")+text);
+  }
+ }
+ if(compatible&&nativeRuntime&&rva==TC_BOARD_MENU_END_RVA){
+  try{nativeRuntime->boardMenuFrame();}catch(const std::exception&e){log(std::string("Board menu error: ")+e.what());}catch(...){}
+ }
+ if(popStyleColorOriginal)popStyleColorOriginal(count);
+}
+#if defined(TC_PIN_PATCH_ONLY) || defined(TC_PIN_PATCH_PLUGIN)
+static bool pinPatchHooksReady=false;
+static bool installPinPatchHook(void* target,void* detour,void** original){
+ if(!target||!detour||!original)return false;
+#ifdef TC_PIN_PATCH_PLUGIN
+ return pinPatchHost&&pinPatchHost->create_hook&&
+        pinPatchHost->create_hook(pinPatchHost->context,target,detour,original)==0;
+#else
+ const MH_STATUS initialized=MH_Initialize();
+ if(initialized!=MH_OK&&initialized!=MH_ERROR_ALREADY_INITIALIZED)return false;
+ return MH_CreateHook(target,detour,original)==MH_OK&&MH_EnableHook(target)==MH_OK;
+#endif
+}
+#endif
 static void init(){if(attempted)return;attempted=true;wchar_t buf[32768];GetModuleFileNameW(nullptr,buf,32768);gameRoot=tc::fs::path(buf).parent_path();
  try{engine=GetModuleHandleW(L"tc_game_engine.dll");if(!engine)throw std::runtime_error("Original engine is missing");
  compatible=tc::hash(tc::read(buf))==TC_EXE_SHA && tc::hash(tc::read(gameRoot/L"tc_game_engine.dll"))==TC_ENGINE_SHA;
@@ -925,12 +1137,28 @@ if(!compatible)throw std::runtime_error("Unsupported game build. Reinstall a com
 log("Compatibility profile: " TC_COMPAT_PROFILE_ID " (game " TC_GAME_VERSION ")");
 #ifndef TC_PIN_PATCH_ONLY
  saves=std::make_unique<tc::SaveProfiles>(gameRoot);
- core=std::make_unique<tc::Core>(gameRoot);core->scan();selected=core->enabled_set();nativeRuntime=std::make_unique<tc::NativeRuntime>(*core,engine,[](const std::string& s){log(s);});log(std::string("TC Mod Loader ")+TC_MODLOADER_VERSION_STRING+"; ImGui "+api<const char*(*)()>("igGetVersion")());log("Isolated save directory: "+saves->path(tc_save_boot::profile).u8string());
+ core=std::make_unique<tc::Core>(gameRoot);core->scan();selected=core->enabled_set();nativeRuntime=std::make_unique<tc::NativeRuntime>(*core,engine,saves->path(tc_save_boot::profile),[](const std::string& s){log(s);});log(std::string("TC Mod Loader ")+TC_MODLOADER_VERSION_STRING+"; ImGui "+api<const char*(*)()>("igGetVersion")());log("Isolated save directory: "+saves->path(tc_save_boot::profile).u8string());
+ /* A session without the save redirect must not run native plugins: they write
+    into the profile the game is using, and that profile would be the player's
+    own.  Resource Mods are unaffected (they are file-level and applied from the
+    Mods page), the game starts, and both the log and the Mods page say why. */
+ if(saveRedirect.applied){
+  log("Save isolation applied: "+saves->path(tc_save_boot::profile).u8string());
+ }else{
+  log(std::string("Save isolation unavailable: ")+saveRedirect.reason);
+  log("This session runs with no save redirect and no native plugins; resource Mods still apply");
+  nativeRuntime->forcedSafeMode=std::string("存档隔离不可用：")+saveRedirect.reason;
+ }
 #else
  /* The standalone patch: nothing but the component preview's pin names.  No mods
     are scanned or loaded, and the player's own save profile is left alone. */
+#ifdef TC_PIN_PATCH_PLUGIN
+ log(std::string("TC Pin Names Mod v0.0.4; ImGui ")+api<const char*(*)()>("igGetVersion")());
+#else
  log(std::string("TC Pin Names patch; ImGui ")+api<const char*(*)()>("igGetVersion")());
 #endif
+#endif
+#ifndef TC_PIN_PATCH_PLUGIN
  if(void* endChild=reinterpret_cast<void*>(GetProcAddress(engine,"igEndChild"))){
    /* The rest of the loader initialises MinHook a little later; doing it here
       too is fine (it reports "already initialised" once that happened). */
@@ -941,6 +1169,61 @@ log("Compatibility profile: " TC_COMPAT_PROFILE_ID " (game " TC_GAME_VERSION ")"
    if(created==MH_OK&&MH_EnableHook(endChild)==MH_OK)log("Toolbar tool slot armed (igEndChild)");
   else log("Toolbar tool slot unavailable (igEndChild hook: "+std::string(MH_StatusToString(created))+")");
  }
+ if(void* popStyleColor=reinterpret_cast<void*>(GetProcAddress(engine,"igPopStyleColor"))){
+   const MH_STATUS mh=MH_Initialize();
+   const MH_STATUS created=(mh==MH_OK||mh==MH_ERROR_ALREADY_INITIALIZED)
+                               ?MH_CreateHook(popStyleColor,reinterpret_cast<void*>(hookPopStyleColor),reinterpret_cast<void**>(&popStyleColorOriginal))
+                               :mh;
+   if(created==MH_OK&&MH_EnableHook(popStyleColor)==MH_OK)log("Top menu bar slot armed (igPopStyleColor)");
+  else log("Top menu bar slot unavailable (igPopStyleColor hook: "+std::string(MH_StatusToString(created))+")");
+ }
+#ifndef TC_PIN_PATCH_ONLY
+ {
+  /* The IO panel's own build/draw entry: the loader's one detour there keeps
+     the cached IO states in step with edits made in the workshop, and applies a
+     Mod's pin order (TC_SERVICE_PIN_ORDER).  Both are this loader's business,
+     so no Mod has to hook this function - which is also why the pin-names Mod
+     can no longer be refused for wanting to. */
+  auto* base=reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+  void* reload=base+TC_RELOAD_CUSTOM_PROTOTYPE_RVA;
+  void* buildView=base+TC_BUILD_IO_STATE_VIEW_RVA;
+  const MH_STATUS mh=MH_Initialize();
+  const bool ready=(mh==MH_OK||mh==MH_ERROR_ALREADY_INITIALIZED);
+  const MH_STATUS reloadCreated=ready
+      ?MH_CreateHook(reload,reinterpret_cast<void*>(hookReloadCustomPrototype),reinterpret_cast<void**>(&reloadCustomPrototypeOriginal))
+      :mh;
+  const MH_STATUS viewCreated=ready
+      ?MH_CreateHook(buildView,reinterpret_cast<void*>(hookBuildIoStateView),reinterpret_cast<void**>(&buildIoStateViewOriginal))
+      :mh;
+  const bool reloadArmed=reloadCreated==MH_OK&&MH_EnableHook(reload)==MH_OK;
+  const bool viewArmed=viewCreated==MH_OK&&MH_EnableHook(buildView)==MH_OK;
+  if(viewArmed)log("IO panel armed (cache rebuild after a prototype reload + tc.pin_order)");
+  else log("IO panel unavailable (build_io_state_view hook: "+std::string(MH_StatusToString(viewCreated))+")");
+  if(!reloadArmed)
+   log("IO panel cache rebuild unavailable (reload hook: "+std::string(MH_StatusToString(reloadCreated))+")");
+ }
+#endif
+#ifdef TC_PIN_PATCH_ONLY
+ /* The standalone patch has no Mod loader and no pin-order service, so it
+    installs the same two panel hooks itself. */
+ {
+  auto* base=reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+  void* reload=base+TC_RELOAD_CUSTOM_PROTOTYPE_RVA;
+  void* buildView=base+TC_BUILD_IO_STATE_VIEW_RVA;
+  const bool reloadReady=installPinPatchHook(
+   reload,reinterpret_cast<void*>(hookReloadCustomPrototype),
+   reinterpret_cast<void**>(&reloadCustomPrototypeOriginal));
+  const bool viewReady=installPinPatchHook(
+   buildView,reinterpret_cast<void*>(hookBuildIoStateView),
+   reinterpret_cast<void**>(&buildIoStateViewOriginal));
+  if(reloadReady&&viewReady)
+   log("IO panel cache rebuild armed (input and output)");
+  else
+   log(std::string("IO panel cache rebuild unavailable (reload=")+
+       (reloadReady?"ok":"failed")+", view="+(viewReady?"ok":"failed")+")");
+  pinPatchHooksReady=pinPatchHooksReady&&reloadReady&&viewReady;
+ }
+#endif
  /* The text trace is armed before anything draws, so the first text the game
     submits in the tool column is already covered. */
  {
@@ -1026,9 +1309,12 @@ log("Compatibility profile: " TC_COMPAT_PROFILE_ID " (game " TC_GAME_VERSION ")"
     log("Fading label trace armed for \""+needle+"\" (fading_label_mesh.set_text)");
   else
    log("Fading label trace unavailable (fading_label_mesh.set_text hook failed)");
+  }
  }
+#endif
+#if defined(TC_PIN_PATCH_ONLY) || defined(TC_PIN_PATCH_PLUGIN)
 /* The component preview's pin names (see hookPreviewText): always armed, since
-   this is the feature rather than a probe. This part is in both builds. */
+   this is the feature rather than a probe. */
  {
  wchar_t table[32]{};
  const DWORD tableLength=GetEnvironmentVariableW(L"TC_MODLOADER_PIN_TABLE",table,32);
@@ -1039,9 +1325,9 @@ log("Compatibility profile: " TC_COMPAT_PROFILE_ID " (game " TC_GAME_VERSION ")"
  }
   void* text=reinterpret_cast<void*>(GetProcAddress(engine,"igText"));
   static void (*trampoline)(const char*,...)=nullptr;
-  if(text&&MH_CreateHook(text,reinterpret_cast<void*>(hookPreviewText),
-                         reinterpret_cast<void**>(&trampoline))==MH_OK&&
-     MH_EnableHook(text)==MH_OK){
+  const bool textReady=installPinPatchHook(text,reinterpret_cast<void*>(hookPreviewText),
+                                           reinterpret_cast<void**>(&trampoline));
+  if(textReady){
    previewTextV=reinterpret_cast<void(*)(const char*,va_list)>(GetProcAddress(engine,"igTextV"));
    previewTextUnformatted=reinterpret_cast<void(*)(const char*,const char*)>(GetProcAddress(engine,"igTextUnformatted"));
    previewCalcTextSize=reinterpret_cast<void(*)(V2*,const char*,const char*,bool,float)>(GetProcAddress(engine,"igCalcTextSize"));
@@ -1060,15 +1346,20 @@ log("Compatibility profile: " TC_COMPAT_PROFILE_ID " (game " TC_GAME_VERSION ")"
    log("Component preview pin names unavailable (igText hook failed)");
   /* The pin bars of that same preview (see hookAddRectFilled). */
   void* addRect=reinterpret_cast<void*>(GetProcAddress(engine,"ImDrawList_AddRectFilled"));
-  if(addRect&&MH_CreateHook(addRect,reinterpret_cast<void*>(hookAddRectFilled),
-                            reinterpret_cast<void**>(&addRectFilledOriginal))==MH_OK&&
-     MH_EnableHook(addRect)==MH_OK)
+  const bool barsReady=installPinPatchHook(addRect,reinterpret_cast<void*>(hookAddRectFilled),
+                                           reinterpret_cast<void**>(&addRectFilledOriginal));
+  if(barsReady)
    log("Component preview pin bars armed (thinner and shorter)");
-  else
+ else
    log("Component preview pin bars unavailable (ImDrawList_AddRectFilled hook failed)");
+  pinPatchHooksReady=textReady&&barsReady;
  }
-}
-}catch(const std::exception& e){error=e.what();log(error);}}
+ #endif
+}catch(const std::exception& e){error=e.what();log(error);
+ /* Anything that got this far is a loader/game mismatch the player has to know
+    about, and in-game pages cannot be trusted to appear (see the note above
+    reportUnsupportedBuild). */
+ reportUnsupportedBuild(error);}}
 static void text(const std::string& s){api<void(*)(const char*,const char*)>("igTextUnformatted")(s.c_str(),nullptr);}
 static bool button(const char* label,V2 size={0,0}){return api<bool(*)(const char*,V2)>("igButton")(label,size);}
 static void line(){api<void(*)()>("igSeparator")();}
@@ -1105,9 +1396,14 @@ static bool selectableRow(const std::string& label,bool selected,float width){re
 static void spacing(){api<void(*)()>("igSpacing")();}
 static bool collapsing(const char* label){return api<bool(*)(const char*,int)>("igCollapsingHeader_TreeNodeFlags")(label,0);}
 static V4 colGood(){return V4{0.40f,0.82f,0.50f,1.f};}
+/* Profile ids and paths the page shows as byte strings: they are ASCII by
+   construction (tc_save_boot::valid), so a wide-to-narrow copy is exact. */
+static std::string narrow(const wchar_t* text){std::string out;for(;text&&*text;++text)out+=(char)*text;return out;}
 static V4 colWarn(){return V4{0.95f,0.74f,0.34f,1.f};}
 static V4 colBad(){return V4{0.94f,0.42f,0.42f,1.f};}
 static V4 colInfo(){return V4{0.45f,0.72f,0.98f,1.f};}
+/* Defined with the Mod manager but drawn after it, from `draw()` itself. */
+static void savesManagerUi(float scale,bool& requestClose);
 
 /* Development helper: dump what the game is showing (the GL backbuffer) as a
    32-bit BMP, so the loader's own pages can actually be looked at.  Outside
@@ -1172,9 +1468,8 @@ static void devShotTick(){
 /* Two panes: the package list on the left, the picked package on the right.
    Everything the old page showed is still here - it is just laid out instead of
    stacked as one column of text. */
-static void modsManagerUi(float scale, bool& requestClose){
+static void modsManagerUi(float scale, bool& requestClose, bool& openSaves){
  static std::string picked;
- static bool showSaves=false;
  const float width=api<float(*)()>("igGetWindowWidth")();
  const float footer=118.f*scale;
  const float toolbar=34.f*scale;
@@ -1185,6 +1480,14 @@ static void modsManagerUi(float scale, bool& requestClose){
  same();textDim("   NATIVE API 1");
  if(core){same();textDim("         "+std::to_string(core->mods.size())+" 个 Mod · 已勾选 "+std::to_string(selected.size())+" · 异常 "+std::to_string(broken));}
  textDim("把 .mod 放进游戏目录的 mods 文件夹，重新打开此页即可识别；勾选后点「应用更改」，重启游戏才生效。");
+ /* The two ways this session can run without native plugins, both said out loud
+    instead of leaving the player with a list of Mods that never loads. */
+ if(!saveRedirect.applied)
+  textColor(colBad(),std::string("存档隔离不可用：")+saveRedirect.reason+
+                    "。本次运行没有重定向存档、也没有加载任何原生插件（资源 Mod 仍生效）。"
+                    "这通常意味着游戏更新了：请重新安装与当前版本匹配的加载器。");
+ else if(nativeRuntime&&!nativeRuntime->forcedSafeMode.empty())
+  textColor(colWarn(),nativeRuntime->forcedSafeMode+"。本次运行未加载原生插件。");
  spacing();
  /* Toolbar */
  if(button("刷新列表",{92.f*scale,toolbar})){try{if(core){core->scan();selected=core->enabled_set();picked.clear();}error.clear();}catch(const std::exception&e){error=e.what();}}
@@ -1279,20 +1582,14 @@ static void modsManagerUi(float scale, bool& requestClose){
   }
   api<void(*)()>("igEndChild")();
  }
- line();
- /* Saves live in a collapsible section: always reachable, never in the way. */
- if(saves){
-  showSaves=collapsing("存档（已隔离）");
-  if(showSaves){
-   textDim("当前："+saves->path(tc_save_boot::profile).u8string());
-   if(button("导入原版存档（新副本）",{186.f*scale,toolbar})){
-    try{auto id=saves->import_original();core->notice="导入并校验成功。重启游戏后使用新副本；当前 Mod 存档和原版存档均保留。";error.clear();log("Imported original saves into "+saves->path(id).u8string());}catch(const std::exception&e){error=e.what();}
-   }
-   same();if(button("打开当前存档",{132.f*scale,toolbar}))ShellExecuteW(nullptr,L"open",saves->path(tc_save_boot::profile).c_str(),nullptr,nullptr,SW_SHOWNORMAL);
-   textDim("导入前请关闭原版游戏；只复制本机存档，不合并、不覆盖。");
-   try{auto next=saves->next();if(next!=tc_save_boot::profile)textColor(colWarn(),"待重启切换："+tc::fs::path(next).u8string());}catch(const std::exception&e){error=e.what();}
+  line();
+  /* Save profiles moved out of this page into their own main-menu entry: one
+     line here keeps the old path discoverable without two pages maintaining the
+     same list. */
+  if(saves){
+   textDim("存档（已隔离）："+narrow(tc_save_boot::profile));
+   same();if(button("存档管理 →",{112.f*scale,toolbar}))openSaves=true;
   }
- }
  /* Footer: unsaved hint + the two actions + one status line. */
  if(core&&selected!=core->enabled_set())textColor(colWarn(),"有未保存的勾选：点「应用更改」后重启游戏生效。");
  if(button("应用更改",{120.f*scale,toolbar})){try{if(!core)throw std::runtime_error("Loader backend unavailable");core->apply(selected);selected=core->enabled_set();core->notice="更改已保存。请关闭并重新启动游戏，让所有修改完整生效。";error.clear();log("Applied selected Mods");}catch(const std::exception&e){error=e.what();log(error);}}
@@ -1355,7 +1652,14 @@ static void draw(){
  api<void(*)(float)>("igSetWindowFontScale")(scale);
  setpos({w-180*scale,24*scale});
  logButtonRect("Mods",w-180*scale,24*scale,150*scale,46*scale);
- if(button("Mods",{150*scale,46*scale})) {if(core){core->scan();selected=core->enabled_set();}managerOpen=true;debugFrames=5;api<void(*)(const char*,int)>("igOpenPopup_Str")("Mod 管理###TCMods",0);log("Manager opened");}
+ if(button("Mods",{150*scale,46*scale})) {if(core){core->scan();selected=core->enabled_set();}managerOpen=true;savesOpen=false;debugFrames=5;api<void(*)(const char*,int)>("igOpenPopup_Str")("Mod 管理###TCMods",0);log("Manager opened");}
+ /* The save manager is the loader's second own entry: same size, one slot under
+    Mods, and the plugin-registered pages shift down by one.  Having it as its
+    own page is what keeps the Mod list about Mods. */
+ const float savesY=(24.f+56.f)*scale;
+ setpos({w-180*scale,savesY});
+ logButtonRect("Saves",w-180*scale,savesY,150*scale,46*scale);
+ if(button("存档",{150*scale,46*scale})) {savesOpen=true;managerOpen=false;debugFrames=5;api<void(*)(const char*,int)>("igOpenPopup_Str")("存档管理###TCSaves",0);log("Save manager opened");}
  /* Development convenience: open the manager without a click, so a screenshot
     run does not need synthetic mouse input (TC_MODLOADER_OPEN=1). */
  if(!managerOpen&&core&&homeSeen){
@@ -1376,7 +1680,7 @@ static void draw(){
  if(core&&nativeRuntime){
   auto pages=nativeRuntime->pages();
   for(size_t i=0;i<pages.size();++i){
-   const float y=(24.f+56.f*(float)(i+1))*scale;
+   const float y=(24.f+56.f*(float)(i+2))*scale;
    setpos({w-180*scale,y});
    logButtonRect(pages[i].id,w-180*scale,y,150*scale,46*scale);
    auto push=api<void(*)(const char*)>("igPushID_Str");
@@ -1387,7 +1691,7 @@ static void draw(){
   }
  }
  api<void(*)(float)>("igSetWindowFontScale")(1.f);
- api<void(*)(V2,int)>("igSetNextWindowSize")({std::min(w-30.f,1000*scale),std::min(h-40.f,740*scale)},1);
+ api<void(*)(V2,int)>("igSetNextWindowSize")({std::min(w-24.f,1120*scale),std::min(h-24.f,820*scale)},1);
  api<void(*)(V2,int,V2)>("igSetNextWindowPos")({w/2,h/2},1,{0.5f,0.5f});
  api<void(*)(float)>("igSetNextWindowBgAlpha")(1.f);
  bool open=true;
@@ -1421,15 +1725,335 @@ static void draw(){
  }
  if(debugFrames>0){--debugFrames;log(std::string("Popup frame: home=")+(homeSeen?"1":"0")+" visible="+(visible?"1":"0"));}
  if(!open)managerOpen=false;
-  if(visible) {
-   api<void(*)(float)>("igSetWindowFontScale")(0.62f*scale);
-   bool requestClose=false;
-   modsManagerUi(scale,requestClose);
-   if(requestClose){managerOpen=false;api<void(*)()>("igCloseCurrentPopup")();}
-   api<void(*)()>("igEndPopup")();
+ if(visible) {
+  api<void(*)(float)>("igSetWindowFontScale")(0.62f*scale);
+  bool requestClose=false;
+  bool openSaves=false;
+  modsManagerUi(scale,requestClose,openSaves);
+  if(requestClose){managerOpen=false;api<void(*)()>("igCloseCurrentPopup")();}
+  if(openSaves){
+   managerOpen=false;savesOpen=true;
+   api<void(*)()>("igCloseCurrentPopup")();
+   api<void(*)(const char*,int)>("igOpenPopup_Str")("存档管理###TCSaves",0);
   }
+  api<void(*)()>("igEndPopup")();
+ }
+ /* The save manager: its own modal, its own entry, the same size as the Mod
+    one so the two pages cannot fight over the screen. */
+ api<void(*)(V2,int)>("igSetNextWindowSize")({std::min(w-30.f,1000*scale),std::min(h-40.f,740*scale)},1);
+ api<void(*)(V2,int,V2)>("igSetNextWindowPos")({w/2,h/2},1,{0.5f,0.5f});
+ api<void(*)(float)>("igSetNextWindowBgAlpha")(1.f);
+ bool savesModal=true;
+ bool savesVisible=api<bool(*)(const char*,bool*,int)>("igBeginPopupModal")("存档管理###TCSaves",&savesModal,2|32);
+ static int savesFrames=0;
+ if(savesVisible){
+  ++savesFrames;
+  if(shotPath&&savesFrames==8){
+   const bool ok=captureFrame(shotPath);
+   log(ok?"Captured save manager screenshot":"Screenshot failed");
+  }
+ }
+ if(!savesModal)savesOpen=false;
+ if(savesVisible){
+  api<void(*)(float)>("igSetWindowFontScale")(0.62f*scale);
+  bool savesClose=false;
+  savesManagerUi(scale,savesClose);
+  if(savesClose){savesOpen=false;api<void(*)()>("igCloseCurrentPopup")();}
+  api<void(*)()>("igEndPopup")();
+ }
+ /* Development convenience: open the save manager without a click, so a
+    screenshot run needs no synthetic mouse input (TC_MODLOADER_OPEN_SAVES=1). */
+ if(!savesOpen&&core&&homeSeen){
+  static bool savesEnvDone=false,savesWanted=false;
+  static int savesHomeFrames=0;
+  if(!savesEnvDone){
+   savesEnvDone=true;
+   wchar_t buffer[8]{};
+   savesWanted=GetEnvironmentVariableW(L"TC_MODLOADER_OPEN_SAVES",buffer,8)>0;
+  }
+  if(savesWanted&&++savesHomeFrames>60){
+   savesWanted=false;savesOpen=true;debugFrames=5;
+   api<void(*)(const char*,int)>("igOpenPopup_Str")("存档管理###TCSaves",0);
+   log("Save manager opened (auto)");
+  }
+ }
  if(firstDraw){firstDraw=false;log("Main menu Mods button rendered");}
 }
+/* ---- save profile manager UI ---------------------------------------------
+   Opened from the loader's own 存档 button on the main menu.  Every frame the
+   popup is up the page walks the profiles directory again, so the list cannot
+   drift from disk and the loader keeps no profile state of its own.  "本次运行"
+   is the profile this process redirected to at boot, "下次启动" is what
+   saves.ini says - the same restart semantics the Mod list already has. */
+static std::string humanBytes(unsigned long long bytes){
+ char text[32]{};
+ if(bytes>=1024ULL*1024*1024)std::snprintf(text,sizeof(text),"%.2f GB",(double)bytes/(1024.0*1024*1024));
+ else if(bytes>=1024ULL*1024)std::snprintf(text,sizeof(text),"%.1f MB",(double)bytes/(1024.0*1024));
+ else std::snprintf(text,sizeof(text),"%llu KB",bytes/1024);
+ return std::string(text);
+}
+/* A path that has to fit one line: keep both ends, which is what identifies a
+   profile ("…\Turing Complete Mods\profiles\default"). */
+static std::string elideMiddle(const std::string& text,size_t limit=52){
+ if(text.size()<=limit)return text;
+ const size_t head=(limit-3)/3,tail=limit-3-head;
+ return text.substr(0,head)+"..."+text.substr(text.size()-tail);
+}
+static void savesManagerUi(float scale,bool& requestClose){
+ static std::string picked,notice,renameFor;
+ static char renameText[80]{};
+ static bool confirming=false;
+ /* The list and the report used to be rebuilt on every frame the page was up:
+    walking every profile (the live one has 139 circuit files), reading
+    saves.ini twice and re-parsing every Mod package per scan.  Measured while a
+    player had the page open, that is a stutter on every frame.  Now the list is
+    refreshed on open, on the button, or when the profiles directory itself
+    changes (one stat per frame), and each profile's report is scanned once and
+    kept for the session. */
+ static std::vector<tc::SaveProfiles::Entry> entries;
+ static std::map<std::string,tc::SaveReport> reports;
+ static std::string selectedId;
+ static tc::fs::file_time_type entriesStamp{};
+ static bool entriesReady=false,refreshWanted=true,haveStamp=false;
+ static std::map<std::string,std::string> installed;
+ static std::set<std::string> enabled;
+ static bool modsKnown=false;
+ const float toolbar=34.f*scale,footer=104.f*scale;
+ const float width=api<float(*)()>("igGetWindowWidth")();
+ textColor(colInfo(),std::string("存档管理"));
+ std::string currentPath,nextId,trashNote;
+ if(saves){
+  bool stale=refreshWanted||!entriesReady;
+  if(!stale&&haveStamp){
+   std::error_code error;
+   const auto now=tc::fs::last_write_time(saves->profiles,error);
+   stale=error||now!=entriesStamp;
+  }
+  if(stale){
+   try{
+    const unsigned long long started=GetTickCount64();
+    entries=saves->list();
+    currentPath=saves->path(tc_save_boot::profile).u8string();
+    const std::wstring selected=saves->next();
+    selectedId=std::string(selected.begin(),selected.end());
+    const auto trashed=saves->trash();
+    if(!trashed.empty())trashNote="回收站 "+std::to_string(trashed.size())+" 份";
+    std::error_code error;
+    entriesStamp=tc::fs::last_write_time(saves->profiles,error);
+    haveStamp=!error;
+    entriesReady=true;refreshWanted=false;
+    log("Save profiles refreshed: "+std::to_string(entries.size())+" profiles, "+
+        std::to_string(GetTickCount64()-started)+" ms");
+   }catch(const std::exception&e){notice=e.what();}
+  }
+ }
+ /* Read from the cache: saves.ini is only touched by the refresh above, so a
+    switch made here shows up after the list is refreshed, exactly like the file
+    the next start will read. */
+ nextId=selectedId;
+ same();textDim("   "+std::to_string(entries.size())+" 个副本"+(trashNote.empty()?"":"   ·   "+trashNote));
+ /* Ids on this line, the full path in the details pane: a wrapped absolute path
+    here pushed the list down and read like part of it. */
+ textDim("本次运行："+narrow(tc_save_boot::profile));
+ if(nextId!=narrow(tc_save_boot::profile))
+  textColor(colWarn(),"下次启动将使用："+nextId+"（重启游戏后生效）");
+ else textDim("切换、新建与导入都在重启后生效；删除会移入回收站，不直接销毁。");
+ spacing();
+ if(button("刷新",{72.f*scale,toolbar})){notice.clear();refreshWanted=true;reports.clear();modsKnown=false;}
+ same();if(button("新建存档",{128.f*scale,toolbar})){
+  try{const auto id=saves->create();saves->select(id);notice="已新建 "+std::string(id.begin(),id.end())+"，重启游戏后使用";confirming=false;refreshWanted=true;reports.clear();}
+  catch(const std::exception&e){notice=e.what();}
+ }
+ same();if(button("导入原版存档",{196.f*scale,toolbar})){
+  try{const auto id=saves->import_original();notice="已导入为 "+std::string(id.begin(),id.end())+"，重启游戏后使用";confirming=false;refreshWanted=true;reports.clear();}
+  catch(const std::exception&e){notice=e.what();}
+ }
+ same();if(button("打开当前文件夹",{224.f*scale,toolbar})){
+  if(saves)ShellExecuteW(nullptr,L"open",saves->path(tc_save_boot::profile).c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+ }
+ line();
+ /* Stacked, not side by side: the pane split depends on the popup's own width,
+    which varies with the player's window, and at the smaller sizes the details
+    column ran off the popup.  A full-width list with the details underneath
+    reads the same at every size. */
+ const float listHeight=-footer-380.f*scale;
+ if(picked.empty()&&!entries.empty())picked=std::string(entries.front().id.begin(),entries.front().id.end());
+ if(api<bool(*)(const char*,V2,int,int)>("igBeginChild_Str")("TCSaveList",{0,listHeight},0,0)){
+  if(!saves)textDim("存档后端不可用。");
+  else if(entries.empty())textDim("还没有存档副本。用「新建存档」开一份新的，或用「导入原版存档」把原版进度复制过来。");
+  else for(auto& entry:entries){
+   const std::string id(entry.id.begin(),entry.id.end());
+   api<void(*)(const char*)>("igPushID_Str")(id.c_str());
+   std::string label=id;
+   if(entry.current)label+="   本次运行";
+   else if(entry.selected)label+="   下次启动";
+   if(entry.imported)label+="   导入副本";
+   const bool isPicked=picked==id;
+   if(entry.current)pushStyleColor(0,colGood());
+   if(selectableRow(label,isPicked,width*0.5f)){picked=id;confirming=false;}
+   if(entry.current)popStyleColor();
+   /* Under the name, not beside it: a right-aligned run of these values ran
+      past the list pane and printed inside the details pane.  Kept short for the
+      same reason: an ImGui child clips what is drawn *after* it, not text that
+      started inside it. */
+   std::string when=entry.modified.empty()?"时间未知":entry.modified;
+   if(when.size()>11)when=when.substr(5);   /* "YYYY-" dropped: the pane is narrow */
+   same();textDim("      "+humanBytes(entry.bytes)+" · "+std::to_string(entry.files)+" 文件 · "+when);
+   api<void(*)()>("igPopID")();
+  }
+  api<void(*)()>("igEndChild")();
+ }
+ if(api<bool(*)(const char*,V2,int,int)>("igBeginChild_Str")("TCSaveDetails",{0,-footer},0,0)){
+  tc::SaveProfiles::Entry* entry=nullptr;
+  for(auto& candidate:entries)if(picked==std::string(candidate.id.begin(),candidate.id.end()))entry=&candidate;
+  if(!entry)textDim("在左侧点一个存档，这里显示详情与操作。");
+  else{
+   const std::string id(entry->id.begin(),entry->id.end());
+   textColor(colInfo(),id);
+   /* One short line each, and the operations stacked one per line: at the
+      player's own window size this pane is around 300 px wide, and a row of
+      buttons plus a wrapped absolute path ran off the page (measured, then
+      this layout). */
+   textDim(elideMiddle(entry->path.u8string(),26));
+   std::string when=entry->modified.empty()?"时间未知":entry->modified;
+   if(when.size()>11)when=when.substr(5);       /* the pane is ~26 glyphs wide */
+   textDim(humanBytes(entry->bytes)+" · "+std::to_string(entry->files)+" 文件 · "+when);
+   if(entry->current)textColor(colGood(),"● 本次运行正在使用这一份");
+   else if(entry->selected)textColor(colWarn(),"● 下次启动会使用这一份（重启后生效）");
+   else textDim("○ 未使用");
+   /* The dependency answer goes right under the name: it is the reason the page
+      exists, and at the player's window size the detailed list below the
+      operations can need a scroll.  Compute first, then draw the summary here
+      and the breakdown at the end. */
+   /* Scanned once per profile per session: the scan decompresses every circuit in
+      the profile (~150 ms for a played-through one), which is fine on a click but
+      was not fine on every frame or on every selection change. */
+   std::string summary;
+   auto scanNow=[&]{
+    const unsigned long long started=GetTickCount64();
+    tc::TypeRegistry registry(core->dir/L"registry.json");
+    if(!modsKnown&&core){
+     for(auto& mod:core->mods)installed[mod.id]=mod.version;
+     enabled=core->enabled_set();
+     modsKnown=true;
+    }
+    reports[id]=tc::buildReport(tc::scanProfile(saves->path(entry->id),registry),registry,
+                                installed,enabled);
+    log("Dependency scan "+id+": "+std::to_string(reports[id].scan.circuits)+" circuits, "+
+        std::to_string(GetTickCount64()-started)+" ms");
+   };
+   /* One automatic scan per page session (the profile that is selected when the
+      page opens); switching rows then shows what is cached and offers the
+      button.  The scan costs a few hundred ms on a played-through profile, which
+      is a hitch worth spending once, not on every click. */
+   if(!reports.count(id)&&reports.empty()){
+    try{scanNow();}
+    catch(const std::exception&e){notice=e.what();}
+   }
+   const tc::SaveReport* report=reports.count(id)?&reports.at(id):nullptr;
+   const bool reportReady=report!=nullptr;
+   if(reportReady){
+    if(report->missing)summary+="缺失 "+std::to_string(report->missing)+" 项";
+    if(report->disabled)summary+=std::string(summary.empty()?"":" · ")+"未启用 "+std::to_string(report->disabled)+" 项";
+    if(report->versionMismatch)summary+=std::string(summary.empty()?"":" · ")+"版本不同 "+std::to_string(report->versionMismatch)+" 项";
+    if(summary.empty())summary="用到的 Mod 都装好并启用了";
+   }
+   if(reportReady)
+    textColor(report->missing?colBad():(report->disabled||report->versionMismatch)?colWarn():colGood(),
+              "Mod 依赖："+summary);
+   else textDim("Mod 依赖：未扫描（点下面的「重新扫描」）");
+   spacing();
+   /* Auto-sized: the player's own window decides the popup width, and a fixed
+      button size clipped its Chinese label at the smaller ones (measured, after
+      two rounds of guessing at glyph widths). */
+   if(entry->current){api<void(*)(bool)>("igBeginDisabled")(true);button("已在使用");api<void(*)()>("igEndDisabled")();}
+   else if(button("切换")){
+    try{saves->select(entry->id);notice="已选择 "+id+"，重启游戏后生效";confirming=false;refreshWanted=true;}
+    catch(const std::exception&e){notice=e.what();}
+   }
+   same();if(button("复制")){
+    try{const auto copy=saves->duplicate(entry->id);notice="已复制为 "+std::string(copy.begin(),copy.end());confirming=false;refreshWanted=true;reports.clear();}
+    catch(const std::exception&e){notice=e.what();}
+   }
+   same();if(button("打开"))ShellExecuteW(nullptr,L"open",entry->path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+   if(entry->current){api<void(*)(bool)>("igBeginDisabled")(true);button("删除");api<void(*)()>("igEndDisabled")();}
+   else if(!confirming){
+    same();if(button("删除")){confirming=true;notice="再点一次确认：删除 "+id+"（移入回收站）";}
+   }else{
+    pushStyleColor(0,colBad());
+    if(button("确认删除")){
+     try{saves->remove(entry->id);notice="已把 "+id+" 移入回收站";picked.clear();refreshWanted=true;reports.clear();}
+     catch(const std::exception&e){notice=e.what();}
+     confirming=false;
+    }
+    popStyleColor();
+   }
+   spacing();line();
+   if(renameFor!=id){renameFor=id;std::snprintf(renameText,sizeof(renameText),"%s",id.c_str());}
+   api<void(*)(float)>("igPushItemWidth")(150.f*scale);
+   const bool edited=api<bool(*)(const char*,char*,unsigned long long,int,void*,void*)>("igInputText")(
+       "##rename",renameText,sizeof(renameText),0,nullptr,nullptr);
+   api<void(*)()>("igPopItemWidth")();
+   same();if(button("重命名")&&edited){
+    try{
+     const std::string to(renameText);
+     const auto renamed=saves->rename(entry->id,std::wstring(to.begin(),to.end()));
+     notice="已重命名为 "+std::string(renamed.begin(),renamed.end());picked=to;confirming=false;refreshWanted=true;reports.clear();
+    }catch(const std::exception&e){notice=e.what();}
+   }
+   textWrapped("名字只能用小写字母、数字与短横线（最长 64 字符）。");
+   spacing();
+   spacing();line();
+   /* Which Mods this profile needs.  A circuit file only carries each custom
+      component's 64 bit id, so the answer is the id → Mod/type cache the loader
+      built while Mods registered (src/save_deps.hpp), joined with what is
+      installed and enabled right now.  Scanned on demand and remembered per
+      profile: the scan decompresses every circuit in the profile. */
+   textColor(colInfo(),"Mod 依赖");
+   same();
+   if(button(reportReady?"重新扫描":"扫描",{120.f*scale,toolbar})){
+    reports.erase(id);modsKnown=false;
+    try{scanNow();}catch(const std::exception&e){notice=e.what();}
+   }
+   if(reportReady){
+    textDim("扫了 "+std::to_string(report->scan.circuits)+" 个电路"+
+            (report->scan.skipped?"（跳过 "+std::to_string(report->scan.skipped)+"）":"")+
+            "，引用 "+std::to_string(report->scan.references)+" 次自定义元件");
+    size_t shown=0;
+    for(auto& item:report->dependencies){
+     if(shown++>=8){textDim("…还有 "+std::to_string(report->dependencies.size()-8)+" 项");break;}
+     /* Known ids carry the type and the Mod that provides it; a tag-only entry
+        comes from the heuristic half of the scan (an uninstalled Mod's type). */
+     const std::string label=item.known?(item.type.empty()?item.tag:item.type):item.tag;
+     if(!item.known){
+      textColor(colWarn(),"  未识别类型 "+label+"   （未安装的 Mod，或本机从未加载过）");
+     }else if(!item.installed){
+      textColor(colBad(),"  需要 "+label+"   ·   "+item.mod+
+                         (item.recordedVersion.empty()?"":" v"+item.recordedVersion)+"（未安装）");
+     }else if(!item.enabled){
+      textColor(colWarn(),"  "+label+"   ·   "+item.mod+" 已安装但未启用");
+     }else{
+      const bool differs=!item.recordedVersion.empty()&&!item.installedVersion.empty()&&
+                         item.recordedVersion!=item.installedVersion;
+      textColor(differs?colWarn():colGood(),
+                std::string("  ")+label+"   ·   "+item.mod+" v"+
+                (item.installedVersion.empty()?"?":item.installedVersion)+
+                (differs?"（存档记录 v"+item.recordedVersion+"）":""));
+     }
+    }
+    pushStyleColor(0,V4{0.60f,0.63f,0.70f,1.f});
+    textWrapped("电路文件里没有 Mod 清单：已知类型按加载器登记表（本机见过的注册）反查，"
+                "带标记的未知项只能按作者写的 8 字节标记显示。");
+    popStyleColor();
+   }
+  }
+  api<void(*)()>("igEndChild")();
+ }
+ if(!notice.empty())textColor(colWarn(),notice);
+ else textDim("删除只是移入回收站（trash-*），改回名字即可恢复。");
+ if(button("关闭",{96.f*scale,toolbar}))requestClose=true;
+}
+
 extern "C" __declspec(dllexport) bool igInvisibleButton(const char* id,V2 size,int flags){
  auto rva=(uintptr_t)__builtin_return_address(0)-(uintptr_t)GetModuleHandleW(nullptr);init();
  if(compatible){
@@ -1486,11 +2110,13 @@ extern "C" __declspec(dllexport) void igEnd(){
  auto rva=(uintptr_t)__builtin_return_address(0)-(uintptr_t)GetModuleHandleW(nullptr);init();
  devShotTick();
  flushTextTrace();
+#if defined(TC_PIN_PATCH_ONLY) || defined(TC_PIN_PATCH_PLUGIN)
  /* Frame boundary: the component preview's name list is rebuilt from here. */
  ++previewLabelTick;
+#endif
 const bool menuEnd=compatible&&rva==TC_MENU_END_RVA;
 #ifndef TC_PIN_PATCH_ONLY
-if(menuEnd){if(homeSeen||managerOpen){try{draw();}catch(const std::exception&e){log(e.what());}}homeSeen=false;}
+if(menuEnd){if(homeSeen||managerOpen||savesOpen){try{draw();}catch(const std::exception&e){log(e.what());}}homeSeen=false;}
 #endif
 api<void(*)()>("igEnd")();
 #ifndef TC_PIN_PATCH_ONLY
@@ -1516,11 +2142,42 @@ if(compatible&&nativeRuntime){
 (void)menuEnd;
 #endif
 }
+#ifdef TC_PIN_PATCH_PLUGIN
+static void pinPatchFrame(void*,const TCFrame*){++previewLabelTick;}
+extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host,TCPlugin* out){
+ if(!host||host->api_version!=TC_MOD_API_VERSION||host->size<TC_HOST_BASE_SIZE||
+    !host->create_hook||!host->engine_proc||!host->log||!out||out->size<sizeof(TCPlugin))
+  return 1;
+ pinPatchHost=host;
+ init();
+ const bool canReport=tc::hostHasField(host,offsetof(TCHost,report_status),
+                                       sizeof(host->report_status))&&host->report_status;
+ if(!compatible||!error.empty()||!pinPatchHooksReady){
+  if(canReport)
+   host->report_status(host->context,2,error.empty()?"补丁钩子安装失败":error.c_str());
+  return 2;
+ }
+ out->user=nullptr;
+ out->on_frame=pinPatchFrame;
+ out->on_unload=nullptr;
+ /* The panel's own live refresh belongs to the loader (it owns
+    build_io_state_view), so this package is only the preview side. */
+ if(canReport)host->report_status(host->context,0,"v0.0.4 已启用：引脚编号与名字对照表");
+ return 0;
+}
+#endif
 BOOL WINAPI DllMain(HINSTANCE h,DWORD reason,LPVOID){if(reason==DLL_PROCESS_ATTACH){DisableThreadLibraryCalls(h);
 #ifdef TC_PIN_PATCH_ONLY
  /* The patch does not redirect saves: the player's own profile stays where it is. */
  return TRUE;
 #else
- return tc_save_boot::attach()?TRUE:FALSE;
+ /* Never fail the load here.  This used to return FALSE when the save redirect
+    could not be applied, and because this DLL *is* the game's engine, a game
+    update turned into "the game does not start at all" with no way out except
+    uninstalling.  Now the result is recorded, logged by init(), and the session
+    runs in a degraded mode (see NativeRuntime::forcedSafeMode): the player's own
+    save path is left untouched and no native plugin runs against it. */
+ saveRedirect=tc_save_boot::attach();
+ return TRUE;
 #endif
 }return TRUE;}

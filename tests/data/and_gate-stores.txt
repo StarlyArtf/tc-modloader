@@ -1,0 +1,13 @@
+# The state writes of the emitted sandbox program for the and_gate board
+# (native-logic-source-1.txt of a real session, TC_MODLOADER_DUMP_SOURCE=1).
+# Rule: every `store(#SIMULATION_STATE + N, value_idM)` publishes node M into slot N,
+# so the slots that receive the same variable are one node:
+#   let value_id256 = input_replay[1] / store 256 / store 257  -> one node, two slots.
+store(#SIMULATION_STATE + 262, U1 (value_id262))
+store(#SIMULATION_STATE + 263, U1 (value_id263))
+store(#SIMULATION_STATE + 256, U1 (value_id256))
+store(#SIMULATION_STATE + 257, U1 (value_id256))
+store(#SIMULATION_STATE + 258, U1 (value_id258))
+store(#SIMULATION_STATE + 259, U1 (value_id258))
+store(#SIMULATION_STATE + 260, U1 (value_id260))
+store(#SIMULATION_STATE + 261, U1 (value_id260))

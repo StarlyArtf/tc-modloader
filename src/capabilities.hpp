@@ -17,7 +17,8 @@ inline uint64_t loader_capabilities() {
     return TC_CAP_LOG | TC_CAP_SYMBOL | TC_CAP_HOOK | TC_CAP_LOGIC |
            TC_CAP_COMPONENT | TC_CAP_UI_PAGE | TC_CAP_UI_SLOT |
            TC_CAP_TEXTURE | TC_CAP_STATUS | TC_CAP_SYMBOL_ALIAS |
-           TC_CAP_HOOK_CHAIN | TC_CAP_EVENTS | TC_CAP_GAME_HANDLES;
+           TC_CAP_HOOK_CHAIN | TC_CAP_EVENTS | TC_CAP_GAME_HANDLES |
+           TC_CAP_SERVICES;
 }
 
 /* Stable names, also the spelling used by mod.json's "capabilities" list. */
@@ -41,6 +42,7 @@ inline const std::vector<CapabilityName>& capability_table() {
         {"hook_chain", TC_CAP_HOOK_CHAIN},
         {"events", TC_CAP_EVENTS},
         {"game_handles", TC_CAP_GAME_HANDLES},
+        {"services", TC_CAP_SERVICES},
     };
     return value;
 }

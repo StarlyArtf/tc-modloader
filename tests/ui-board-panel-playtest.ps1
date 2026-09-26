@@ -97,7 +97,9 @@ if ($Example) {
   # only appears when the driver in the test build enters one).
   foreach ($taskExpected in @(
       'UI slot registered: main (board side panel)',
+      'UI slot registered: bar (top menu bar)',
       'Board panel: registered slot ''main''',
+      'Board panel: registered top menu bar item ''bar''',
       'Native loaded: example.board-panel')) {
     if (!$taskText.Contains($taskExpected)) {
       $taskLines | Select-Object -Last 20

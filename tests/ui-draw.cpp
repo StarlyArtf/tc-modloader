@@ -15,6 +15,11 @@ static void pop(void*) { ++pops; }
 static bool item(const char*,Vec2,int) { ++items; return true; }
 static bool yes() { return true; }
 static bool hovered(int) { return true; }
+/* The engine's InvisibleButton keeps reporting "held" while the button is down;
+   the canvas is supposed to turn that into one click per physical press, so the
+   stub can switch the press edge on and off independently of it. */
+static bool pressEdge = true;
+static bool mouseClicked(int, bool) { return pressEdge; }
 static void line(void*,Vec2 a,Vec2 b,Color,float) { ++lines; lastA=a; lastB=b; }
 static void poly(void*,const Vec2* p,int n,Color,int flags,float) {
     assert(flags==1); vertices.assign(p,p+n);
@@ -35,6 +40,7 @@ int main() {
     api.windowList=list; api.cursorScreen=origin; api.pushClip=push; api.popClip=pop;
     api.itemActive=yes; api.line=line; api.polyline=poly;
     table().invisibleButton=item; table().isItemHovered=hovered; table().getMousePos=origin;
+    table().isMouseClicked=mouseClicked;
     { Canvas invalid("bad",{-1,20}); assert(!invalid); }
     { Canvas invalid(nullptr,{20,20}); assert(!invalid); }
     assert(items==0 && pushes==0);
@@ -60,6 +66,11 @@ int main() {
         throw 1;
     } catch(int) {}
     assert(pushes==2 && pops==2 && items==1);
+    /* Held but not freshly pressed: the InvisibleButton still says yes, the canvas
+       must not report a click (a single press used to fire on every frame). */
+    pressEdge=false;
+    { Canvas held("held",{20,20}); assert(held && held.hovered() && !held.clicked()); }
+    pressEdge=true;
     assert(!loadDrawing(&host) && !drawingReady()); // failed reload clears stale bindings
     std::cout << "PASS drawing capability failure, coordinates, input snapshot, validation and clip cleanup\n";
 }

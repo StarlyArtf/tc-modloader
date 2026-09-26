@@ -175,6 +175,16 @@ static void draw(void*, const TCFrame* frame, float width, float height) {
 #endif
 }
 
+/* A control in the game's own top menu bar (TC_UI_SLOT_BOARD_MENU).  The host
+   draws it right after the game's own buttons, on the same line, and while the
+   bar's own button style (padding, rounding, spacing, colours) is still pushed -
+   so a plain tc::ui::button comes out looking like the bar's entries.  It drives
+   the same ping counter the side panel shows. */
+static void menuBarPing(void*, const TCFrame*, float, float) {
+    const std::string label = "Ping (bar) " + std::to_string(pings);
+    if (tc::ui::button(label.c_str())) ++pings;
+}
+
 extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
     if (!h || h->api_version != TC_MOD_API_VERSION || h->size < TC_HOST_BASE_SIZE || !out ||
         out->size < sizeof(TCPlugin))
@@ -199,6 +209,13 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
         return 4;
     }
     reportStatus("Board panel: registered slot 'main'", 0);
+    const int menuResult = tc::ui::registerMenuBarItem("bar", menuBarPing, nullptr, h);
+    if (menuResult != 0)
+        reportStatus("Board panel: registerMenuBarItem failed with " +
+                         std::to_string(menuResult),
+                     1);
+    else
+        reportStatus("Board panel: registered top menu bar item 'bar'", 0);
 #ifdef TC_BOARD_DRIVER
     if (!tc_board_driver::start(h, driverLog)) return 9;
     out->on_frame = tc_board_driver::tick;

@@ -62,8 +62,50 @@ inline const std::vector<SymbolEntry>& symbol_profile() {
          "bool(void*, void*, void*, uint32_t point, uint8_t colour); the board's per-frame wire handling"},
         {"save.count", "save_count__modelZsave_u11", TC_SYM_DATA,
          "const int64_t*; how many times the game has saved"},
+        /* The schematic writer.  The game calls it with the target path right
+           before it serializes the board; the loader hooks it so definitions hear
+           TC_LOGIC_SAVE before the file is written.  Evidence:
+           tests/component-storage-playtest.ps1 (the probe calls it to save) and
+           tests/component-placeholder-playtest.ps1 (a save made with a Mod
+           missing rewrites the file). */
+        {"save.schematic", "save_this_schematic__modelZboardZschematics_u132", TC_SYM_FUNCTION,
+         "void(const TCNimString* path, void* model, void* modelField, void* board, uint64_t setting)"},
         {"save.level", "save_level_data__modelZutilities_u5683", TC_SYM_FUNCTION,
          "void(void); the game writes the level save - the save event is derived from this call"},
+        {"board.undo", "undo_board__presenterZutilitiesZhelper95functions_u8367", TC_SYM_FUNCTION,
+         "uint8_t(void* board); game-native undo using the Board model at rcx (verified by disassembly)"},
+        /* The bottom drawer that describes the *selected* component - the panel
+           a player edits a Constant's label and value in.  Its fourth argument
+           is the component index the drawer is showing (measured by the
+           punch-tape example, which hooks the same function).  The loader hooks
+           it so a Mod can put its own editor rows inside that panel
+           (TC_UI_SLOT_BOARD_COMPONENT_PANEL). */
+        {"board.component_panel",
+         "build_component_description_panel__presenterZboard95uiZbottom95panelZcomponent95description_u1227",
+         TC_SYM_FUNCTION,
+         "void(void*, void*, void*, const int64_t* componentIndex, ...); the selected component's drawer"},
+        {"board.world_to_screen", "world_pos_to_screen_pos__presenterZrendererZshaderZubo95view95model_u1155",
+         TC_SYM_FUNCTION,
+         "Vec2(Vec2 world); reads the camera from the global ubo_view_model and returns *normalised* "
+         "screen coordinates.  Evidence: the game's own draw_simple_rect (VA 0x1403404f0) takes the "
+         "result and multiplies it by ImGuiIO.DisplaySize (io+8) before ImDrawList_AddRect, which is "
+         "how the board's drag-selection rectangles are placed"},
+        {"options.general", "build_general_options__presenterZmain95menu95uiZoptionsZgeneral95tab_u339",
+         TC_SYM_FUNCTION,
+         "void(void* presenter); the Options page's General tab - the game's settings panel.  A Mod "
+         "hooks it, calls the original and appends its own row"},
+        {"board.redo", "redo_board__presenterZutilitiesZhelper95functions_u8374", TC_SYM_FUNCTION,
+         "uint8_t(void* board); game-native redo using the Board model at rcx (verified by disassembly)"},
+        /* The presenter's state upgrade.  The game's own component placement
+           calls this with `context + 0x1a3b8` and 0x30 right after add_component
+           succeeds (disassembly of handle_no_action_yet+0xf77 and of the
+           component menu), and without that call a component added through the
+           command bus is not registered in the board's hit state: it cannot be
+           clicked or dragged until something else refreshes the board.
+           Evidence: 2026-09-22, the user placed one component by hand and the
+           three command-bus-placed ones became draggable with it. */
+        {"board.after_place", "upgrade__presenterZcontext_u2766", TC_SYM_FUNCTION,
+         "void(void* presenterSlot, uint8_t target); presenterSlot is the change_scene context + 0x1a3b8"},
         {"save.path.level", "__emutls_v.global_save_level_path__modelZmodel95types_u79", TC_SYM_DATA,
          "emutls control block; read through tc::TCSaveModel, not directly"},
         {"save.path.schematic", "__emutls_v.global_save_schematic_path__modelZmodel95types_u81", TC_SYM_DATA,
@@ -82,6 +124,42 @@ inline const std::vector<SymbolEntry>& symbol_profile() {
          "total cost of a component kind"},
         {"cost.delay", "get_delay_cost__modelZscores_u2316", TC_SYM_FUNCTION,
          "delay cost of a component kind"},
+        /* IO values.  The three global-input calls are what the game's own IO
+           panel runs (its bit squares flip, its value field writes); the
+           constant pair is the setting write plus the refresh a value edit
+           performs.  TC_SERVICE_IO_VALUE wraps them for plugins. */
+        {"io.input.get", "get_component_global_input__presenterZutilitiesZhelper95functions_u9752", TC_SYM_FUNCTION,
+         "int64_t(void* board, int64_t component)"},
+        {"io.input.set", "set_component_global_input__presenterZutilitiesZhelper95functions_u5857", TC_SYM_FUNCTION,
+         "void(void* board, int64_t component, int64_t value); the native value field's write"},
+        {"io.input.flip", "flip_component_global_input__presenterZutilitiesZhelper95functions_u5846", TC_SYM_FUNCTION,
+         "void(void* board, int64_t component, int64_t bit); one native bit square's click"},
+        {"io.constant.set", "set_setting__presenterZutilitiesZhelper95functions_u2763", TC_SYM_FUNCTION,
+         "void(void* board, int64_t setting, int64_t component, int64_t value); setting 0 is a constant's value"},
+        {"io.constant.refresh", "sim_stop_and_refresh__modelZsimulationZcompile95thread_u3043", TC_SYM_FUNCTION,
+         "void(void* board); refreshes the running simulation in place"},
+        /* The custom-tail key/value table.  A 0x4e component record owns one
+           `Table[int64, int64]` at +0x190 and the game serializes it inside the
+           schematic, which is where a native component's configuration lives.
+           The setter is the same function the game's own custom-tail
+           deserializer calls while it rebuilds a record from a saved schematic
+           (get_component__modelZsave95mongerZversionsZv7_u5+0x4cb), so the
+           call shape is (table*, key:i64, value:i64).  Evidence:
+           tests/component-persistence-playtest.ps1 -Mode insert inserts into an
+           empty table through it, grows the table and reads the value back
+           after a save and restart. */
+        {"save.custom_tail_set", "X5BX5Deq___modelZsave95mongerZversionsZv7_u70", TC_SYM_FUNCTION,
+         "void(void* table, int64_t key, int64_t value); the custom component tail table's own `[]=`"},
+        /* The engine's cursor placement.  The game's own panels lay their lists
+           out with these two (the left IO panel positions an entry's label with
+           igSetCursorPos and the line after it with igSetCursorPosY), so both
+           are hook chain points: a Mod draws inside such a panel from the chain
+           callback, and a Mod that makes an entry taller moves the lines below
+           it by changing the y the game is about to use. */
+        {"ig.set_cursor_pos", "igSetCursorPos", TC_SYM_FUNCTION,
+         "engine import thunk in the EXE; void(ImVec2 x, y)"},
+        {"ig.set_cursor_pos_y", "igSetCursorPosY", TC_SYM_FUNCTION,
+         "engine import thunk in the EXE; void(float y)"},
     };
     return value;
 }

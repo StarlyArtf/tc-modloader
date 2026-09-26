@@ -63,19 +63,20 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host, TCPlugin* plugin) {
 | `logic` | `TC_CAP_LOGIC` | `register_logic` | 元件行为交给 C++ 回调 |
 | `component` | `TC_CAP_COMPONENT` | `register_component` | 声明式元件（引脚＋回调，自动生成定义） |
 | `ui_page` | `TC_CAP_UI_PAGE` | `register_ui_page` | 主菜单页面容器 |
-| `ui_slot` | `TC_CAP_UI_SLOT` | `register_ui_slot` | 游戏自己的布局里的插槽（板侧栏、工具栏） |
+| `ui_slot` | `TC_CAP_UI_SLOT` | `register_ui_slot` | 游戏自己的布局里的插槽（板侧栏 `TC_UI_SLOT_BOARD_SIDE`、工具列 `TC_UI_SLOT_BOARD_TOOLBAR`、电路板顶部菜单栏 `TC_UI_SLOT_BOARD_MENU`） |
 | `texture` | `TC_CAP_TEXTURE` | `create_ui_texture` 等 | 图片 / RGBA 上传与宿主管理的纹理生命周期 |
 | `status` | `TC_CAP_STATUS` | `report_status` | 插件自己把状态写给 Mods 页与日志 |
 | `symbol_alias` | `TC_CAP_SYMBOL_ALIAS` | `resolve_alias` | 用稳定别名（`sim.do`、`level.load`…）取地址，不再硬编码混淆名，见 [symbols.md](symbols.md) |
 | `hook_chain` | `TC_CAP_HOOK_CHAIN` | `register_hook_chain` | 加入加载器拥有的钩子链：多个 Mod 共用同一目标，按优先级／Mod id 排序 |
 | `events` | `TC_CAP_EVENTS` | `add_event_listener` | 宿主事件总线：关卡加载、场景切换、仿真命令、保存 |
 | `game_handles` | `TC_CAP_GAME_HANDLES` | `get_current_game_handle`、`validate_game_handle`、`resolve_game_handle` | 带代次检查的游戏对象句柄；当前签发 Board 句柄 |
+| `services` | `TC_CAP_SERVICES` | `query_service` | 查询独立版本的游戏服务表；Board V1 句柄、V2 值快照、V3 对象句柄、V4 对象数据、V5 元件引脚、V6 连接判定、`tc.simulation` 仿真读数、`tc.io_value` 数值编辑器（读写全局输入、写常量、按位翻转、表达式求值与格式化），以及 `tc.pin_order` 左侧 IO 面板引脚顺序（按元件下标读、重排与恢复） |
 
 能力位本身自 **0.6.0** 起提供；`ui_page` / `ui_slot` 的引入版本写在
 `sdk/tc_mod_api.h` 的注释里。加载器启动时会把自己支持的能力写进日志：
 
 ```text
-TC Mod Loader 0.6.0 capabilities: log, symbol, hook, logic, component, ui_page, ui_slot, texture, status, symbol_alias, hook_chain
+TC Mod Loader 0.6.0 capabilities: log, symbol, hook, logic, component, ui_page, ui_slot, texture, status, symbol_alias, hook_chain, events, game_handles, services
 ```
 
 ## 钩子链与符号别名
@@ -115,7 +116,7 @@ if (tc::events::subscribe(host, TC_EVENT_LEVEL_LOAD | TC_EVENT_SIM_COMMAND, &onE
 
 | 事件 | `flags` | `subject` / `name` | 触发点 |
 |---|---|---|---|
-| `TC_EVENT_LEVEL_LOAD` | 0 | 板模型 / 关卡名 | `level.load` 链 |
+| `TC_EVENT_LEVEL_LOAD` | 0 | 板模型 / 关卡名（仅在回调期间借用，不要保存指针） | `level.load` 链 |
 | `TC_EVENT_SCENE_CHANGE` | 目标场景号 | 该次切换的 context | `scene.change` |
 | `TC_EVENT_SIM_COMMAND` | 0 run / 1 stop / 2 reset | — | `sim.do` 链 |
 | `TC_EVENT_SAVE` | 保存计数 | — | `save.level` |
@@ -131,10 +132,11 @@ if (tc::events::subscribe(host, TC_EVENT_LEVEL_LOAD | TC_EVENT_SIM_COMMAND, &onE
 
 ## 游戏对象句柄
 
-`TCGameHandle` 可以跨帧保存，但不能持久化到磁盘。当前 Loader 只签发
-`TC_GAME_OBJECT_BOARD`：关卡加载时生成新代次，下一次关卡加载或任何场景切换都会让旧句柄
-失效。`tc::validateGameHandle()` 返回 1 表示有效、0 表示已失效，负值表示参数或宿主错误；
-`tc::resolveGameHandle()` 只为有效句柄返回临时的底层 Board 指针。
+`TCGameHandle` 不能持久化到磁盘。Board 句柄可以跨帧保存：关卡加载时生成新代次，下一次关卡
+加载或离开场景会让旧句柄失效。Board V3 对象快照还会从可信枚举结果签发 Component/Wire
+句柄；它们只在快照所在引擎帧内有效，下一帧自动失效，避免游戏容器搬迁后留下悬空地址。
+`tc::validateGameHandle()` 返回 1 表示有效、0 表示已失效，负值表示参数或宿主错误；
+`tc::resolveGameHandle()` 只为当前仍有效的句柄返回临时底层指针。
 “离开关卡会失效”这条在真机上按**玩家的动作**验过：关卡里按 Escape，游戏自己调用
 `change_scene(ctx,0)`，句柄随之被作废。
 
@@ -149,8 +151,8 @@ if (tc::currentGameHandle(host, TC_GAME_OBJECT_BOARD, &board) == TC_HANDLE_OK) {
 }
 ```
 
-`COMPONENT`、`WIRE` 和 `LEVEL` kind 已预留但返回 `TC_HANDLE_ERR_KIND`；它们要等统一快照能够从
-可信枚举结果签发，不能让 Mod 把任意裸指针包装成“安全句柄”。
+`COMPONENT`、`WIRE` 不能通过 `currentGameHandle` 任意查询，只能由 Board V3 同帧快照签发；
+`LEVEL` kind 仍预留。Mod 没有把任意裸指针包装成“安全句柄”的入口。
 
 两条真机实测（`tests/game-handle-probe-playtest.ps1`，脚本里记着完整证据）值得单列，因为它们
 决定了句柄在关卡内是否可用：

@@ -1,0 +1,38 @@
+# SoftFloat 3e sources the binary32 kernel needs.
+#
+# This is the transitive closure of the symbols fp/fp32.cpp calls: every file
+# below was picked by compiling the whole upstream source tree once, reading
+# each object's defined/undefined symbols and walking the reference graph from
+# those entry points.  Files not listed here (f16, f64, extF80, f128, their
+# helpers, and even f32_eq/lt/le, because the kernel implements the project's
+# compare and classify itself) are neither vendored nor compiled.  See
+# third_party/berkeley-softfloat-3/README.md for the upstream commit and the
+# exact procedure; the integer conversions joined the list with the M4
+# catalogue (f32_to_i32/f32_to_ui32/i32_to_f32/ui32_to_f32 and the two rounding
+# helpers they need).
+
+source/f32_add.c
+source/f32_div.c
+source/f32_mul.c
+source/f32_mulAdd.c
+source/f32_rem.c
+source/f32_roundToInt.c
+source/f32_sqrt.c
+source/f32_sub.c
+source/f32_to_i32.c
+source/f32_to_ui32.c
+source/i32_to_f32.c
+source/s_addMagsF32.c
+source/s_approxRecipSqrt32_1.c
+source/s_approxRecipSqrt_1Ks.c
+source/s_mulAddF32.c
+source/s_normRoundPackToF32.c
+source/s_normSubnormalF32Sig.c
+source/s_roundPackToF32.c
+source/s_roundToI32.c
+source/s_roundToUI32.c
+source/s_subMagsF32.c
+source/softfloat_state.c
+source/ui32_to_f32.c
+source/ARM-VFPv2-defaultNaN/s_propagateNaNF32UI.c
+source/ARM-VFPv2-defaultNaN/softfloat_raiseFlags.c

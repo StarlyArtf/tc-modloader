@@ -14,16 +14,20 @@
 | 声明式 C++ 元件 | 只声明引脚和回调，自动生成定义，无需手写电路文件 | [docs/sdk/native-components.md](docs/sdk/native-components.md) |
 | 声明延迟 | 元件声明的关键路径进入编译期时序统计 | [docs/sdk/game-model.md](docs/sdk/game-model.md#设计代价与声明延迟) |
 | 原生逻辑回调 | 元件每周期行为由插件 C++ 决定，关卡判定/暂停/重置仍由游戏执行 | [docs/sdk/custom-logic.md](docs/sdk/custom-logic.md) |
-| 独立存档 | 始终使用独立存档，可导入原版存档副本 | [docs/install.md](docs/install.md) |
+| 独立存档与存档管理 | 始终使用独立存档；主菜单「存档」页可新建/导入/复制/重命名/删除到回收站/切换副本，并列出每份存档**需要哪些 Mod、缺哪些** | [docs/install.md](docs/install.md) |
 | 能力协商 | 插件按 `TC_CAP_*` 位判断宿主支持什么；包在 `mod.json` 里声明所需能力与依赖版本 | [docs/reference/capabilities.md](docs/reference/capabilities.md) |
 | 符号别名与钩子链 | 插件用 `sim.do` 这类稳定别名取地址；多个 Mod 可以加入同一个游戏函数的钩子链 | [docs/reference/symbols.md](docs/reference/symbols.md) |
 | 事件总线 | 订阅关卡加载、场景切换、仿真命令、保存等事件，不必自己钩内部函数 | [docs/reference/capabilities.md](docs/reference/capabilities.md) |
 
 版本号只有一个来源：仓库根目录的 `VERSION`；`build.ps1` 由它生成 `src/version.hpp`，
 加载器横幅、安装器标题、`tcmod-cli --version` 与分发包文件名都读同一处，不再各写各的。
-源码树为 **0.6.0**：在 0.4.0 分发包之后加入了声明式元件、原生逻辑形状/位宽扩展、
-插件界面页面与插槽、纹理、波形导出，以及能力协商与依赖版本约束
-（见 [docs/changelog.md](docs/changelog.md)）；尚未重新打分发压缩包。
+当前版本 **0.8.0**：在 0.4.0 之后加入了元件图片 V5 与放置幽灵 V6、声明式元件、原生逻辑形状/位宽
+扩展、插件界面页面与插槽、纹理、波形导出、存档管理页与 Mod 依赖清单，以及能力协商与依赖版本约束
+（详见 [docs/changelog.md](docs/changelog.md)）。
+
+**与游戏版本的关系**：加载器只支持它画像过的那一份游戏构建。游戏更新后它会**照常让游戏启动**，
+但本次运行不加载任何原生插件（避免 Mod 写进你的真实存档），并弹一次提示告诉你需要安装匹配新版本的
+加载器——不会出现"游戏打不开"的情况。
 
 ## 玩家：三步使用
 
@@ -44,7 +48,11 @@
 | 日志与故障排查 | [docs/reference/diagnostics.md](docs/reference/diagnostics.md) |
 | 全部文档索引 | [docs/README.md](docs/README.md) |
 
-SDK 定义在 `sdk/`：`tc_mod_api.h`（宿主入口）、`tc_mod.h`（聚合模型）、
+SDK 定义在 `sdk/`：`tc_mod_api.h`（宿主入口）、`tc_service_api.h`（版本化游戏服务）、
+`tc_command_api.h`（有归属与结果的排队命令）、
+`tc_lifecycle_api.h`（值类型生命周期/变化事件）、
+`tc_transaction_api.h`（事务预检、批处理与保存屏障）、
+`tc_handle_api.h`（对象句柄）、`tc_mod.h`（聚合模型）、
 `tc_game_model.h`、`tc_component_model.h`、`tc_board_model.h`、`tc_game_state.h`、
 `tc_simulation.h`、`tc_wire_model.h`、`tc_save_model.h`、`tc_logic_api.h`（原生逻辑回调）、
 `tc_hook.h` / `tc_hook_api.h`（钩子链）、`tc_trace.h`（关卡波形与 VCD 导出）、

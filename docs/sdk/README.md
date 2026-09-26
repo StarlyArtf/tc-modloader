@@ -8,10 +8,20 @@ SDK 是一组头文件（`sdk/`），描述加载器暴露给原生插件的 C A
 | 头文件 | 内容 | 参考 |
 |---|---|---|
 | `tc_mod_api.h` | 宿主入口：`TCHost`、`TCPlugin`、日志、符号解析、Hook、逻辑注册 | [host-api.md](host-api.md) |
+| `tc_service_api.h` | 独立版本的服务表；Board V1 句柄、V2 快照、V3 对象枚举、V4 对象读取、V5 元件引脚，以及 `tc.simulation` | [services.md](services.md) |
+| `tc_command_api.h` | 排队、归属隔离、可查询结果的游戏命令总线 | [commands.md](commands.md) |
+| `tc_lifecycle_api.h` | Board 进入/离开、对象与选择变化的值类型事件 | [lifecycle.md](lifecycle.md) |
+| `tc_transaction_api.h` | 乐观冲突检测、连续命令批次、原生 Undo/Redo/Save | [transactions.md](transactions.md) |
+| `tc_handle_api.h` | 带代次检查的游戏对象句柄 | [services.md](services.md) |
 | `tc_mod.h` | 聚合入口：一次 `load(host)` 加载下面全部模型 | 本页 |
 | `tc_game_model.h` | 原型／元件对象模型、内置表、自定义元件注册、代价与延迟字段 | [game-model.md](game-model.md) |
 | `tc_component_model.h` | 电路文件导入、目录更新、原型快照释放 | [game-model.md](game-model.md) |
 | `tc_native_component.h` | 声明引脚＋C++ 回调，自动创建元件，无需电路文件 | [native-components.md](native-components.md) |
+| `tc_component_types.h` | V2 定义：每方向 0–16 脚、自定义状态大小的回调（`TCLogicIOV2`） | [services.md](services.md#tccomponenttypes注册一个-v2-元件定义)、[custom-logic.md](custom-logic.md) |
+| `tc_component_geometry.h` | M5 V1/V2：声明类型 footprint，并逐实例同步原生交互矩形 | [services.md](services.md#tccomponentgeometry声明类型-footprint-与逐实例交互范围) |
+| `tc_component_render.h` | M5 V1/V2：按类型注册棋盘绘制回调（宿主仿射基、裁剪、受控图元），并用 V2 关掉游戏自己的缩略图/水印 | [services.md](services.md#tccomponentrender棋盘覆盖绘制) |
+| `tc_component_instances.h` | 跨帧稳定的实例句柄：枚举、世代校验、读状态、单实例重置 | [services.md](services.md#tccomponentinstances跨帧稳定的实例句柄) |
+| `tc_component_storage.h` | 每实例配置 blob 与仿真状态快照；配置和 RESET 语义分离 | [services.md](services.md#tccomponentstorage配置与仿真状态快照) |
 | `tc_board_model.h` | 当前／上一帧选中的元件与导线 | [simulation.md](simulation.md) |
 | `tc_game_state.h` | 战役、关卡、字宽、当前输入/输出 | [simulation.md](simulation.md) |
 | `tc_simulation.h` | 周期、命令设置、run/pause/reset、输入回放与输出历史指针 | [simulation.md](simulation.md) |
@@ -82,4 +92,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/Pack-Mod.ps1 -Source m
 - 第一个插件：[guides/first-native-mod.md](../guides/first-native-mod.md)
 - 用 C++ 决定元件行为：[guides/component-with-cpp-logic.md](../guides/component-with-cpp-logic.md)
 - 给插件加界面：[ui.md](ui.md)
+- 查询版本化游戏服务：[services.md](services.md)
 - 上限与约束：[reference/limits.md](../reference/limits.md)

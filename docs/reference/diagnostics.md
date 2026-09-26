@@ -10,6 +10,21 @@
 | 插件数据 | `<游戏目录>/tc-modloader-data/plugin-data/<mod id>/` | 插件自己写的数据（例如自动验证开关） |
 | 生成源码转储 | 游戏工作目录 | `native-logic-source-<n>.txt`（每次编译一份）、`native-logic-source.txt`（含桥接调用的那份） |
 | 隔离沙箱日志 | `build/<playtest>-<guid>/game/tc-modloader-data/loader.log` | 自动验证每次运行的副本 |
+| 版本不匹配标记 | `<游戏目录>/tc-modloader-data/unsupported-build.txt` | 加载器版本 + 游戏 EXE/引擎哈希；出现它就说明这次运行没有真正接管（见下方"与游戏不匹配时"） |
+
+## 与游戏不匹配时（0.8.0 起）
+
+`loader.log` 里会出现这三行的组合，它们就是"游戏更新了，请换匹配的加载器"的机器可读形式：
+
+```text
+Save isolation unavailable: <原因>
+This session runs with no save redirect and no native plugins; resource Mods still apply
+Unsupported game build. Reinstall a compatible loader.
+```
+
+同时会弹一次原生对话框（同一"加载器版本 + 游戏哈希"只弹一次），并写下
+`tc-modloader-data/unsupported-build.txt`。这种情况下主菜单没有 Mods 按钮是预期行为：加载器知道的
+对齐点已经不可信，游戏内页面可能根本不会被调用，所以提示走的是 Windows 对话框。
 
 ## 日志前缀
 
@@ -52,6 +67,21 @@ dev.hook-chain-crash in sim.do: access violation at 0x0000000000000008
 listener`）、异常类型与访问地址。玩家只要把这个文件发过来，就不必猜"是哪个 Mod 干的"。
 日志同样会轮转（8 MiB，上一份是 `loader.log.1`），所以长期挂机也不会写出一个巨大的文件。
 
+## 左侧 IO 面板（引脚顺序 / 缓存同步）
+
+面板画的是缓存下来（只在关卡加载时重建）的三段序列，所以"某个引脚的框不见了"要分三类看。
+把 `TC_MODLOADER_PIN_ORDER_LOG` 设成 `1`（`dump` 再加原始结构），日志里会出现：
+
+| 日志 | 含义与后续动作 |
+|---|---|
+| `IO panel armed (cache rebuild after a prototype reload + tc.pin_order)` | 加载器拿到了面板构建入口：改引脚后重建缓存 + 套用 Mod 的顺序。这一行不在，两个功能都没接上 |
+| `IO panel cache rebuilt (a custom prototype was reloaded)` | 工坊里改名/增删引脚后，缓存真的重建了（"不用退出再进工坊"就是靠它）。玩家手动改一次引脚就应该出现一行 |
+| `IO panel cache rebuild failed: the game's io state helpers are missing` | 三个游戏函数地址没取到：兼容画像不对，面板会退回"要退出再进"的旧行为 |
+| `pin order: summary \| inputs cache=N rows=N frames=N \| …`（逐帧变化时才打印） | 缓存条数 / 本帧画了几条 / 画了几个框。`cache` 比面板显示的少 = 缓存旧；`rows` 比 `cache` 少 = 锚点没认出来；`frames` 比 `rows` 少 = 框被下一条目或裁剪吃掉 |
+| `pin order: row <组> #i key=… width=… top=… bottom=…` | summary 变化时每条的几何，用来核对框的位置与高度 |
+| `pin order: panel anchor +0x… is not handled` | 面板里出现本 Mod 不认识的锚点（工坊第三组"内存/寄存器"就是这一类）；拿到这个偏移就能补测量 |
+| `pin order dump: group N count=… entries=…` / `group N unavailable count=… contextReadable=… header=…` | 原始缓存结构。`contextReadable=0` 或 `header` 与 `count` 不一致时，服务选择不动作而不是猜 |
+
 ## 原生逻辑关键行
 
 | 日志 | 含义与后续动作 |
@@ -71,7 +101,7 @@ listener`）、异常类型与访问地址。玩家只要把这个文件发过�
 | 现象 | 先看什么 | 常见原因 |
 |---|---|---|
 | 插件没加载 | `插件名 failed: ...` 或管理页状态 | 包未应用/指纹不匹配、ABI 版本不符、DLL 缺依赖 |
-| Hook 没生效 | `Hook rejected: phase, target or conflict` | 目标不是 EXE 函数、目标已被其他 Mod 占用、在入口之外注册 |
+| Hook 没生效 | `Hook rejected: phase, target or conflict` | 目标不是 EXE 函数或原引擎可执行导出、目标已被其他 Mod 占用、在入口之外注册 |
 | 回调一次都没跑 | 有无 `bound` 与 `emitted` | 元件没放到板上、原理图引用的 ID 不同、形状规则不满足 |
 | 关卡判定与日志不一致 | `exposes ...` 诊断行 | 元件内部节点的输入元组不是定义引脚；或原理图复制了关卡自带 IO |
 | 字宽输出关卡读到 0/空白 | 生成源码转储里的输出赋值行 | 输出脚没接到关卡输出（连线坐标错一格）、位宽不匹配 |
@@ -117,6 +147,7 @@ var vid260 = U8 ((((U8 (load(<U1>, #SIMULATION_STATE + 10092544))) & 1)) | ...)
 
 ```powershell
 $env:TC_MODLOADER_OPEN = '1'                                  # 启动后自动打开管理页（免点击）
+$env:TC_MODLOADER_OPEN_SAVES = '1'                            # 免点击打开「存档」页
 $env:TC_MODLOADER_SHOT = 'D:\shot\mods.bmp'                   # 打开若干帧后写一张 BMP
 ```
 
@@ -132,6 +163,18 @@ $env:TC_MODLOADER_SHOT_DELAY = '14000'                        # 毫秒
 ```
 
 抓帧在 `igEnd` 里按时间触发（每帧都会走），日志写 `Captured frame screenshot`。
+
+要拿**元件自己的排版**跟截图对账（本体多大、字多高、引脚在哪），浮点元件族有一个按帧输出的
+诊断：设 `TC_FLOATOPS_LAYOUT=1` 再启动游戏，`local.float-ops` 每个实例每帧写一行
+
+```text
+float-ops render: type=0x463332434f4e5331 unit=25.60 px/cell
+  body=910,762..1036,838 pin0=1050,800 value="1.0000001"
+```
+
+`tests/float-ops-playtest.ps1` 就是用它把截图和"截图那一帧"对上的（相机在首次绘制之后还会移动，
+所以只记第一帧是不够的）：取截帧那行之前的**最后一行**，再按这些屏幕坐标量像素。不设这个变量时
+只写一条有界的"注册后第一帧"记录，正常游玩不受影响。
 
 每个真机用例都会复制一份游戏到 `build/<name>-<guid>/game`，并把 `USERPROFILE`/`APPDATA`
 指向副本内的 `home`，因此不会碰到玩家存档。用例失败时按日志里的目录路径进去看

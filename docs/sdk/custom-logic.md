@@ -48,6 +48,10 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host, TCPlugin* plugin) {
 | `state[8]` | 每实例独立的 8×64 位持久状态 |
 | `user` | 注册时传入的 `TCLogicDefinition::user` |
 
+V2 的 `TCLogicIOV2` 还在结构尾部追加了只读的 `config/config_size/config_schema`。它们由宿主按实例
+持有，RESET 不清除；回调只能在本次调用期间读取，并须先用 `size` 判断这些尾字段是否存在。
+配置的声明与更新见 [services.md](services.md#tccomponentstorage配置与仿真状态快照)。
+
 | phase | 调用时机 | `outputs[]` | `state[8]` |
 |---|---|---|---|
 | `TC_LOGIC_CYCLE` | 每个仿真周期 | 写回该元件输出脚 | 写回 |
@@ -67,10 +71,10 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host, TCPlugin* plugin) {
 
 | 项目 | 规则 |
 |---|---|
-| 引脚数 | 每方向最多 8 个 |
+| 引脚数 | `TCNativeComponent`（V1）每方向最多 8 个；`tc.component.types`（V2，见 [services.md](services.md#tccomponenttypes注册一个-v2-元件定义)）到 16 个。**一个方向可以为 0**（纯源无输入、纯汇无输出，两个方向不能同时为 0）。0 输入时依赖链不存在，0 输出时最后一个逻辑节点是"输出悬空"的驱动门，回调就在它上面跑——实测见 [research/custom-component-pins.md](../research/custom-component-pins.md) |
 | 位宽 | 每个引脚 1–64 位 |
-| 总输入宽度 | ≤128 位（打包成两个 payload 字） |
-| 内部门 | 每个输出脚对应一个可识别的逻辑节点（`0x03`–`0x0b`、`0x12`–`0x1e`、`0x2a`） |
+| 总输入宽度 | ≤128 位（打包成两个 payload 字）。**这是硬约束**：生成代码里的外调只能可靠地传 4 个参数，扩到 6 个时第 5、6 个参数收到的是垃圾（2026-09-22 实测，见 [research/custom-component-pins.md](../research/custom-component-pins.md)） |
+| 内部门 | 每个输出脚对应一个可识别的逻辑节点（`0x03`–`0x0b`、`0x12`–`0x1e`、`0x2a`）；生成式脚手架（`register_component`）的节点数必须是 `(输入数 ? 2×输入数−1 : 0) + 输出数 + (输出数为 0 ? 1 : 0)` |
 | 回调输入元组 | 第一个输出门的操作数列表，顺序即回调 `inputs[]` 顺序，必须与定义输入脚数一致 |
 | 输出顺序 | 元件的输出脚顺序 |
 

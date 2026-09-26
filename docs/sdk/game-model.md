@@ -14,11 +14,17 @@ tc::TCPrototype p;
 if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
     auto count = tc::prototypeInputCount(p);
     for (uint64_t i = 0; i < count; ++i) {
-        auto* pin = tc::prototypeInputPin(p, i);
-        auto word = tc::pinWordSizeRaw(*pin);   // 原始 WordSize 值
+        const tc::TCPinPoint point = tc::prototypeInputPinPoint(p, i);
+        const uint64_t word = tc::prototypeInputPinWordSize(p, i);
+        // point 是相对元件原点的原理图坐标（游戏自己的 get_position 就是位置 + 该偏移）
+        // word 是原始 WordSize；tc::pinWordSizeIsAuto(word) 表示由连接的网络决定
     }
 }
 ```
+
+需要原始指针时 `tc::prototypeInputPin(p, i)` 仍然可用；它返回的 `TCPin*` 比真正的描述符早
+8 字节，所以读坐标请用上面的封装，或自己加这 8 字节。这条锚点的证据见
+[research/board-object-fields.md](../research/board-object-fields.md) §2。
 
 ## 已验证布局
 
@@ -31,7 +37,7 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 | `+0xb0` | SVG 形状／图标字符串 |
 | `+0x40` / `+0x48` | 分类／布局候选字段（以原始值暴露） |
 | `+0x130` / `+0x138` | 缓存门数 / 声明延迟 |
-| 引脚条目 `0x38` 字节 | 原始 WordSize 在 `+0x10`；相对坐标在描述符 `+2`（描述符起点为 `TCPin* + 8`） |
+| 引脚条目 `0x38` 字节 | 原始 WordSize 在 `+0x10`；相对坐标在描述符 `+2`（描述符起点为 `TCPin* + 8`，这一锚点由 `tc::pinPoint()` 封装） |
 | `TCPrototypeKind +0x188` | 自定义 ID，**uint64_t**（低 16 位仅用于哈希初始槽位） |
 
 ## 常用调用
@@ -45,6 +51,8 @@ if (model.getPrototype(tc::kPrototypeKindCustom, custom_id, p)) {
 | 清空自定义表 | `removeAllCustomPrototypes()` |
 | 查询自定义表 | `hasCustomPrototype(id)`、`customPrototypeCount()`、`customPrototypeIdAt(index)` |
 | 写入设计代价 | `setPrototypeGateCost`、`setPrototypeDelay`、`TCPrototypeBuilder::setDesignCost` |
+| 读引脚几何 | `prototypeInputPinPoint(p, i)` / `prototypeOutputPinPoint(p, i)` —— 相对元件原点的原理图坐标 |
+| 读引脚字宽 | `prototypeInputPinWordSize(p, i)` / `prototypeOutputPinWordSize(p, i)`；`pinWordSizeIsAuto(raw)` 判断 `AUTO_SIZE` |
 
 内置元件的 kind 是单字节键：请用内置表枚举，不要向游戏查询任意字节值，未知 kind 可能
 触发 Nim 索引／键错误。自定义 ID 查询缺失时返回空对象。

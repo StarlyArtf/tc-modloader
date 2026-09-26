@@ -6,8 +6,8 @@
    but it resolves only while its owning game object belongs to the current
    generation.  Never persist handles to disk. */
 #define TC_GAME_OBJECT_BOARD 1u
-#define TC_GAME_OBJECT_COMPONENT 2u /* reserved until snapshot enumeration */
-#define TC_GAME_OBJECT_WIRE 3u      /* reserved until snapshot enumeration */
+#define TC_GAME_OBJECT_COMPONENT 2u /* issued only by a Board object snapshot */
+#define TC_GAME_OBJECT_WIRE 3u      /* issued only by a Board object snapshot */
 #define TC_GAME_OBJECT_LEVEL 4u     /* reserved */
 typedef struct TCGameHandle {
     uint32_t size;

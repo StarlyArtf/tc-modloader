@@ -1,0 +1,14 @@
+{
+  "format": 2,
+  "id": "local.float-ops",
+  "name": "Float Ops（FP32 常量/加法/显示）",
+  "version": "0.2.0",
+  "author": "TC Mod Loader",
+  "description": "独立的 IEEE 754 浮点元件 Mod，共 22 个可用元件（Constant、Add、Display、Subtract、Multiply、Divide、Square Root、Negate、Absolute、Compare、Classify、FMA、Remainder、Round To Integral、MinimumNumber、MaximumNumber、I32/U32 与 FP32 的双向转换、Split Bits、Make Bits）。元件注册在游戏自己的右侧元件栏里：游戏会按名字里的 \"/\" 把它们收进一个 浮点 文件夹（元件名形如 浮点/FP32 Add），自定义页里只剩这一个文件夹；属性选择（舍入模式等）用游戏自己的底部抽屉。元件配置保存在游戏自己的电路存档中。另外五个 FP32 M0 * 兼容性测试探针在 浮点/M0 子文件夹里，可以忽略。不修改 Mod Loader 或游戏二进制。",
+  "requires": [],
+  "capabilities": ["log", "status", "services", "game_handles"],
+  "native": {
+    "api": 1,
+    "entry": "native/float-ops.dll"
+  }
+}

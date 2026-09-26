@@ -7,6 +7,10 @@
 #include "tc_hook_api.h"
 #include "tc_event_api.h"
 #include "tc_handle_api.h"
+#include "tc_service_api.h"
+#include "tc_command_api.h"
+#include "tc_lifecycle_api.h"
+#include "tc_transaction_api.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,6 +45,7 @@ extern "C" {
 #define TC_CAP_HOOK_CHAIN   (1ull<<10) /* hook_chain: register_hook_chain */
 #define TC_CAP_EVENTS       (1ull<<11) /* events: add_event_listener */
 #define TC_CAP_GAME_HANDLES (1ull<<12) /* game_handles: generation-checked game objects */
+#define TC_CAP_SERVICES     (1ull<<13) /* services: independently versioned API tables */
 typedef struct TCFrame {uint32_t size; int32_t frame_number; double time_seconds;} TCFrame;
 
 /* Native UI page registered with the optional host->register_ui_page entry
@@ -81,6 +86,29 @@ typedef struct TCUiPageDefinition {
    small (a button, or a colour chip) and to expand on hover. */
 #define TC_UI_SLOT_BOARD_TOOLBAR 2u
 
+/* TC_UI_SLOT_BOARD_MENU is a control *inside the game's own top menu bar* (the
+   row with the menu, save and hint buttons above a board).  The host draws the
+   slots right after the game's own buttons, on the same line, while the game's
+   button style (frame padding, rounding, spacing and button colours) is still
+   pushed - so a plain tc::ui::button() or an invisible button plus a canvas comes
+   out looking like the bar's own entries, with no style handling of your own. */
+#define TC_UI_SLOT_BOARD_MENU 3u
+
+/* TC_UI_SLOT_BOARD_COMPONENT_PANEL is a slot *inside the game's own component
+   drawer* - the panel the game shows along the bottom for the component the
+   player has selected, where a built-in Constant's label and value fields live.
+   The drawer is the place the game itself edits such values, so a Mod's editor
+   for its own components belongs here rather than in a window of its own.
+
+   The loader hooks the drawer (see symbol_profile.hpp, `board.component_panel`),
+   lets the game lay out its own rows, and then calls the slot of the Mod that
+   owns the selected component: the drawer's window is current, the cursor sits
+   after the game's own rows, and the host has pushed ID scopes, so a slot draws
+   ordinary tc::ui widgets (text, sameLine, setNextItemWidth, inputText, button)
+   row by row exactly like the game's own fields.  Only one component panel slot
+   per Mod is called, and only for that Mod's own types. */
+#define TC_UI_SLOT_BOARD_COMPONENT_PANEL 4u
+
 /* Native UI slot registered with the optional host->register_ui_slot entry
    point (see sdk/tc_ui.h).  slot_id and title are copied by the host during
    tc_mod_load, so the plugin's buffers only have to live for that call. */
@@ -97,6 +125,12 @@ typedef struct TCUiSlotDefinition {
  void* user;
  float preferred_width;        /* 0 = host default; panel width in pixels */
  float preferred_height;       /* 0 = host default; panel height in pixels */
+ /* TC_UI_SLOT_BOARD_COMPONENT_PANEL only.  The same callback with the instance
+    the drawer is showing, so a Mod can read and write that instance's own
+    configuration.  A caller whose `size` stops before this field falls back to
+    `draw` and simply has no instance id. */
+ void (*draw_component)(void* user,const TCFrame* frame,uint64_t instance,
+                        float content_width,float content_height);
 } TCUiSlotDefinition;
 
 /* Size of TCHost before any optional tail was appended.  Plugins must accept
@@ -126,7 +160,8 @@ typedef struct TCHost {
  void* (*resolve_symbol)(void* context,const char* exact_coff_name);
  void* (*engine_proc)(void* context,const char* export_name);
  /* Creates a disabled hook. Host enables all hooks only after tc_mod_load succeeds.
-    Targets must be game EXE functions; duplicate targets are rejected.
+    Targets must be profiled game EXE functions or executable original-engine
+    exports returned by engine_proc; duplicate targets are rejected.
     Call only during tc_mod_load. Original trampoline remains valid for this process. */
  int (*create_hook)(void* context,void* target,void* detour,void** original);
  /* Optional tail extension: check host.size before accessing. Initialization
@@ -204,6 +239,9 @@ typedef struct TCHost {
  int (*get_current_game_handle)(void* context,uint32_t kind,TCGameHandle* out);
  int (*validate_game_handle)(void* context,const TCGameHandle* handle);
  int (*resolve_game_handle)(void* context,const TCGameHandle* handle,const void** out);
+ /* Versioned service discovery.  Unlike the compatibility fields above, new
+    game APIs belong in service tables instead of extending TCHost again. */
+ int (*query_service)(void* context,const char* service_id,uint32_t version,void* out,uint32_t out_size);
 } TCHost;
 typedef struct TCPlugin {
  uint32_t size;
@@ -267,6 +305,109 @@ inline int resolveGameHandle(const TCHost* host,const TCGameHandle* handle,const
     if (!hostHasField(host,offsetof(TCHost,resolve_game_handle),sizeof(host->resolve_game_handle)) ||
         !host->resolve_game_handle) return TC_HANDLE_ERR_UNAVAILABLE;
     return host->resolve_game_handle(host->context,handle,out);
+}
+template <typename T> inline int queryService(const TCHost* host,const char* id,uint32_t version,T* out) {
+    if (!id || !out) return TC_SERVICE_ERR_ARGUMENT;
+    if (!hostHasField(host,offsetof(TCHost,query_service),sizeof(host->query_service)) || !host->query_service)
+        return TC_SERVICE_ERR_UNAVAILABLE;
+    return host->query_service(host->context,id,version,out,static_cast<uint32_t>(sizeof(T)));
+}
+inline int boardService(const TCHost* host,TCBoardApiV1* out) {
+    return queryService(host,TC_SERVICE_BOARD,TC_BOARD_API_VERSION_1,out);
+}
+inline int boardService(const TCHost* host,TCBoardApiV2* out) {
+    return queryService(host,TC_SERVICE_BOARD,TC_BOARD_API_VERSION_2,out);
+}
+inline int boardService(const TCHost* host,TCBoardApiV3* out) {
+    return queryService(host,TC_SERVICE_BOARD,TC_BOARD_API_VERSION_3,out);
+}
+inline int boardService(const TCHost* host,TCBoardApiV4* out) {
+    return queryService(host,TC_SERVICE_BOARD,TC_BOARD_API_VERSION_4,out);
+}
+inline int boardService(const TCHost* host,TCBoardApiV5* out) {
+    return queryService(host,TC_SERVICE_BOARD,TC_BOARD_API_VERSION_5,out);
+}
+inline int boardService(const TCHost* host,TCBoardApiV6* out) {
+    return queryService(host,TC_SERVICE_BOARD,TC_BOARD_API_VERSION_6,out);
+}
+inline int commandService(const TCHost* host,TCCommandApiV1* out) {
+    return queryService(host,TC_SERVICE_COMMANDS,TC_COMMAND_API_VERSION_1,out);
+}
+inline int commandService(const TCHost* host,TCCommandApiV2* out) {
+    return queryService(host,TC_SERVICE_COMMANDS,TC_COMMAND_API_VERSION_2,out);
+}
+inline int lifecycleService(const TCHost* host,TCGameLifecycleApiV1* out) {
+    return queryService(host,TC_SERVICE_LIFECYCLE,TC_LIFECYCLE_API_VERSION_1,out);
+}
+inline int transactionService(const TCHost* host,TCTransactionApiV1* out) {
+    return queryService(host,TC_SERVICE_TRANSACTIONS,TC_TRANSACTION_API_VERSION_1,out);
+}
+inline int transactionService(const TCHost* host,TCTransactionApiV2* out) {
+    return queryService(host,TC_SERVICE_TRANSACTIONS,TC_TRANSACTION_API_VERSION_2,out);
+}
+inline int simulationService(const TCHost* host,TCSimulationApiV1* out) {
+    return queryService(host,TC_SERVICE_SIMULATION,TC_SIMULATION_API_VERSION_1,out);
+}
+inline int ioValueService(const TCHost* host,TCIoValueApiV1* out) {
+    return queryService(host,TC_SERVICE_IO_VALUE,TC_IO_VALUE_API_VERSION_1,out);
+}
+inline int captureBoardSnapshot(const TCBoardApiV2* service,const TCGameHandle* handle,TCBoardSnapshotV1* out) {
+    if (!service || !handle || !out) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV2,capture_snapshot) + sizeof(service->capture_snapshot) ||
+        !service->capture_snapshot) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->capture_snapshot(service->context,handle,out,static_cast<uint32_t>(sizeof(*out)));
+}
+inline int captureBoardSnapshot(const TCBoardApiV3* service,const TCGameHandle* handle,TCBoardSnapshotV1* out) {
+    if (!service || !handle || !out) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV3,capture_snapshot) + sizeof(service->capture_snapshot) ||
+        !service->capture_snapshot) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->capture_snapshot(service->context,handle,out,static_cast<uint32_t>(sizeof(*out)));
+}
+inline int captureBoardObjects(const TCBoardApiV3* service,const TCGameHandle* handle,
+                               TCBoardObjectSnapshotV1* out,const TCBoardObjectBuffersV1* buffers) {
+    if (!service || !handle || !out) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV3,capture_objects) + sizeof(service->capture_objects) ||
+        !service->capture_objects) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->capture_objects(service->context,handle,out,static_cast<uint32_t>(sizeof(*out)),buffers);
+}
+inline int readComponent(const TCBoardApiV4* service,const TCGameHandle* handle,TCComponentInfoV1* out) {
+    if (!service || !handle || !out) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV4,read_component) + sizeof(service->read_component) ||
+        !service->read_component) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->read_component(service->context,handle,out,static_cast<uint32_t>(sizeof(*out)));
+}
+inline int readWire(const TCBoardApiV4* service,const TCGameHandle* handle,TCWireInfoV1* out) {
+    if (!service || !handle || !out) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV4,read_wire) + sizeof(service->read_wire) ||
+        !service->read_wire) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->read_wire(service->context,handle,out,static_cast<uint32_t>(sizeof(*out)));
+}
+inline int readComponentPins(const TCBoardApiV5* service,const TCGameHandle* handle,
+                             TCComponentPinsV1* out,const TCComponentPinBuffersV1* buffers) {
+    if (!service || !handle || !out || !buffers) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV5,read_component_pins) + sizeof(service->read_component_pins) ||
+        !service->read_component_pins) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->read_component_pins(service->context,handle,out,
+                                        static_cast<uint32_t>(sizeof(*out)),buffers);
+}
+inline int readWireEnds(const TCBoardApiV6* service,const TCGameHandle* handle,TCWireEndsV1* out) {
+    if (!service || !handle || !out) return TC_SNAPSHOT_ERR_ARGUMENT;
+    if (service->size < offsetof(TCBoardApiV6,read_wire_ends) + sizeof(service->read_wire_ends) ||
+        !service->read_wire_ends) return TC_SNAPSHOT_ERR_UNAVAILABLE;
+    return service->read_wire_ends(service->context,handle,out,static_cast<uint32_t>(sizeof(*out)));
+}
+inline int simulationState(const TCSimulationApiV1* service,TCSimulationStateV1* out) {
+    if (!service || !out) return TC_SIMULATION_ERR_ARGUMENT;
+    if (service->size < offsetof(TCSimulationApiV1,get_state) + sizeof(service->get_state) ||
+        !service->get_state) return TC_SIMULATION_ERR_UNAVAILABLE;
+    return service->get_state(service->context,out,static_cast<uint32_t>(sizeof(*out)));
+}
+inline int readSimulationValue(const TCSimulationApiV1* service,uint64_t byte_offset,
+                               uint32_t bits,uint64_t* out) {
+    if (!service || !out) return TC_SIMULATION_ERR_ARGUMENT;
+    if (service->size < offsetof(TCSimulationApiV1,read_value) + sizeof(service->read_value) ||
+        !service->read_value) return TC_SIMULATION_ERR_UNAVAILABLE;
+    return service->read_value(service->context,byte_offset,bits,out);
 }
 /* Address for a stable alias such as "sim.do" (the loader's symbol profile).
    Null when the alias is unknown to this loader or unresolved in this build. */
