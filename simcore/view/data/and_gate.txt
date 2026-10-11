@@ -1,0 +1,9 @@
+# Input -> AND -> Output, the smallest board that shows a value reaching
+# something.  Wire endpoints must land exactly on the pin cells, because that
+# is what the builder joins into a net.
+component index=0 kind=0x3f x=0 y=0 rotation=0 word30=0 word40=2
+component index=1 kind=0x04 x=4 y=0 rotation=0 word30=2 word40=1
+component index=2 kind=0x44 x=8 y=0 rotation=0 word30=1 word40=0
+wire index=0 from=0,-1 to=3,-1 width=1 slot=256
+wire index=1 from=0,1 to=3,1 width=1 slot=258
+wire index=2 from=6,0 to=7,0 width=1 slot=260

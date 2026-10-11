@@ -200,7 +200,7 @@
 | # | 结论 | 证据 |
 |---|---|---|
 | 1 | 元件记录的 `+0x30` 是**输入脚数**、`+0x40` 是**输出脚数**（与原型表逐个对上：Input 0/2、AND 2/1、Output 1/0）；`+0x38` 是游戏自己的私有指针（0 输入元件为空，其余指向一个首字等于脚数的结构），**不是**状态槽 | `deep_component` 的 `word@0x30/word@0x40` 与 `build/kinds.txt` 的原型脚数一致 |
-| 2 | 未做：自定义元件在扁平序列里的内部导线还没有 dump（需要 `TC_SIM_STATE_CUSTOM=1` 那套 fixture 再跑一次）。因为第 6 项选了 B，它不再决定架构 | —— |
+| 2 | **已解决（2026-09-30，换了一条路）**：自定义元件的内部电路不从扁平序列取，而从**自定义原型自己的定义数组**取（组件 `+0xe0`/`+0xe8`、导线 `+0x100`/`+0x108`，元素格式与棋盘记录相同），沙盒在成表前展平。真机：玩家那块带五种自制元件的 CPU 板从整块拒跑变成 nets=130/devices=103。见 [research/custom-components.md](research/custom-components.md) | `tests/custom-prototype-probe.cpp` 的 dump + `sandbox-custom` 真机用例 |
 | 3 | **写状态槽游戏会跟着变**：写进 wire 记录的 `+0x38` 槽（及其相邻字节），游戏自己的 `sim_state_read_u64` 立刻读回我们写的值；渲染线程每帧读槽 260（caller RVA `0x1756c8`，695 次），全部在渲染线程上 | `TC_SIM_STATE_DRIVE` 报告里 `program=1 read=0`：我们故意写反值，读回来的就是反值 |
 | 3b | **游戏程序会在同一周期覆盖这些槽**：写完 2 个周期后 256..263 全部回到程序的值；264..271 这类没人写过的槽保持不变 | `write_slot` 报告（`before=165 after=1` 对 256..263，`after=165` 对 264..271） |
 | 4 | 部分：`tc.simulation` 的 slice + run 请求能推进并逐周期采样（既有 regression 覆盖）；这次观察到关卡自带测试跑完后 cycle 停在 3 不再前进，S2 runtime 要么自己驱动推进，要么只在"关卡还在跑"时接管 | `drive` 报告里 `cycle 3` 重复，而我们的引擎时钟一直在走（8192→40960） |
@@ -310,22 +310,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File simcore/tests/semantics-prob
 | `0 & x = 0`、`1 | x = 1`、`nand(z,1) = x` | probe3 | 门的 Z 按未知处理 |
 | 未求值的门输出在 `$dumpvars` 里是 `x`，不是 `z` | probe1/2/3 | 上电解析一遍：被驱动的网是 X，没驱动的才是 Z |
 | 三反相环释放后周期 = 6 × 每级延迟 | probe3 | delta 环 + 分层队列（没有 delta 环就没有这个周期） |
+| `assign #(5,9)` 落在**多位**网上时，选择哪一边按新值的**最低位**（奇数走 5、偶数走 9）；含 x/z 的值不服从这条 | probe4（2026-09-29） | **偏差**：本内核按最高位选边，总线器件因此只用同一个数做弧延迟交叉验证，见 §13.3 |
 
-### 13.2 交叉验证覆盖的 7 个电路
+### 13.2 交叉验证覆盖的 8 个电路
 
 `tools/simcore-iverilog.ps1` 把 `simcore/tests/circuits.hpp` 里的电路导出成
 `assign #(tplh,tphl)` / `always @(posedge clk) q <= #ctoq d`，跑 iverilog，再把它的 VCD 与
 内核自己的逐事件表按"每个时间点、每根网"比对：`delay_chain`、`multi_driver`、`gate_unknown`、
-`ring`、`delta_chain`（64 级零延迟）、`dff_shift`、`bus_split`（4 位 Maker/Splitter）。
-当前 7/7 完全一致；单测另有 145 项断言覆盖波形看不到的部分（解析表、调度顺序、
+`ring`、`delta_chain`（64 级零延迟）、`dff_shift`、`bus_split`（4 位 Maker/Splitter）、
+`mux_word`（字宽 Mux，含选通为 X 的那一拍，见 §16）。
+当前 8/8 完全一致；单测另有 234 项断言覆盖波形看不到的部分（解析表、调度顺序、
 时间轮/溢出堆两条路径、setup/hold、零延迟振荡报错而非死循环、自环停在 X、未驱动网）。
 
 ### 13.3 与计划文本的偏差
 
 - 计划写"能独立 `ctest` 跑"；本仓库没有 CMake，所有离线测试都是 PowerShell + g++，
   因此 simcore 用同一形状（`simcore/tests/simcore.ps1`），没有引入第二套构建系统；
-- 器件库当前是 S1 规模（`buf/not/and2..xnor3/mux2/dff` + `const`/`splitter`/`maker`）。
-  未实现的器件返回空指针，由接入层报"未支持"，不做近似；
+- 器件库当前是 S1 规模加字宽 Mux（`buf/not/and2..xnor3/dff` + `const`/`splitter`/`maker` +
+  `mux<宽度>`，一位的别名是目录里的 `mux2`）。未实现的器件返回空指针，由接入层报"未支持"，
+  不做近似；
+- **多位网的成对弧延迟**：内核按新值的最高位在 `tplh`/`tphl` 之间选（`ArcDelay::forTransition`），
+  iverilog 按最低位选，含 x/z 的值两家都给不出可归纳的规则（probe4 是量到的原始表）。
+  游戏自己的时序表还没接，所以哪一边对**没有证据**，内核行为不动；总线器件一律用**同一个数**
+  做弧延迟交叉验证——沙盒当前的库本来就是"每器件一个常数"（§4.4），这不是绕开，而是如实
+  标注"这一位还没量到"。等真机时序表进来再定；
 - 时序库（S5）只有数据结构与查表入口，文件格式未定；setup/hold 目前只做上报，
   不导出 `$setup`/`$hold` 时间检查（§8.2 只要求波形一致）。
 
@@ -335,7 +343,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File simcore/tests/semantics-prob
    （元件记录 `+0x30`/`+0x38`、扁平序列里自定义元件的内部导线），再跑第 3 项（写回一个非时钟槽
    看棋盘与探针）。S0 的结论决定 S2 的网表来源是 A 还是 B；
 2. S1 的器件库按沙盒实际用到的器件补齐（125 个原型里常用的那几十个），仍然保持
-   "不支持的明说"；
+   "不支持的明说"（字宽 Mux 见 §16，屏幕与两个宿主外设见 §17）；
 3. S2 起才碰游戏：网表构建（`tcsim/`）、槽位写回、推进控制。
 
 ## 14. S2 进展（2026-09-25）
@@ -637,3 +645,194 @@ interactive switch: configured level 1 reaches the engine as net0=1 and net1=0
 **同类未修**：关卡输入（`0x3c/0x3d/0x3f/0x40/0x41`）与 Verilog Input 也是"值来自游戏程序"的一类；
 现在仍按状态数组读，而 AND 板用例的输入恰好是 0，所以这条路径**没有非零证据**。修它要用
 `tc.io_value` 的 `read_input(board, pinIndex)`，还牵涉左侧面板的引脚顺序映射——留作下一步。
+
+## 15. S4 第一件（游戏侧）：把 trace 写成 VCD（2026-09-29）
+
+观测这一段的第一件接上来了：沙盒插件里加了两个开关，`vcd=1` 与 `vcd_cycles=N`（默认 60）。绑定
+一块板子之后跑够 N 个周期，就把引擎自己的 trace 用 `simcore/include/tcsim/observe.hpp` 的
+`writeVcd()` 写成标准 VCD，落在插件数据目录 `sandbox-sim.vcd`；改动板子会重新绑定，因此编辑一次
+就自动刷新一份。写成功记一行
+`sandbox-sim: wrote <路径> (N event(s), M nets, K violation(s))`。
+
+这条的意义在于**同一份事件表**：离线的 iverilog 交叉验证比对的就是 `engine.trace()`，示波器和棋盘
+读的也是它，现在外部查看器打开的 VCD 还是它——三者不可能各说各话，棋盘显示与波形不一致时能直接
+判断是哪一层的问题。违例（setup/hold、多驱动、零延迟振荡、未驱动网）同一行里给出条数，面板/
+棋盘高亮那一半还没做。
+
+开关文件的位置记在这里以免再跑偏：它是**插件数据目录**里的
+`<游戏目录>/tc-modloader-data/plugin-data/dev.sandbox-sim/sandbox-sim.txt`，不是
+`tc-modloader-data/sandbox-sim.txt`（插件的 `readConfig()` 读前者）。
+
+### 15.1 与 simcore-view 同步（同一天）
+
+观测的第二件一起接上了：插件现在把**游戏正在跑的那块板子**按 `simcore/view/board_file.hpp`
+的板子记录格式写到同一个数据目录的 `sandbox-sim-board.txt`（`dump=0` 可关，默认开），绑定板子时
+写一次，之后跟着报告的节奏大约每秒刷新一次。于是独立查看器可以直接盯住游戏里那块板子：
+
+```powershell
+build\simcore-view.exe --board D:\p\tc-modloader-data\plugin-data\dev.sandbox-sim\sandbox-sim-board.txt
+```
+
+这件事的意义就是查看器 README 里那句"这是另一套渲染管线"：同一份捕获同时喂给游戏、离线单测、
+VCD 和 GDI 窗口，所以当棋盘和那张图对同一个值给出不同答案时，可以立刻分清是器件语义/网表构建、
+写回层，还是游戏渲染的问题。查看器目前是打开时读一次（`O` 键可以重新挑文件）；"跟着文件变"的
+`--watch` 模式还没做。
+
+### 15.2 实时跟随 + 沙盒自动拉起（同一天）
+
+上一条留下的那半件做完了：
+
+- **查看器加了 `--watch`**：每 200 ms 看一次板子记录的时间戳与大小，变了就重载；重载**保留视角
+  与当前选中**（只清 hover），所以"值在动"不会让人丢掉正在看的那根线，标题会带 `(watch)`。
+- **沙盒插件自己把窗口拉起来**：绑定板子成功之后（也就是记录文件已经写出来之后）如果当前是沙盒，
+  就用 `CreateProcess` 起 `simcore-view.exe --board <记录> --watch`。viewer 现在随
+  `dev.sandbox-sim.mod` 一起打包，加载器把它和插件 DLL 解到同一个 `native/` 目录，插件优先从那里
+  启动，所以玩家不再需要另复制 exe。已有窗口仍在运行时不重复打开；玩家关掉后，下次进入沙盒会
+  重新拉起。`view=0` 可关掉自动开窗，`viewer=<路径>` 仍可覆盖随包版本。
+
+顺序有讲究：窗口**必须在记录文件存在之后**才启动（它启动时就要读那个文件），所以拉起放在绑定
+的位置而不是 `level.load`；再叠上 `sandbox_active` 判断，非沙盒的关卡不会弹窗。
+
+日志会写一行 `sandbox-sim: started the viewer: "<exe>" --board "<记录>" --watch`；真机门槛
+`sandbox-sim-viewer` 还要求 `<exe>` 来自该隔离沙盒解包出的 Mod 目录，并在结束时只关闭那个进程。
+
+### 15.3 内存与读写端口：行为已接入 simcore（2026-09-29）
+
+RAM 不是普通有脚器件。游戏原型表给 `0x76 RAM` 的记录是 **0 进 0 出**；`0x36 Load port`
+是 3 进 2 出，`0x38 Store port` 是 5 进 1 出，端口直接摆在 RAM 插座中。Symphony 的
+`symphony_6_ram` 板也印证了这一点：2 个 RAM、6 个 Load、4 个 Store、0 根内部导线。
+查看器仍使用 2026-09-29 重 dump 的完整几何（包括 Store 的第 5 个隐藏输入），但 simcore 不再
+因为 RAM 无脚而拒绝这块板。
+
+这次行为不是按名称猜的。设置 `TC_MODLOADER_DUMP_SOURCE=1` 后，游戏自己生成的
+`native-logic-source-*.txt` 明确给出了下列契约；`tests/sandbox-memory-playtest.ps1 -CircuitPath`
+也能把玩家自己的 RAM 电路部署到隔离沙盒复测：
+
+| 语义 | 游戏生成代码中的结果 |
+|---|---|
+| 容量 | 地址位数 = RAM 记录 `+0xe0 + +0xf0`；Register File 为 8 位地址（256 B），Main Memory 为 8+16 位（16 MiB） |
+| 地址 | 每次访问先做 `address & (capacity - 1)`；跨末端的多字节尾部读零、写忽略，不逐字节回绕 |
+| 宽度 | 端口 `+0xe0/+0xe8` 是 8/16/32 位访问宽度；Load 的 `+0x88` 同时是可见输出宽度 |
+| Load | Enable=1 时执行对应的 `load<U8/U16/U32>`；Enable=0 时不向共享输出总线驱动值 |
+| Store | Enable=1 时执行对应宽度的 store；地址、值或使能未知时不改 RAM |
+| 顺序 | 插座中离 RAM 最远（画面最上方）的端口先执行，逐个向 RAM 靠近；所以同址 Load 在 Store 上方读旧值，在下方读新值 |
+| 字节序 | `+0x178` 是 RAM 的 little-endian 标志；当前两颗样本均为 0，即多字节值按大端布局 |
+
+实现落点：
+
+- `simcore/include/tcsim/memory.hpp` 用稀疏字节表保存 RAM 私有状态，并实现 8/16/32 位
+  Load/Store、使能、四态未知值、地址掩码、边界 guard 与大小端；
+- `board.hpp` 读取 `+0xe0/+0xf0/+0x178`，按旋转后的插座坐标把端口归属到 RAM，再用隐藏的
+  8 位顺序链保证端口严格从上到下求值；脱离插座的端口仍然 fatal，不做近似；
+- `netlist.hpp` / `engine.hpp` 的外部激励从单个 Logic 改成完整 `BitVector`，`runtime.hpp` 与
+  `dev.sandbox-sim` 现在按连续小端状态字节读写宽总线。否则 32 位地址只能变成 0/1；
+- `sandbox-sim-board.txt` 记录新增 `memory_bits`、`memory_extra`、`little_endian`，所以
+  simcore-view 重放 16/32 位端口时不会退化成默认 8 位。
+
+离线门槛新增同址 Load→Store→Load、大小端、容量掩码、末端 guard、持久写入、松散端口拒绝等
+用例（那一刻是 `simcore` 212/212、查看器 168/168；当前数字见 §16）。其中第二周期用例还会
+保持所有可见引脚不变，确认 runtime 仍重新执行端口链，而不是只在首次求值时碰一次 RAM。
+
+仍有一条明确边界：RAM 内容可通过 `BuildOptions::initialize_memory` / `RuntimeConfig::initialize_memory`
+注入，但游戏关卡 `memory_manager` 的 reset-data 缓冲尚未桥接到这个回调。也就是说端口行为、容量、
+顺序和读写已经兼容；没有调用初始化回调的游戏绑定目前从全零 RAM 开始，带程序镜像的 CPU 还需要
+补上这条只读初始化桥。`sandbox-sim-components.txt` 现在会完整 dump 0x238 字节，并单列
+`worde0/worde8/wordf0/little178`，供下一步定位 reset-data 归属。
+
+## 16. 器件覆盖第一件：字宽 Mux（2026-09-29）
+
+**为什么先做它**：真机沙盒里正在跑的那块板上就有一块——`sandbox-sim-board.txt` 里标着
+`index=22` 的那条（构建器的位置下标是 21，所以它的器件叫 `u21_mux32`）是
+`kind=0x2a word30=3 word40=1 memory_bits=32`。而在这一节之前，simcore 递给它的是
+`FATAL: component … (kind 0x2A) has no device in the library`，整块板因此拒跑（红线 6 的
+正确行为，但覆盖缺一件就是缺一件）。
+
+**引脚顺序与宽度都不是猜的**：
+
+| 证据 | 它说了什么 |
+|---|---|
+| `build/kinds.txt`（2026-09-29 重 dump） | `0x2a name="Mux" inputs=3 outputs=1 in0=(-1,-1,w1) in1=(-1,0,wauto) in2=(-1,1,wauto) out0=(2,0,wauto)`：**选通脚是固定一位**，两条数据脚是自动宽度 |
+| 同一次真机 dump 的导线 | 落到 `in0` 的是 **1 位**线，`in1` 32 位、`in2` 16 位，输出 32 位——与"in0 是选通"逐条对上，且记录里的 `+0xe0` 正是被解析出来的 32 |
+| 关卡自己的判定 | `campaign/byte_mux/test.si`：`select == 1` 取 B，否则取 A；`ui.txt` 的三行输入名就是 Select/A/B |
+| 已经验过的元件形状 | `docs/verification.md` 的 `shape_mux8`（3×8 位 → 8 位，`byte_mux` 关卡 40 周期无失配）用的是同一套引脚顺序与语义 |
+
+**落点**：
+
+- `devices.hpp` 新增 `deviceMux(位宽, 弧延迟, 延迟类型)`：`S(1)/A(w)/B(w) → Y(w)`，行为就是逐位的
+  Verilog 条件算子（选通为 X 时保留两路一致的位，Z 按 X 处理），按位宽缓存，与
+  `deviceTriState`/`deviceSplitter` 同一形状；目录里原有的 `mux2` 变成它的**一位别名**，
+  语义只有一处实现；
+- `board.hpp` 把"自动宽度"从 Word Switch 一处推广成一张表：先取记录 `+0xe0`（游戏算好的宽度），
+  再取数据引脚上最宽的导线，**控制脚（选通 `in0`、使能 `in0`，都是 `w1`）永不参与加宽**；
+  `0x2a` 在引脚挂网时按解析出来的宽度建器件，宽度进名字（`u21_mux32`）以便读日志；
+- 交叉验证新增第八个电路 `mux_word`：4 位 A/B + 1 位选通，含"选通跳到 X、两路只在部分位上
+  一致"的一拍；iverilog 13.0 逐网一致，`y` 依次是 `1010 → 1100 → 1x10 → 1010 → 1111 → 1110`；
+- 查看器侧把真机记录固化成 `simcore/view/data/mux.txt`（元件 22 的那条记录 + 落在它引脚上的
+  四根导线），离线用例断言它不再是"没有器件"而是 `mux32`，并且**选通仍然接在那根一位网上**；
+
+**当前门槛**：`simcore` **234/234**、`simcore-view` **180/180**、`simcore-iverilog` **8/8**。
+
+**已知边界（不装懂）**：
+
+- 宽度来自"记录 `+0xe0`"或"数据导线里最宽的一根"；一根线都不接的 Mux 不会建器件（与
+  Word Switch、与所有引脚挂网规则一致），引脚上有多根线时按最宽的那根解析；
+- 多位网的成对弧延迟仍然是 §13.3 记的那条偏差，所以 `mux_word` 用同一个数做弧延迟；
+- 这一节列的那批"还没实现"的种类**已经全部落地**：`0x2D`/`0x2C`/`0x2B`（译码器）、
+  `0x10`/`0x30`（Maker / Word Maker）、`0x1A`（Equal）、`0x2F`（字宽 Splitter）在
+  docs/research/simcore-kind-coverage.md 的第三刀到第七刀里逐个交付，存储家族
+  （`0x27` Register、`0x26` Counter、`0x37` Delay Line）在第七刀补齐。现在只剩 `0x50`——
+  游戏自己拒绝放置它，交付形态是"识别并明确报未支持"。
+
+## 17. 屏幕与两个宿主外设：屏幕的语义、能画到哪一步（2026-09-29）
+
+`0x5b Screen` / `0x5c Time` / `0x5d Keyboard` 在真机那两块板子上都出现过（沙盒 dump 里的 39/40/41
+号元件，kind 正好是这三件），而在本节之前它们是**三条 fatal**：`no pin geometry`（查看器）
+与 `no device in the library`（构建器）——一条都足以让整块板子拒跑。这一节把"认识它们"做完，
+并说清"把屏幕画出来"还差什么。
+
+### 17.1 语义是游戏自己写的，不需要猜
+
+| 事实 | 证据（都在仓库里） |
+|---|---|
+| 三个输入：Enable（1 位）、Setting index（8 位）、Value（64 位）；没有输出 | `build/kinds.txt`：`0x5b name="Screen" inputs=3 outputs=0 in0=(-26,-19,w1) in1=(-26,-18,w8) in2=(-26,-17,w64)`；真机导线上落进 `in0` 的正是那根 1 位线 |
+| 三个脚的名字和用法 | `campaign/symphony_8_io_devices/meta.txt`：**"The screen has three inputs, Enable, Setting index and Value … Enable pin should be [T]"** |
+| 写设置的含义 | 同一关的 ISA：`screen %a, %b` = "Stores the value of %b in screen setting %a"，关卡的模拟器逐字照做（`test.si`：`screen_setting[a_value] = b_value`） |
+| 屏幕显示什么 | 屏幕自己的手册 `asset/manual/Circuits/The screen/doc.txt`：**"Link the screen to a RAM component to show the data inside"**；链接是屏幕角上的小红按钮（`test.si` 用 `get_screen_connection("screen") != "Main Memory"` 检查玩家是否接对） |
+| 四种模式与像素格式 | 同一页手册：mode 0 ASCII 8（96×40 字符；设置 0 模式 / 1 数据偏移 / 2 前景 / 3 背景 / 4 字体）、1 ASCII 32（每 4 字节 = 字符 + 前景 + 背景 + 填充）、2 Pixel 8（每字节一像素，`RRR GG BB`）、3 Pixel 32（每 4 字节 = R + G + B + 填充）；像素模式**分辨率 = 4×(setting+1) × 3×(setting+1)** |
+| 真机程序正是这么用的（交叉验证） | `symphony_8_io_devices/new_program.asm`：先 `screen 0 := 2`（Pixel 8）、`screen 1 := visual_data`（数据偏移）、`screen 2 := 19`（分辨率），而它的绘制代码每行前进 **80 字节** = `4×(19+1)` |
+
+### 17.2 这一轮落了什么
+
+- **`simcore/include/tcsim/screen.hpp`**：`ScreenSettings`（8 项设置表 + 越界索引记账）、
+  `ScreenImage` 与 `renderScreen()`（Pixel 8 / Pixel 32 逐字节渲染；ASCII 两种模式**明说**需要游戏
+  字库、不画假图；模式号不在 0–3 的按号报出来），以及三脚锁存器件 `screenSpec()`；
+- **`board.hpp`**：屏幕在引脚挂网时建成器件，并把设置表与三个网记进
+  `BuildResult::screens`；三个输入网同时进 `observed_nets`（游戏的屏幕逻辑读的就是它们），
+  这样"游戏读什么、我们就发布什么"；
+- **Time / Keyboard 按宿主源处理**：它们的输出网进 `source_nets`（值只有游戏知道，simcore 只当
+  影子），Keyboard 自己的那个输入脚不再被误当成它驱动的东西——`kindIsSource` 原先只覆盖
+  0 输入的种类，这条修正对所有源种类都成立；
+- **查看器**：`kind_pins.hpp` 补上三行几何。真机那块板子的 `0x5B/0x5C/0x5D` 三条
+  `no pin geometry` 随之消失；到 2026-09-30 为止，构建器那边**只剩 `0x50`** 一个未支持
+  （游戏自己拒绝放置它）。查看器的冻结表仍是单独维护的，存储家族的隐藏脚还没有画进那张表，
+  这是查看器侧的下一件小事，不影响沙盒本身；
+- **门槛**：`simcore` **255/255**、`simcore-view` **188/188**。
+
+### 17.3 还差一条数据桥：屏幕"画什么"
+
+屏幕没有输出脚，它的画面不是网上的值，而是**那颗被链接的 RAM 的字节**。所以"在 simcore 里同步
+显示"有两条路，各自缺一件可以在真机上一次量完的事实：
+
+1. **离线（simcore 自己算，最像影子）**：需要 (a) 屏幕→RAM 的链接字段（小红按钮写进屏幕记录的
+   哪个槽位——`ScreenBinding` 已经给它留了位置），(b) 那颗 RAM 的字节进 simcore（§15.3 已经列为
+   待办：游戏 `memory_manager` 的只读桥）。两件都到手后，`renderScreen()` 就能离线算出
+   "游戏现在应该显示什么"，与游戏画面逐像素对照——这正是查看器存在的理由；
+2. **在线（游戏自己算，最省事）**：游戏在 `redraw_screen__presenterZupdate95state95common_u67`
+   里把像素算进 `presenter.renderer.multi_mesh.screen_mesh`（该模块的符号有
+   `set8_bit_pixels`、`set32_bit_pixels`、`set_screen_setting`），插件把这个 mesh 的像素数组
+   转发进板子记录、查看器照画即可。它拿到的是游戏的原图，代价是"两边不会各说各话"这个用途变弱
+   （那是拷贝，不是独立计算）。
+
+测量脚本已经就位一半：`examples/sandbox-sim` 的 `dump=1` 会把**每颗元件的整条 0x238 字节**写进
+`sandbox-sim-components.txt`（`writeComponentRecords`），只要那块板子能绑定成功。上面第 1 条
+需要的两件事——链接字段与 RAM 字节——正好都在那份 dump 里能看出来。

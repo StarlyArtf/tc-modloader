@@ -1,5 +1,6 @@
 /* Test-only driver for the Float Ops editor rows in the game's own component
-   drawer (examples/float-ops/components_ui.cpp).
+   drawer (the rows are declared in examples/float-ops/editor.cpp and drawn by
+   the loader).
 
    It does the three things a player does and a script cannot: it selects one of
    the Mod's components through the board's own selection entry point, moves the
@@ -81,11 +82,21 @@ int body_click_attempts = 0;
 bool body_click = true;
 int palette_row = -1;
 int start_frame = 0, stage = 0, stage_frame = 0, clicks_sent = 0;
+/* The rectangle the row trace last agreed on, and how many reads in a row said
+   the same thing: the loader's row window is clamped on the first frames, and
+   the trace only appears about once a second. */
+float settled_x0 = -1.f, settled_y0 = -1.f, settled_x1 = -1.f, settled_y1 = -1.f;
+int settled_reads = 0;
 std::string target = "constant";
 std::string keys = "xy";
 std::string row_kind = "label";
 uint64_t target_custom_id = 0;
 std::string report_path;
+/* The loader's row window, from its own trace: the rows of a three-field type
+   are taller than the screen-clamped window, so the visible part of a row (not
+   its mathematical centre) is what a player can click. */
+float panel_x = 0.f, panel_y = 0.f, panel_w = 0.f, panel_h = 0.f;
+bool panel_valid = false;
 std::string bodies_path;
 uint64_t target_instance = 0;
 std::vector<RowBox> rows;
@@ -143,44 +154,57 @@ bool readRows() {
     std::FILE* file = std::fopen(report_path.c_str(), "rb");
     if (!file) return false;
     std::vector<RowBox> parsed;
-    char line[256] = {};
+    char line[512] = {};
     while (std::fgets(line, sizeof(line), file)) {
+        /* The rows are the loader's now (tc.component.editor), so the geometry
+           comes from its own trace - the same recipe
+           tests/component-editor-driver.cpp uses:
+
+             Component editor: row instance=0x… field="label" rect=x0,y0,x1,y1 …
+
+           The row rectangle is also the field a click lands on (the host draws
+           the widget inside it), so the two boxes below are the same one.  The
+           log grows, so the newest line for a field wins. */
         float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
-        char kind[64] = {};
-        if (std::sscanf(line, "field %63s %f %f %f %f", kind, &x0, &y0, &x1, &y1) == 5) {
-            for (RowBox& box : parsed) {
-                if (box.kind != kind) continue;
-                box.field_min_x = x0;
-                box.field_min_y = y0;
-                box.field_max_x = x1;
-                box.field_max_y = y1;
-                box.field_valid = x1 > x0 && y1 > y0;
-                break;
+        char field[64] = {};
+        {
+            float px = 0.f, py = 0.f, pw = 0.f, ph = 0.f;
+            if (std::sscanf(line,
+                            "Component editor: window instance=%*s pos=%f,%f size=%f,%f",
+                            &px, &py, &pw, &ph) == 4) {
+                panel_x = px;
+                panel_y = py;
+                panel_w = pw;
+                panel_h = ph;
+                panel_valid = pw > 0.f && ph > 0.f;
+                continue;
             }
+        }
+        if (std::sscanf(line,
+                        "Component editor: row instance=%*s field=\"%63[^\"]\" "
+                        "rect=%f,%f,%f,%f",
+                        field, &x0, &y0, &x1, &y1) != 5)
             continue;
+        RowBox box;
+        box.kind = field;
+        box.min_x = x0;
+        box.min_y = y0;
+        box.max_x = x1;
+        box.max_y = y1;
+        box.valid = x1 > x0 && y1 > y0;
+        box.field_min_x = x0;
+        box.field_min_y = y0;
+        box.field_max_x = x1;
+        box.field_max_y = y1;
+        box.field_valid = box.valid;
+        bool replaced = false;
+        for (RowBox& existing : parsed) {
+            if (existing.kind != box.kind) continue;
+            existing = box;
+            replaced = true;
+            break;
         }
-        if (std::sscanf(line, "choice %63s %f %f %f %f", kind, &x0, &y0, &x1, &y1) == 5) {
-            for (RowBox& box : parsed) {
-                if (box.kind != kind) continue;
-                box.choice_min_x = x0;
-                box.choice_min_y = y0;
-                box.choice_max_x = x1;
-                box.choice_max_y = y1;
-                box.choice_valid = x1 > x0 && y1 > y0;
-                break;
-            }
-            continue;
-        }
-        if (std::sscanf(line, "row %63s %f %f %f %f", kind, &x0, &y0, &x1, &y1) == 5) {
-            RowBox box;
-            box.kind = kind;
-            box.min_x = x0;
-            box.min_y = y0;
-            box.max_x = x1;
-            box.max_y = y1;
-            box.valid = x1 > x0 && y1 > y0;
-            parsed.push_back(box);
-        }
+        if (!replaced) parsed.push_back(box);
     }
     std::fclose(file);
     if (parsed.empty()) return false;
@@ -494,8 +518,34 @@ void tick(void*, const TCFrame* frame) {
             stage_frame = frame->frame_number;
             return;
         case 3: {
+            /* Re-read right before clicking: the loader clamps its row window
+               onto the screen, so the rectangle the first frames carried can sit
+               outside the client area while the settled one does not. */
+            (void)readRows();
             const RowBox* entry = row(row_kind.c_str());
             if (!entry) return;
+            /* ... and wait until two reads agree: the trace is written about
+               once a second, so the first batch after the drawer opens can still
+               be the unclamped one (same rule as
+               tests/component-editor-driver.cpp). */
+            const float stable_x0 = entry->field_valid ? entry->field_min_x : entry->min_x;
+            const float stable_y0 = entry->field_valid ? entry->field_min_y : entry->min_y;
+            const float stable_x1 = entry->field_valid ? entry->field_max_x : entry->max_x;
+            const float stable_y1 = entry->field_valid ? entry->field_max_y : entry->max_y;
+            if (stable_x0 != settled_x0 || stable_y0 != settled_y0 ||
+                stable_x1 != settled_x1 || stable_y1 != settled_y1) {
+                settled_x0 = stable_x0;
+                settled_y0 = stable_y0;
+                settled_x1 = stable_x1;
+                settled_y1 = stable_y1;
+                settled_reads = 0;
+                stage_frame = frame->frame_number;
+                return;
+            }
+            if (++settled_reads < 2) {
+                stage_frame = frame->frame_number;
+                return;
+            }
             /* The field, not the row: the label text next to it is not a widget,
                and what the player has to be able to reach is the input box. */
             const float min_x = entry->field_valid ? entry->field_min_x : entry->min_x;
@@ -508,9 +558,29 @@ void tick(void*, const TCFrame* frame) {
                own box. */
             float x = (min_x + max_x) * 0.5f;
             float y = (min_y + max_y) * 0.5f;
+            /* A group of radios is clicked on its last choice, not in the
+               middle: the row's traced rectangle covers the whole group, and the
+               middle can land between two radios (the old row window reported
+               the last radio's own box for the same reason). */
+            if (row_kind != "label" && row_kind != "value" && row_kind != "bits")
+                x = max_x - 4.f;
             if (entry->choice_valid) {
                 x = (entry->choice_min_x + entry->choice_max_x) * 0.5f;
                 y = (entry->choice_min_y + entry->choice_max_y) * 0.5f;
+            }
+            /* Click the part of the row the window actually shows: the loader
+               clamps its row window onto the screen, so the last row of a
+               three-field type can extend past its bottom edge (measured: the
+               label row of the Constant is 742..793 inside a 628..784 window). */
+            if (panel_valid) {
+                const float low = panel_y + 2.f;
+                const float high = panel_y + panel_h - 2.f;
+                if (y < low) y = low;
+                if (y > high) y = high;
+                const float left = panel_x + 2.f;
+                const float right = panel_x + panel_w - 2.f;
+                if (x < left) x = left;
+                if (x > right) x = right;
             }
             if (frame->frame_number - stage_frame < 40) {
                 moveTo(x, y);
@@ -545,6 +615,19 @@ void tick(void*, const TCFrame* frame) {
                typing into it.  The pointer is held on the field so a person
                moving the real mouse cannot take the hover off it mid-word. */
             if (frame->frame_number - stage_frame < 60) return;
+            /* Clear the box first with Backspace: the box already holds the
+               instance's value, and a player who wants a different number
+               replaces it rather than appending to it (the first run of
+               tests/float-width-playtest.ps1 typed "3.5" into a box showing "1"
+               and committed 13.5).  Backspace is what reaches ImGui through the
+               posted messages - a posted Ctrl+A does not update the key state
+               ImGui reads - and on an empty box it is a no-op. */
+            for (int index = 0; index < 16; ++index) {
+                sendKey(VK_BACK, true);
+                Sleep(20);
+                sendKey(VK_BACK, false);
+                Sleep(20);
+            }
             for (char value : keys) {
                 sendChar(value);
                 Sleep(60);

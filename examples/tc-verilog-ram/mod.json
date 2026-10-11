@@ -1,0 +1,10 @@
+{
+  "format": 2,
+  "id": "example.tc-verilog-ram",
+  "name": "TC-Verilog 元件编辑器",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "在游戏内编写并检查 TC-Verilog 元件；示例包含支持三态读出的 16x8 RAM。",
+  "capabilities": ["services", "ui_page"],
+  "native": {"api": 1, "entry": "native/tc-verilog-ram.dll"}
+}

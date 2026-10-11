@@ -1,0 +1,2 @@
+# Memory metadata carried by sandbox-sim-board.txt for offline replay.
+component index=0 kind=0x76 x=0 y=0 rotation=0 word30=0 word40=0 custom=0 memory_bits=8 memory_extra=16 little_endian=1

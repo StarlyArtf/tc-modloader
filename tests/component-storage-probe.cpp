@@ -446,9 +446,16 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     definition.default_config = kDefaultConfig;
     definition.config_migration_version = TC_COMPONENT_CONFIG_MIGRATION_VERSION_1;
     definition.migrate_config = &migrateConfig;
-    static const TCComponentLifecycleV1 lifecycle = {
-        sizeof(TCComponentLifecycleV1), TC_COMPONENT_LIFECYCLE_VERSION_1, nullptr, nullptr,
-        &configChanged, nullptr, &loaded, &saving};
+    /* Field by field: the structure grows by appending callbacks. */
+    static const TCComponentLifecycleV1 lifecycle = [] {
+        TCComponentLifecycleV1 value{};
+        value.size = sizeof(value);
+        value.version = TC_COMPONENT_LIFECYCLE_VERSION_1;
+        value.on_config_changed = &configChanged;
+        value.on_load = &loaded;
+        value.on_save = &saving;
+        return value;
+    }();
     definition.lifecycle = &lifecycle;
     if (tc::component_types::registerDefinition(types, &definition) != TC_COMPONENT_TYPES_OK)
         return 4;

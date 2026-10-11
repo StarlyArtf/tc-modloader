@@ -12,7 +12,7 @@
         the board, the probes and the scope read.
 
    The switch is a file, not a checkbox yet: `<game>/tc-modloader-data/
-   sandbox-sim.txt` with `enabled=1`.  Off (or missing) is the default and the
+   plugin-data/dev.sandbox-sim/sandbox-sim.txt` with `enabled=1`.  Off (or missing) is the default and the
    Mod then does nothing at all - red line 1 in the plan.  `invert=1` publishes
    the opposite value, which is how the real-machine test proves the bytes show
    what we wrote.  `trace=1` adds the per-wire diagnostics described below, and
@@ -21,6 +21,19 @@
    its end, which is the only way an edge detector's one-gate-delay pulse can
    reach the board and the scope (the plan's section 14.7); with `gate_delay`
    set to a whole unit (1024 ticks) that pulse is one published step wide.
+
+   `vcd=1` adds the other half of S4 on the game side: after `vcd_cycles`
+   cycles (default 60) of a binding, the engine's own trace is written as
+   standard VCD to the plugin's data directory (`sandbox-sim.vcd`).  It is the
+   same event list the offline iverilog cross-check compares and the same one the
+   scope reads, so a waveform opened in GTKWave cannot disagree with the board.
+
+   `dump=0` turns off the board record, which is on by default: the board the game
+   is running is written to `sandbox-sim-board.txt` in the format simcore-view
+   reads (`simcore/view/board_file.hpp`), refreshed about once a second and again
+   on every rebind.  That is the "sync" with the standalone window: the same
+   capture feeds the game, the offline tests and the GDI viewer, so a value the
+   board and the picture disagree on is a real signal about which layer is wrong.
 
    Values reach the screen through one hard contract: the board uploads the whole
    `simulation_state` array as a texture buffer every frame, and each wire
@@ -40,7 +53,9 @@
 #include "../../sdk/tc_component_instances.h"
 #include "../../sdk/tc_component_storage.h"
 #include "../../simcore/include/tcsim/board.hpp"
+#include "../../simcore/include/tcsim/custom.hpp"
 #include "../../simcore/include/tcsim/engine.hpp"
+#include "../../simcore/include/tcsim/observe.hpp"
 #include "../../simcore/include/tcsim/runtime.hpp"
 #include "cycle_unblock.hpp"
 
@@ -52,7 +67,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -64,6 +81,30 @@ tc::TCMod mod;
 bool enabled = false;
 bool invert_publish = false;
 bool trace_events = false;
+/* S4 on the game side: the engine's own trace, written as standard VCD (the
+   same data the offline iverilog cross-check compares), so the board, the scope
+   and an external viewer all read one set of events.  `vcd_cycles` is how many
+   cycles of a binding to capture; a sandbox edit rebinds and refreshes it. */
+bool vcd_export = false;
+int vcd_cycles = 60;
+bool vcd_written = false;
+/* The other half of "one capture, two consumers": the board the game is running
+   right now, written in the record format simcore/view (`board_file.hpp`) and
+   simcore's own tests read.  Point simcore-view at that file and the same board
+   is drawn through a completely different pipeline (GDI, not the game's ImGui) -
+   which is what tells "the game shows the value wrong" apart from "simcore
+   computes it wrong". */
+bool dump_board = true;
+/* The board the last bind saw, kept so the record file can be refreshed about
+   once a second (the report's cadence) without walking the game again. */
+tcsim::BoardView bound_view;
+/* The viewer is started for the player when the sandbox opens, so the "other
+   rendering pipeline" is on screen without anyone typing a command.  `view=0`
+   turns it off and `viewer=<path>` overrides where the exe is found. */
+bool view_auto = true;
+std::string viewer_override;
+bool view_launched = false;
+HANDLE viewer_process = nullptr;
 bool startup_seed = false;
 bool sandbox_active = false;
 /* Diagnostic switch (2026-09-25): 0 leaves the game's own cycle/compile passes
@@ -213,6 +254,74 @@ std::string dataPath(const char* name) {
     return (std::filesystem::u8path(host->data_directory_utf8) / name).u8string();
 }
 
+std::filesystem::path pluginNativeDirectory() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&host), &module) ||
+        !module)
+        return {};
+    wchar_t path[32768] = {};
+    const DWORD count = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+    if (!count || count >= std::size(path)) return {};
+    return std::filesystem::path(path).parent_path();
+}
+
+bool viewerIsRunning() {
+    if (!viewer_process) return false;
+    if (WaitForSingleObject(viewer_process, 0) == WAIT_TIMEOUT) return true;
+    CloseHandle(viewer_process);
+    viewer_process = nullptr;
+    view_launched = false;
+    return false;
+}
+
+/* Start the viewer on this board, with `--watch` so it follows the record the
+   game keeps writing.  The packaged executable lives beside this DLL in the
+   loader's native cache.  The old data/game-directory locations and an
+   explicit `viewer=<path>` remain useful development fallbacks. */
+void launchViewer() {
+    if (!view_auto || viewerIsRunning() || view_launched) return;
+    const std::string board = dataPath("sandbox-sim-board.txt");
+    if (board.empty()) return;
+    std::vector<std::string> candidates;
+    if (!viewer_override.empty()) candidates.push_back(viewer_override);
+    const std::filesystem::path native = pluginNativeDirectory();
+    if (!native.empty()) candidates.push_back((native / "simcore-view.exe").u8string());
+    if (host && host->data_directory_utf8) {
+        const std::filesystem::path data = std::filesystem::u8path(host->data_directory_utf8);
+        candidates.push_back((data / "simcore-view.exe").u8string());
+        candidates.push_back((data / ".." / ".." / ".." / "simcore-view.exe").lexically_normal().u8string());
+    }
+    bool found_executable = false;
+    for (const std::string& exe : candidates) {
+        std::error_code error;
+        if (!std::filesystem::exists(std::filesystem::u8path(exe), error) || error) continue;
+        found_executable = true;
+        const std::string command = "\"" + exe + "\" --board \"" + board + "\" --watch";
+        std::string mutable_command = command;
+        STARTUPINFOA startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                           CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, nullptr, nullptr, &startup,
+                           &process)) {
+            CloseHandle(process.hThread);
+            viewer_process = process.hProcess;
+            view_launched = true;
+            log("sandbox-sim: started the viewer: " + command);
+            return;
+        } else {
+            log("sandbox-sim: could not start the viewer (error " +
+                std::to_string(GetLastError()) + "): " + exe);
+        }
+    }
+    log(found_executable
+            ? "sandbox-sim: every simcore-view.exe candidate failed to start"
+            : "sandbox-sim: no packaged simcore-view.exe, data/game-directory copy, or override; set "
+              "viewer=<path> in sandbox-sim.txt");
+}
+
 /* The board's own prototype table answers the pin geometry, so this Mod and the
    offline test run the same builder over the same numbers. */
 bool prototypeGeometry(const tcsim::BoardComponent& component, tcsim::KindPins& out) {
@@ -220,11 +329,15 @@ bool prototypeGeometry(const tcsim::BoardComponent& component, tcsim::KindPins& 
     if (!mod.game.getPrototype(component.kind, component.custom_id, prototype)) return false;
     const uint64_t inputs = tc::prototypeInputCount(prototype);
     const uint64_t outputs = tc::prototypeOutputCount(prototype);
-    if (inputs > 8 || outputs > 4) return false;
+    /* What the table can hold, not what the built-ins need: a custom
+       component's interface is whatever its author drew (the player's own
+       `Symphony/DEC` has seven outputs, a 5-to-32 decoder thirty-two), and a
+       cap of eight refused those boards with "no pin geometry". */
+    if (inputs > tcsim::KindPins::kMaxPins || outputs > tcsim::KindPins::kMaxPins) return false;
     out = tcsim::KindPins{};
     out.kind = component.kind;
     out.name = tc::prototypeNameCStr(prototype);
-    out.input_count = static_cast<uint8_t>(inputs);
+    out.declared_inputs = static_cast<uint8_t>(inputs);
     out.output_count = static_cast<uint8_t>(outputs);
     for (uint64_t index = 0; index < inputs; ++index) {
         const tc::TCPinPoint point = tc::prototypeInputPinPoint(prototype, index);
@@ -240,6 +353,24 @@ bool prototypeGeometry(const tcsim::BoardComponent& component, tcsim::KindPins& 
         const uint64_t raw = tc::prototypeOutputPinWordSize(prototype, index);
         out.out_bits[index] = tc::pinWordSizeIsAuto(raw) || raw == 0 ? 1 : static_cast<uint16_t>(raw < 64 ? raw : 64);
     }
+    /* The storage family's data/enable/reset pins live in the prototype's second
+       input list (+0x70): the palette does not draw them and
+       `prototypeInputCount` does not count them, but the game wires them and its
+       compiler reads them, so a board builder that stopped at the declared pins
+       would see a register with no inputs at all. */
+    const uint64_t hidden = tc::prototypeHiddenPinCount(prototype);
+    for (uint64_t index = 0; index < hidden && index < 8; ++index) {
+        const tc::TCPinPoint point = tc::prototypeHiddenPinPoint(prototype, index);
+        out.hidden_x[index] = static_cast<int8_t>(point.x);
+        out.hidden_y[index] = static_cast<int8_t>(point.y);
+        const uint64_t raw = tc::prototypeHiddenPinWordSize(prototype, index);
+        out.hidden_bits[index] =
+            tc::pinWordSizeIsAuto(raw) || raw == 0 ? 1 : static_cast<uint16_t>(raw < 64 ? raw : 64);
+    }
+    out.hidden_count = static_cast<uint8_t>(hidden < 8 ? hidden : 8);
+    /* The record counts the hidden pins, so the total is what a builder has to
+       report for the geometry check to pass. */
+    out.input_count = static_cast<uint8_t>(out.declared_inputs + out.hidden_count);
     return true;
 }
 
@@ -339,7 +470,9 @@ void applyInteractiveOverride() {
 }
 
 /* A source net's value: a host component answers from its own configuration,
-   everything else from the byte the game's state array holds. */
+   everything else from the little-endian bytes the game's state array holds.
+   Addresses and data buses are wider than one byte, so reading only slots[0]
+   would make every RAM access target address zero or one. */
 uint64_t readSourceNet(tcsim::NetId net, const std::vector<uint64_t>& slots, unsigned char* buffer) {
     const tcsim::BuildResult& build = runtime.build();
     const std::vector<tcsim::NetId>& sources = runtime.sourceNets();
@@ -355,7 +488,12 @@ uint64_t readSourceNet(tcsim::NetId net, const std::vector<uint64_t>& slots, uns
         }
     }
     if (slots.empty() || slots[0] >= state_size) return 0;
-    return buffer[slots[0]] & 1u;
+    const uint16_t bits = runtime.netlist().net(net).bits;
+    const uint16_t bytes = static_cast<uint16_t>(std::min<uint32_t>(8u, (bits + 7u) / 8u));
+    uint64_t value = 0;
+    for (uint16_t byte = 0; byte < bytes && slots[0] + byte < state_size; ++byte)
+        value |= static_cast<uint64_t>(buffer[slots[0] + byte]) << (byte * 8u);
+    return value;
 }
 
 void noteCuts(const char* phase, const std::vector<sandbox_cycle_unblock::Cut>& cuts) {
@@ -618,15 +756,193 @@ void armCycleUnblock() {
 
 /* Binds the runtime to the board the game is showing.  Called again whenever
    the board object changes (a new level, or an edit that reloads it). */
+void writeBoardRecord(const void* board, const tcsim::BoardView& view);
+void writeCustomDefinitions(std::ostream& out, const tcsim::BoardView& view);
+
+/* ---- custom components: flatten the definition into the board ------------
+
+   A custom component (kind 0x4e) is a *definition*: the game parsed a circuit
+   and keeps it in the custom-prototype table.  The prototype carries that
+   circuit as two counted arrays -
+
+     +0xe0  component count        +0xe8  component data
+     +0x100 wire count             +0x108 wire data
+
+   - and both use the *same element layouts the board itself uses* (components
+   0x238 bytes with kind/x/y/rotation/id at +0/+2/+4/+6/+8, the same record
+   `readBoard` walks; wires with their two endpoints at +0x18..+0x1e and their
+   width at +0x30).  The array data starts eight bytes after the pointer (the
+   sequence's own header sits in front of it).  See
+   docs/research/custom-components.md for the run that measured this.
+
+   Flattening: each definition's internals are copied into the netlist's board
+   view, moved far from every real coordinate (so nothing can collide), and
+   joined to the instance's own pins **by index** - the k-th Input Pin of the
+   definition to the k-th input pin of the instance, and the k-th Output Pin to
+   the k-th output.  By index, because the instance's pin geometry is the
+   normalised one the palette shows while the definition's pins sit wherever its
+   author drew them (measured: `Symphony/DEC`'s instance pins are a vertical
+   column at x=1 while its definition's seven output pins run along y=-4). */
+/* Is [pointer, pointer + bytes) inside committed, unguarded memory?  A counted
+   array read out of a prototype is only safe when the whole thing really is
+   there - see readCustomDefinition. */
+bool memoryReadable(const void* pointer, uint64_t bytes) {
+    if (!pointer || bytes == 0) return false;
+    const auto* start = static_cast<const unsigned char*>(pointer);
+    /* Walk region by region rather than testing the two ends: an allocation is
+       not required to sit inside one region, and demanding that it does threw
+       away perfectly good definitions.  Every byte still has to be committed
+       and unguarded, which is what makes reading the array safe. */
+    uint64_t done = 0;
+    while (done < bytes) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(start + done, &info, sizeof(info)) != sizeof(info)) return false;
+        if (info.State != MEM_COMMIT) return false;
+        if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        const uint64_t base = reinterpret_cast<uint64_t>(info.BaseAddress);
+        const uint64_t here = reinterpret_cast<uint64_t>(start + done);
+        if (here < base || info.RegionSize <= here - base) return false;
+        done += info.RegionSize - (here - base);
+    }
+    return true;
+}
+
+bool readCustomDefinition(uint64_t custom_id, tcsim::CustomDefinition& out) {
+    /* Two things a prototype can be, and only one of them is a definition.  The
+       sandbox's own clock/switch/button and every component a Mod registered
+       with a C++ callback instead of a circuit (`local.float-ops`' types) are
+       custom prototypes too - but their `+0xe0`/`+0xe8` are not a counted array
+       of components, and reading them as one is what crashed the game in
+       `on_frame`.  Refuse the host ids outright, and then demand that both
+       arrays are provably there before a single record is decoded. */
+    if (tcsim::customIsClock(custom_id) || tcsim::customIsInteractiveSource(custom_id)) return false;
+    tc::TCPrototype prototype{};
+    if (!mod.game.getPrototype(0x4e, custom_id, prototype)) return false;
+    const auto arrayOf = [&prototype](size_t countOffset, size_t pointerOffset, uint64_t stride,
+                                      uint64_t& count, const unsigned char*& data) {
+        std::memcpy(&count, prototype.bytes + countOffset, sizeof(count));
+        const void* pointer = nullptr;
+        std::memcpy(&pointer, prototype.bytes + pointerOffset, sizeof(pointer));
+        if (!pointer || count == 0 || count > 4096) return false;
+        /* The element array starts eight bytes into the sequence (its own header
+           sits in front); the count only means something if that many elements
+           are really mapped. */
+        if (!memoryReadable(pointer, 8 + count * stride)) {
+            log("sandbox-sim: definition array at " + std::to_string(pointerOffset) + " count=" +
+                std::to_string(count) + " pointer=0x" + [&pointer] {
+                    char text[32] = {};
+                    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(
+                                                                    reinterpret_cast<uintptr_t>(pointer)));
+                    return std::string(text);
+                }() + " is not readable for " + std::to_string(8 + count * stride) + " bytes");
+            return false;
+        }
+        data = static_cast<const unsigned char*>(pointer) + 8;
+        return true;
+    };
+    uint64_t componentCount = 0;
+    const unsigned char* componentData = nullptr;
+    uint64_t wireCount = 0;
+    const unsigned char* wireData = nullptr;
+    if (!arrayOf(0xe0, 0xe8, 0x238, componentCount, componentData)) return false;
+    /* A definition's wire records use the *board's* wire layout: stride 0x68,
+       endpoints at +0x18..+0x1e, legs at +0x20/+0x28.  The earlier "0x40" came
+       from the probe's own guess and made most internal wires read as garbage
+       (measured 2026-09-30: with 0x68 every sampled record lands on a plausible
+       pair of endpoints, with 0x40 only every other one does). */
+    if (!arrayOf(0x100, 0x108, 0x68, wireCount, wireData)) return false;
+    for (uint64_t index = 0; index < componentCount; ++index) {
+        unsigned char record[0x238];
+        std::memcpy(record, componentData + index * 0x238, sizeof(record));
+        /* A definition record's settings count/pointer (`+0xa8`/`+0xb0`) is the
+           board layout's field, and it is where a Static Indexer keeps its
+           signed shift - so it has to be kept when it is real, and it must not
+           be followed when it is not (that dereference is the other way a
+           prototype that is not a definition can fault). */
+        {
+            uint64_t setting_count = 0;
+            std::memcpy(&setting_count, record + 0xa8, 8);
+            const void* settings = nullptr;
+            std::memcpy(&settings, record + 0xb0, 8);
+            if (setting_count == 0 || setting_count >= 1024 || !memoryReadable(settings, 16)) {
+                std::memset(record + 0xa8, 0, 8);
+                std::memset(record + 0xb0, 0, 8);
+            }
+        }
+        tcsim::BoardComponent component = tcsim::readComponentRecord(record);
+        /* A definition's records do not repeat the pin counts the way a board
+           record does (measured: `Symphony/DEC`'s seven Output Pins read 0/0
+           while the prototype table says 1/0), so they come from the same table
+           the geometry does - which is also what the netlist builder's own
+           cross-check compares against. */
+        tc::TCPrototype kind_prototype{};
+        if (mod.game.getPrototype(component.kind, component.custom_id, kind_prototype)) {
+            /* The record's count is the total the builder cross-checks, and for
+               the storage family that total includes the prototype's hidden
+               pins (a Register's enable and data pins), exactly as
+               `prototypeGeometry` reports them. */
+            component.input_count = static_cast<uint8_t>(tc::prototypeInputCount(kind_prototype) +
+                                                         tc::prototypeHiddenPinCount(kind_prototype));
+            component.output_count = static_cast<uint8_t>(tc::prototypeOutputCount(kind_prototype));
+        }
+        out.components.push_back(component);
+    }
+    for (uint64_t index = 0; index < wireCount; ++index) {
+        const unsigned char* record = wireData + index * 0x68;
+        tcsim::BoardWire wire = tcsim::readWireRecord(record);
+        /* Inside a definition there is no state byte of the game's to publish
+           to: the sentinel keeps the netlist builder from writing into whatever
+           offset the record happened to carry. */
+        wire.slot = tcsim::kNoStateSlot;
+        out.wires.push_back(wire);
+    }
+    return true;
+}
+
 bool bindRuntime(const void* board, const tcsim::BoardView& view) {
     tcsim::RuntimeConfig config;
     config.ticks_per_unit = static_cast<tcsim::Tick>(ticks_per_unit);
     config.cycle_units = static_cast<tcsim::Tick>(cycle_units);
     config.gate_delay = tcsim::ArcDelay{static_cast<tcsim::Tick>(gate_delay), static_cast<tcsim::Tick>(gate_delay)};
     config.trace = trace_events || startup_seed;
+    /* Written before the bind attempt: a board simcore refuses is exactly the
+       board whose record someone wants to look at in the viewer. */
+    bound_view = view;
+    writeBoardRecord(board, view);
+    /* Only in the sandbox, and only after the record exists: the viewer is
+       started with `--board <that file>`, so it has to be there first. */
+    if (sandbox_active) launchViewer();
     runtime = tcsim::SandboxRuntime();
-    if (!runtime.bind(view, &prototypeGeometry, config)) {
+    /* Custom components are flattened into the board before the netlist is
+       built: their internals become ordinary records and the instance's pins are
+       bridged to the definition's boundary pins.  The raw `view` is still what
+       the viewer and the slot bookkeeping use.  The algorithm itself lives in
+       simcore/include/tcsim/custom.hpp, because the viewer has to run the very
+       same one over the definitions the board file carries - a second copy is
+       how the two ends drift apart. */
+    const tcsim::BoardView netlist_view = tcsim::flattenCustomComponents(
+        view, readCustomDefinition,
+        [](const tcsim::BoardComponent& component, tcsim::KindPins& pins) {
+            return prototypeGeometry(component, pins);
+        });
+    if (!runtime.bind(netlist_view, &prototypeGeometry, config)) {
         last_error = runtime.notes().empty() ? "bind failed" : runtime.notes().front();
+        /* A custom component whose definition could not be read keeps its own
+           record, and the builder then says so by id - which is the honest
+           answer, but the reason (no definition) is what a reader needs. */
+        for (const tcsim::BoardComponent& component : view.components) {
+            if (component.kind != 0x4e) continue;
+            if (tcsim::customIsClock(component.custom_id) ||
+                tcsim::customIsInteractiveSource(component.custom_id)) continue;
+            tcsim::CustomDefinition probe;
+            if (!readCustomDefinition(component.custom_id, probe))
+            {
+                std::ostringstream text;
+                text << "sandbox-sim: custom 0x" << std::hex << component.custom_id << std::dec
+                     << " has no readable definition, so it cannot be simulated";
+                log(text.str());
+            }
+        }
         log("sandbox-sim: cannot run this board: " + last_error);
         runtime_bound = false;
         return false;
@@ -635,11 +951,24 @@ bool bindRuntime(const void* board, const tcsim::BoardView& view) {
     bound_board = board;
     bound_components = view.components.size();
     bound_slot_signature = slotSignature(view);
+    vcd_written = false;
     failed_board = nullptr;
     failed_components = 0;
     failed_slot_signature = 0;
     last_cycle = -1;
     log("sandbox-sim: bound board -> " + runtime.describe());
+    /* Which devices this board became, in order.  A count in the line above
+       says nothing about *which* kinds were recognised, and "the register did
+       not become a device" is the first thing to check when a value looks
+       wrong. */
+    {
+        std::string names;
+        for (const tcsim::DeviceInstance& device : runtime.netlist().devices()) {
+            if (!names.empty()) names += ", ";
+            names += device.name;
+        }
+        log("sandbox-sim: devices -> " + (names.empty() ? std::string("(none)") : names));
+    }
     for (const tcsim::BuildNote& note : runtime.build().notes) {
         log("sandbox-sim: note: " + note.text);
     }
@@ -656,7 +985,417 @@ unsigned char* stateArray() {
     return buffer;
 }
 
+/* The engine's trace as a VCD document.  What `simcore/tests` and the iverilog
+   cross-check read offline, now written from inside the running game: the same
+   events the board and the scope show. */
+void writeVcd() {
+    if (!runtime_bound) return;
+    const std::string path = dataPath("sandbox-sim.vcd");
+    if (path.empty()) return;
+    const std::string text =
+        tcsim::writeVcd(runtime.netlist(), runtime.engine().trace(), "sandbox", "1ps");
+    std::ofstream(path, std::ios::trunc) << text;
+    log("sandbox-sim: wrote " + path + " (" +
+        std::to_string(runtime.engine().trace().size()) + " event(s), " +
+        std::to_string(runtime.netlist().netCount()) + " nets, " +
+        std::to_string(runtime.engine().violations().size()) + " violation(s))");
+}
+
+/* The route the game draws for one wire, as absolute board points.
+
+   The record's leg seq is (+0x20 count, +0x28 data) and each leg is a
+   (direction, length) pair of u16; the direction codes are the eight 45-degree
+   steps counter-clockwise from +x in a y-up space, which is what the measured
+   wires say: a straight (+3,0) wire is one (0,3), the wire (-7,-12)->(-4,-17)
+   is (7,3)+(6,2), and (-4,-11)->(-7,-16) is (6,1)+(5,3)+(6,1) - each sum equal
+   to the endpoint difference with y flipped.  Directions 1-4 are that same
+   rotation; everything else here is measured. */
+bool wirePathPoints(const void* board, uint64_t index, std::vector<std::pair<int, int>>& out) {
+    out.clear();
+    if (!board) return false;
+    const auto* bytes = static_cast<const unsigned char*>(board);
+    const uint64_t count = tcsim::board_detail::readU64(bytes, 0x98);
+    const unsigned char* data = nullptr;
+    std::memcpy(&data, bytes + 0xa0, sizeof(data));
+    if (!data || index >= count || count > 65536) return false;
+    const unsigned char* record = data + 8 + index * 0x68;
+    const uint32_t legs = static_cast<uint32_t>(tcsim::board_detail::readU64(record, 0x20) & 0xffffu);
+    const uint64_t legs_at = tcsim::board_detail::readU64(record, 0x28);
+    if (legs == 0 || legs > 64) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    const void* legs_ptr = reinterpret_cast<const void*>(legs_at);
+    if (!legs_ptr || VirtualQuery(legs_ptr, &info, sizeof(info)) != sizeof(info)) return false;
+    if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    const auto begin = reinterpret_cast<uintptr_t>(legs_at);
+    const auto end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    if (end < begin || end - begin < 8 + static_cast<uintptr_t>(legs) * 4) return false;
+    static const int kDx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+    static const int kDy[8] = {0, -1, -1, -1, 0, 1, 1, 1}; /* leg space, y up */
+    int x = tcsim::board_detail::readU64(record, 0x18) & 0xffff;
+    int y = tcsim::board_detail::readU64(record, 0x1a) & 0xffff;
+    if (x >= 0x8000) x -= 0x10000;
+    if (y >= 0x8000) y -= 0x10000;
+    out.push_back({x, y});
+    const auto* payload = reinterpret_cast<const unsigned char*>(legs_at);
+    for (uint32_t leg = 0; leg < legs; ++leg) {
+        const uint16_t direction = static_cast<uint16_t>(payload[8 + leg * 4]) |
+                                   (static_cast<uint16_t>(payload[9 + leg * 4]) << 8);
+        const uint16_t length = static_cast<uint16_t>(payload[10 + leg * 4]) |
+                                (static_cast<uint16_t>(payload[11 + leg * 4]) << 8);
+        if (direction > 7 || length == 0 || length > 256) return false;
+        x += kDx[direction] * length;
+        y -= kDy[direction] * length;
+        out.push_back({x, y});
+    }
+    return out.size() >= 2;
+}
+
+/* The board as simcore-view reads it.  One capture, two consumers: the same text
+   the viewer draws through GDI and the offline tests parse.  A wire that reports
+   its legs also carries `path=`, which is how the picture ends up with the route
+   the game actually draws instead of one the viewer invents. */
+/* The pins the game's own prototype table answers for one component, in the
+   record format simcore/view/board_file.hpp reads.  Written for *every*
+   component - the board's own and a definition's internals alike - because
+   the viewer runs with no game attached, and a component it cannot place is
+   a component it cannot flatten.  Order: the prototype's declared pins,
+   then its hidden ones, which is the order the record counts them in. */
+void writePinGeometry(std::ostream& out, const tcsim::BoardComponent& component) {
+    tcsim::KindPins shape;
+    if (!prototypeGeometry(component, shape)) return;
+    const auto pin_offset = [&shape](uint8_t pin) {
+        return pin < shape.declared_inputs
+                   ? std::pair<int, int>{shape.in_x[pin], shape.in_y[pin]}
+                   : std::pair<int, int>{shape.hidden_x[pin - shape.declared_inputs],
+                                         shape.hidden_y[pin - shape.declared_inputs]};
+    };
+    const auto pin_bits = [&shape](uint8_t pin) {
+        return pin < shape.declared_inputs ? shape.in_bits[pin]
+                                           : shape.hidden_bits[pin - shape.declared_inputs];
+    };
+    out << " inbits=";
+    for (uint8_t pin = 0; pin < shape.input_count; ++pin) {
+        if (pin) out << ";";
+        out << static_cast<int>(pin_bits(pin) ? pin_bits(pin) : 1);
+    }
+    out << " outbits=";
+    for (uint8_t pin = 0; pin < shape.output_count; ++pin) {
+        if (pin) out << ";";
+        out << static_cast<int>(shape.out_bits[pin] ? shape.out_bits[pin] : 1);
+    }
+    out << " inpins=";
+    for (uint8_t pin = 0; pin < shape.input_count; ++pin) {
+        if (pin) out << ";";
+        const std::pair<int, int> offset = pin_offset(pin);
+        out << offset.first << "," << offset.second;
+    }
+    out << " outpins=";
+    for (uint8_t pin = 0; pin < shape.output_count; ++pin) {
+        if (pin) out << ";";
+        out << static_cast<int>(shape.out_x[pin]) << "," << static_cast<int>(shape.out_y[pin]);
+    }
+}
+
+void writeBoardRecord(const void* board, const tcsim::BoardView& view) {
+    if (!dump_board) return;
+    const std::string path = dataPath("sandbox-sim-board.txt");
+    if (path.empty()) return;
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return;
+    out << "# dev.sandbox-sim: the board the game is running, in the record format\n"
+           "# simcore/view/board_file.hpp and simcore/tests read.  Start the viewer with\n"
+           "#   build\\simcore-view.exe --board <this file>\n";
+    for (size_t index = 0; index < view.components.size(); ++index) {
+        const tcsim::BoardComponent& component = view.components[index];
+        /* The game leaves a kind-0 tombstone where a component was deleted (the
+           handoff's "撤销的墓碑"); it is not a circuit record, and a viewer that
+           meets an unknown kind refuses to run the board at all - which would
+           turn "watch the values" into a static picture. */
+        if (component.kind == 0) continue;
+        out << "component index=" << index << " kind=0x" << std::hex
+            << static_cast<int>(component.kind) << std::dec << " x=" << component.x
+            << " y=" << component.y << " rotation=" << static_cast<int>(component.rotation)
+            << " word30=" << static_cast<int>(component.input_count)
+            << " word40=" << static_cast<int>(component.output_count)
+            << " custom=" << component.custom_id
+            << " memory_bits=" << component.memory_bits
+            << " memory_extra=" << component.memory_extra_address_bits
+            << " little_endian=" << (component.memory_little_endian ? 1 : 0)
+            /* A Static Indexer keeps the field it reads in +0x70, and the
+               viewer has no other way to learn it - its frozen table only knows
+               the kinds, not one instance's setting. */
+            << " field_bits=" << component.field_bits;
+        /* The level an interactive source is holding right now.  It lives in the
+           component's own host-owned configuration (a click writes it there), not
+           in the state array the wires carry, so a viewer that only reads the
+           record would show every switch as low. */
+        if (component.id) {
+            out << " id=" << component.id;
+            const auto level = interactive_levels.find(component.id);
+            if (level != interactive_levels.end())
+                out << " level=" << static_cast<int>(level->second & 1u);
+        }
+        /* Every pin the game's own prototype table answers for this component,
+           with its width.  This used to be written for Mod types only (kind
+           0x4e), because a Mod's interface is whatever its author drew and no
+           frozen table can know it.  The rest of the board needs it just as
+           much: the viewer runs with no game attached, so a component that does
+           not carry its own geometry falls back to a frozen copy of this table -
+           and that copy is exactly what drifted, leaving the viewer refusing a
+           board with a 3 Bit Decoder, a Register or a Splitter while this Mod
+           simulated it happily.  Carrying the geometry makes the picture agree
+           with the simulation by construction.
+
+           Order: the prototype's declared pins, then its hidden ones - the same
+           order the record counts them in, and the order the netlist builder
+           numbers a device's input pins in. */
+        writePinGeometry(out, component);
+        out << "\n";
+    }
+    for (size_t index = 0; index < view.wires.size(); ++index) {
+        const tcsim::BoardWire& wire = view.wires[index];
+        out << "wire index=" << index << " from=" << wire.x1 << "," << wire.y1 << " to=" << wire.x2
+            << "," << wire.y2 << " width=" << wire.width << " slot=" << wire.slot;
+        /* What the wire is showing right now.  A latch's state is its past, and
+           a viewer that replays the board from scratch would start every
+           feedback loop at X - so the current value travels with the record and
+           the viewer seeds its engine with it. */
+        if (runtime_bound && index < runtime.build().net_of_wire.size()) {
+            const tcsim::NetId net = runtime.build().net_of_wire[index];
+            if (net != tcsim::kNoNet)
+                out << " value=" << static_cast<int>(runtime.boardByte(net) & 1u);
+        }
+        std::vector<std::pair<int, int>> path;
+        if (wirePathPoints(board, index, path)) {
+            out << " path=";
+            for (size_t step = 0; step < path.size(); ++step) {
+                if (step) out << ";";
+                out << path[step].first << "," << path[step].second;
+            }
+        }
+        out << "\n";
+    }
+    writeCustomDefinitions(out, view);
+}
+
+/* The definitions behind the board's custom components.  The viewer has no game
+   to ask, so a board that carries a custom component has to carry the circuit
+   behind it too - otherwise the viewer can only refuse the board ("custom
+   component ... has no sandbox simulator behavior") while this Mod simulates it
+   happily.  Nested definitions are written as well: a definition may itself
+   place another custom component.
+
+   Each line ends with `def=0x<id>` so one parser can read a definition's
+   components and wires with the very same field layout the board's own lines
+   use (the viewer strips the three-character prefix). */
+void writeCustomDefinitions(std::ostream& out, const tcsim::BoardView& view) {
+    /* writeBoardRecord runs about once a second (and again on every board
+       change), and every definition it writes has to be read out of the
+       game's own memory.  Cache the text per board: the walk over the
+       prototype table happens once, not once per frame. */
+    static std::string cached;
+    static uint64_t cached_signature = 0;
+    uint64_t signature = 0x9e3779b97f4a7c15ull;
+    const auto mix = [&signature](uint64_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+    mix(view.components.size());
+    mix(view.wires.size());
+    for (const tcsim::BoardComponent& component : view.components) {
+        if (component.kind == 0x4e) mix(component.custom_id);
+    }
+    if (signature != cached_signature) {
+        std::ostringstream text;
+        std::set<uint64_t> written;
+        std::vector<uint64_t> pending;
+        for (const tcsim::BoardComponent& component : view.components) {
+            if (component.kind == 0x4e) pending.push_back(component.custom_id);
+        }
+        while (!pending.empty()) {
+            const uint64_t id = pending.back();
+            pending.pop_back();
+            if (!id || written.count(id)) continue;
+            written.insert(id);
+            tcsim::CustomDefinition definition;
+            if (!readCustomDefinition(id, definition)) continue;
+            text << "defcustom id=0x" << std::hex << id << std::dec
+                << " components=" << definition.components.size() << " wires=" << definition.wires.size() << "\n";
+            for (size_t index = 0; index < definition.components.size(); ++index) {
+                const tcsim::BoardComponent& component = definition.components[index];
+                if (component.kind == 0x4e) pending.push_back(component.custom_id);
+                text << "defcomponent index=" << index << " kind=0x" << std::hex
+                    << static_cast<int>(component.kind) << std::dec << " x=" << component.x << " y=" << component.y
+                    << " rotation=" << static_cast<int>(component.rotation)
+                    << " word30=" << static_cast<int>(component.input_count)
+                    << " word40=" << static_cast<int>(component.output_count)
+                    << " custom=" << component.custom_id;
+                /* The pins travel too.  A definition may place another custom
+                   component, and flattening that nested instance needs *its* pins -
+                   which only the game knew.  The fields go before `def=` because
+                   the pin lists run to the end of the line. */
+                if (component.id) text << " id=" << component.id;
+                text << " field_bits=" << component.field_bits << " def=0x" << std::hex << id << std::dec;
+                writePinGeometry(text, component);
+                text << "\n";
+            }
+            for (size_t index = 0; index < definition.wires.size(); ++index) {
+                const tcsim::BoardWire& wire = definition.wires[index];
+                text << "defwire index=" << index << " from=" << wire.x1 << "," << wire.y1 << " to=" << wire.x2 << ","
+                    << wire.y2 << " width=" << wire.width << " def=0x" << std::hex << id << std::dec << "\n";
+            }
+        }
+        cached = text.str();
+        cached_signature = signature;
+    }
+    out << cached;
+}
+
+/* The runtime wire record is 0x68 bytes.  The endpoints (+0x18), the width
+   (+0x30) and the state slot (+0x38) are mapped; the rest is not - and a wire's
+   own route, if the game keeps one, has to live in there, because a straight
+   line between two cells cannot draw the bent wires a player makes.  Dump the
+   raw records so that question is answered from a board instead of guessed at
+   (that is the measurement the "carry the real path into the record" step
+   needs; nothing is parsed from it yet). */
+void writeWireRecords(const void* board) {
+    if (!dump_board || !board) return;
+    const std::string path = dataPath("sandbox-sim-wires.txt");
+    if (path.empty()) return;
+    const auto* bytes = static_cast<const unsigned char*>(board);
+    const uint64_t count = tcsim::board_detail::readU64(bytes, 0x98);
+    const unsigned char* data = nullptr;
+    std::memcpy(&data, bytes + 0xa0, sizeof(data));
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return;
+    if (!data || count > 65536) {
+        out << "no wire table yet\n";
+        return;
+    }
+    out << "# raw runtime wire records, stride 0x68; endpoints at +0x18, width at +0x30, "
+           "state slot at +0x38\n";
+    /* Reading a pointer out of the game's memory is only safe once the page is
+       known to be committed and readable; the first attempt at this dumped the
+       legs blind and the fault truncated the whole file.  Every line is flushed
+       as well, so a later fault keeps what came before it. */
+    const auto readable = [](const void* address, size_t size) {
+        if (!address || reinterpret_cast<uintptr_t>(address) < 0x10000) return false;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info)) return false;
+        if (info.State != MEM_COMMIT) return false;
+        if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        const auto begin = reinterpret_cast<uintptr_t>(address);
+        const auto end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        return end > begin && end - begin >= size;
+    };
+    const uint64_t limit = count < 32 ? count : 32;
+    for (uint64_t index = 0; index < limit; ++index) {
+        const unsigned char* record = data + 8 + index * 0x68;
+        out << index << ":";
+        for (int offset = 0; offset < 0x68; ++offset) {
+            char text[4] = {0};
+            std::snprintf(text, sizeof(text), " %02x", record[offset]);
+            out << text;
+        }
+        /* +0x20 is the leg count and +0x28 a pointer to the legs (a Nim seq
+           header: count, reserved, data).  Dump the pointed-to bytes too, so the
+           element encoding is measured rather than assumed - only when the
+           pointer is plausible, because this runs inside the game. */
+        const uint32_t legs = tcsim::board_detail::readU64(record, 0x20) & 0xffffu;
+        const uint64_t legs_at = tcsim::board_detail::readU64(record, 0x28);
+        out << "   legs=" << legs << " at=0x" << std::hex << legs_at << std::dec << " bytes:";
+        if (legs > 0 && legs < 1024 && readable(reinterpret_cast<const void*>(legs_at), 48)) {
+            const auto* legs_bytes = reinterpret_cast<const unsigned char*>(legs_at);
+            for (uint32_t index2 = 0; index2 < 48; ++index2) {
+                char text[4] = {0};
+                std::snprintf(text, sizeof(text), " %02x", legs_bytes[index2]);
+                out << text;
+            }
+            /* A Nim seq is (count, reserved, data); if the data slot looks like a
+               pointer, follow it once so a two-level layout is visible too. */
+            uint64_t inner = 0;
+            std::memcpy(&inner, legs_bytes + 8, sizeof(inner));
+            out << "  inner=0x" << std::hex << inner << std::dec << ":";
+            if (readable(reinterpret_cast<const void*>(inner), 32)) {
+                const auto* inner_bytes = reinterpret_cast<const unsigned char*>(inner);
+                for (uint32_t index2 = 0; index2 < 32; ++index2) {
+                    char text[4] = {0};
+                    std::snprintf(text, sizeof(text), " %02x", inner_bytes[index2]);
+                    out << text;
+                }
+            } else {
+                out << " (not a pointer)";
+            }
+        } else {
+            out << " (not read)";
+        }
+        out << "\n";
+        out.flush();
+    }
+}
+
+/* Raw runtime component records.  The board file the viewer reads carries only
+   what is already interpreted; a component whose meaning is not mapped yet -
+   the RAM (0x76) is the one that matters now - has to be read off a real board
+   before anything can be claimed about it.  Every field is dumped verbatim, the
+   whole record plus the handful of slots the rest of the loader already reads,
+   so the measurement is "here are the bytes", not "here is my guess".  A
+   pointer that comes out of the game is only followed after VirtualQuery says
+   the page is committed and readable, and every line is flushed (the first
+   blind read in this file truncated a dump to zero bytes). */
+void writeComponentRecords(const void* board) {
+    if (!dump_board || !board) return;
+    const std::string path = dataPath("sandbox-sim-components.txt");
+    if (path.empty()) return;
+    const auto* bytes = static_cast<const unsigned char*>(board);
+    const uint64_t count = tcsim::board_detail::readU64(bytes, 0x78);
+    const unsigned char* data = nullptr;
+    std::memcpy(&data, bytes + 0x80, sizeof(data));
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return;
+    if (!data || count > 65536) {
+        out << "no component table yet\n";
+        return;
+    }
+    out << "# raw runtime component records, stride 0x238; kind +0x00, x +0x02, y +0x04, "
+           "rotation +0x06, id +0x08, input count +0x30, pointer +0x38, output count +0x40, "
+           "bits +0x88, memory bits +0xe0/+0xe8, extra address bits +0xf0, endian +0x178, "
+           "custom prototype id +0x188\n";
+    for (uint64_t index = 0; index < count; ++index) {
+        const unsigned char* record = data + 8 + index * 0x238;
+        const int kind = record[0] | (record[1] << 8);
+        const int x = static_cast<int16_t>(record[2] | (record[3] << 8));
+        const int y = static_cast<int16_t>(record[4] | (record[5] << 8));
+        out << "component " << index << " kind=0x" << std::hex << kind << std::dec << " x=" << x
+            << " y=" << y << " rotation=" << static_cast<int>(record[6])
+            << " id=" << tcsim::board_detail::readU64(record, 0x08)
+            << " word30=" << tcsim::board_detail::readU64(record, 0x30)
+            << " ptr38=" << tcsim::board_detail::readU64(record, 0x38)
+            << " word40=" << tcsim::board_detail::readU64(record, 0x40)
+            << " word88=" << tcsim::board_detail::readU64(record, 0x88)
+            << " custom=" << tcsim::board_detail::readU64(record, 0x188)
+            << " worde0=" << tcsim::board_detail::readU64(record, 0xe0)
+            << " worde8=" << tcsim::board_detail::readU64(record, 0xe8)
+            << " wordf0=" << tcsim::board_detail::readU64(record, 0xf0)
+            << " little178=" << static_cast<int>(record[0x178]) << "\n";
+        out << "   bytes:";
+        for (int offset = 0; offset < 0x238; ++offset) {
+            char text[4] = {0};
+            std::snprintf(text, sizeof(text), " %02x", record[offset]);
+            out << text;
+        }
+        out << "\n";
+        out.flush();
+    }
+}
+
 void writeReport() {
+    /* Keep the viewer's record as fresh as the report: a board someone is
+       looking at in simcore-view should be the board on screen, not the one
+       that was there when the level loaded. */
+    if (!bound_view.components.empty() || !bound_view.wires.empty())
+        writeBoardRecord(bound_board, bound_view);
+    if (bound_board) writeWireRecords(bound_board);
+    if (bound_board) writeComponentRecords(bound_board);
     const std::string path = dataPath("sandbox-sim-report.txt");
     if (path.empty()) return;
     std::ostringstream report;
@@ -664,6 +1403,7 @@ void writeReport() {
            << " sandbox=" << (sandbox_active ? 1 : 0) << " invert=" << (invert_publish ? 1 : 0)
            << " startup_seed=" << (startup_seed ? 1 : 0) << " seeded_nets=" << seeded_nets
            << " steps_per_cycle=" << (steps_per_cycle > 0 ? steps_per_cycle : 1)
+           << " vcd=" << (vcd_export ? 1 : 0) << " vcd_written=" << (vcd_written ? 1 : 0)
            << " patched_wires=" << index_patch_count;
     if (index_patch_base) report << " patch_base=" << index_patch_base;
     report << "\n";
@@ -839,6 +1579,10 @@ void frameBody(const TCFrame*) {
             log("sandbox-sim: cycle " + std::to_string(cycle) + " " + runtime.describe());
         }
     }
+    if (vcd_export && !vcd_written && cycles_run >= static_cast<uint64_t>(vcd_cycles > 0 ? vcd_cycles : 1)) {
+        writeVcd();
+        vcd_written = true;
+    }
 }
 
 /* The report is what a test (and a player debugging a board) reads, so it is
@@ -866,6 +1610,11 @@ bool readConfig() {
         if (key == "enabled") enabled = value == "1" || value == "true" || value == "on";
         else if (key == "invert") invert_publish = value == "1" || value == "true";
         else if (key == "trace") trace_events = value == "1" || value == "true";
+        else if (key == "vcd") vcd_export = value == "1" || value == "true";
+        else if (key == "vcd_cycles") vcd_cycles = std::stoi(value);
+        else if (key == "dump") dump_board = !(value == "0" || value == "false" || value == "off");
+        else if (key == "view") view_auto = !(value == "0" || value == "false" || value == "off");
+        else if (key == "viewer") viewer_override = value;
         else if (key == "ticks_per_unit") ticks_per_unit = std::stoull(value);
         else if (key == "cycle_units") cycle_units = std::stoull(value);
         else if (key == "gate_delay") gate_delay = std::stoull(value);

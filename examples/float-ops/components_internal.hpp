@@ -1,6 +1,8 @@
-/* State and helpers the two M2 implementation files share:
-   components.cpp owns configuration, logic, drawing and registration,
-   components_ui.cpp owns hover, clicks and the two editor windows. */
+/* State and helpers the implementation files share: components.cpp owns the
+   catalogue (families, formats, configuration, logic, drawing, registration),
+   editor.cpp declares the drawer rows each type gets, and icons.cpp runs the
+   same drawing code against a rasterising table to produce the pictures the
+   package ships. */
 
 #ifndef float_ops_components_internal_hpp
 #define float_ops_components_internal_hpp
@@ -13,6 +15,7 @@
 #include "../sdk/tc_ui.h"
 #include "components.hpp"
 #include "fp/decimal.hpp"
+#include "fp/format.hpp"
 #include "fp/fp32.hpp"
 
 #include <cstdint>
@@ -133,55 +136,8 @@ extern int frameCounter;
 /* The Display's last input and its formatted text: written by the logic
    callback, read by the render callback and by the true-game test. */
 extern std::mutex valueMutex;
-extern std::map<uint64_t, uint32_t> values;
+extern std::map<uint64_t, uint64_t> values;
 extern std::map<uint64_t, std::string> texts;
-
-/* The drawer's editor rows: what a row edits, and the text a player is typing
-   (ImGui keeps the rest of the field state itself). */
-/* `info` is a row with no widget: the catalogue types that have no rounding
-   choice show what their pins mean instead (bit order of Classify, the
-   saturating policy of the conversions, the pin split of Split/Make Bits). */
-enum class RowKind { none, label, value, rounding, display, info };
-
-/* One painted row: where it is on screen and what it edits.  The rows are real
-   widgets (see the row window in components_ui.cpp), so `live` is what ImGui
-   answered about the row's own field - the playtest reads it, and a row that a
-   build does not deliver input to is still reported as such. */
-struct PanelRow {
-    HitBox box;
-    RowKind kind = RowKind::none;
-    bool live = false;
-};
-
-/* The configuration the rows were filled from, byte for byte.
-
-   The instance id alone cannot answer "do these rows still describe this
-   component's configuration?": a level that is left and entered again reuses the
-   board's component ids, the loader restores a saved record on the first frame
-   that can see it (which can be later than the drawer's first read), and an undo
-   or a clone moves the same bytes again.  Keeping the bytes the rows were built
-   from turns all of those into one question - "does the record still hold what
-   the fields show?" - so the player never has to click a field to make the panel
-   agree with the board. */
-constexpr uint32_t kConfigSnapshotBytes = 32;
-
-struct ConfigSnapshot {
-    uint64_t type = 0;      /* the custom id the bytes belong to, 0 = none */
-    uint32_t size = 0;
-    bool valid = false;     /* the record could be read at all */
-    uint8_t bytes[kConfigSnapshotBytes] = {};
-};
-
-struct EditorState {
-    uint64_t instance = 0;      /* the instance the rows are showing, 0 = none */
-    char label[64] = {};        /* the label field */
-    char value[64] = {};        /* the value field (Constant only) */
-    std::string message;        /* why the last commit was refused, if it was */
-    PanelRow rows[4];           /* the panel rows of the last painted frame */
-    int rowCount = 0;
-    ConfigSnapshot loaded;      /* what the record held when the rows were filled */
-};
-extern EditorState editor;
 
 /* Drawing helpers (components.cpp). */
 ScreenBox screenBox(const TCComponentRenderFrameV1& frame, float x0, float y0, float x1,
@@ -189,11 +145,10 @@ ScreenBox screenBox(const TCComponentRenderFrameV1& frame, float x0, float y0, f
 HitBox hitBox(const TCComponentRenderFrameV1& frame, float x0, float y0, float x1,
               float y1);
 
-/* Interaction helpers (components_ui.cpp). */
-/* Registers the editor rows that live in the game's own component drawer (the
-   panel along the bottom for the selected component) and keeps the hover state
-   fresh once per frame. */
-void registerEditors(const TCHost* host);
+/* Interaction helpers.  The property rows are the loader's own
+   (tc.component.editor): editor.cpp declares one field table per type, and the
+   frame callback (components.cpp) keeps the board hover state fresh. */
+void registerEditorFields(const TCHost* host);
 void frameCallback(void* user, const TCFrame* frame);
 
 /* Configuration access (components.cpp). */
@@ -215,12 +170,15 @@ void servicePendingCircuitSave();
    the board that is gone, so the next read comes from the new records. */
 void serviceBoardChange();
 
-/* Defaults, names and logging also live in components.cpp. */
+/* Defaults, names and logging also live in components.cpp.  Every default takes
+   the width its type works in, because one format is one component type
+   (plan 6.4.1): FP16 Constant and FP64 Constant register different blobs. */
 void note(const std::string& text);
-ConstantConfig constantDefault();
-AddConfig addDefault();
-DisplayConfig displayDefault();
-OpsConfig opsDefault();
+ConstantConfig constantDefault(uint32_t format);
+ConstantConfigWide constantWideDefault(uint32_t format);
+AddConfig addDefault(uint32_t format);
+DisplayConfig displayDefault(uint32_t format);
+OpsConfig opsDefault(uint32_t format);
 tcfp::FPRounding roundingOf(uint8_t code);
 tcfp::DisplayMode displayModeOf(uint8_t code);
 const char* roundingCode(tcfp::FPRounding rounding);

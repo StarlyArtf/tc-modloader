@@ -20,9 +20,12 @@ foreach($taskFile in @('Turing Complete.exe','compile.dll','tc_game_engine.dll',
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\tc-loader.dll') -Destination (Join-Path $taskRoot 'game_engine.dll')
 Copy-Item -LiteralPath $taskFixture -Destination (Join-Path $taskData 'fixtures\and2_component.data')
 Copy-Item -LiteralPath (Join-Path $taskRepo 'build\component-placement-probe.dll') -Destination (Join-Path $taskPackage 'native\probe.dll')
+# The peer Mod: its own registered type is what the delete command's ownership
+# rule has to protect, so the sandbox needs a second, independent package.
+Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\local.editor-demo.mod') -Destination (Join-Path $taskRoot 'mods\local.editor-demo.mod')
 '{"format":2,"id":"test.component-placement","name":"Development component placement probe","version":"0.0.1","native":{"api":1,"entry":"native/probe.dll"}}' | Set-Content -LiteralPath (Join-Path $taskPackage 'mod.json') -Encoding utf8
 & (Join-Path $taskRepo 'tools\Pack-Mod.ps1') -Source $taskPackage -Output (Join-Path $taskRoot 'mods\probe.mod') | Out-Null
-& (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply test.component-placement
+& (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply test.component-placement local.editor-demo
 if($LASTEXITCODE){throw 'Component placement probe package apply failed'}
 $taskPreviousProfile = $env:USERPROFILE
 $taskPreviousAppData = $env:APPDATA
@@ -72,11 +75,40 @@ try {
       'component placement undo state=3 result=0',
       'component placement undo points=30,0:0 20,6:1 24,10:1 28,10:0',
       'component placement undo components \[0x00\(0,0\)\] \[0x4e\(20,6\)c\] \[0x4e\(24,10\)c\] \[0x00\(0,0\)\]',
-      'component placement redo state=3 result=0 components=4 .*restored=1')){
+      'component placement redo state=3 result=0 components=4 .*restored=1',
+      # The delete command (tc.commands V2): the game's own undo-aware wrapper
+      # removes the component (live count down, the cell empty), one undo brings
+      # it back, and redo removes it again - which the low-level tombstone entry
+      # cannot do.
+      'Board edits: component placement .*component deletion armed',
+      'component delete command submit=0 request=\d+ instance=\d+',
+      'component delete command state=3 result=0 live=\d+->\d+ at\(28,10\)=0',
+      'component delete undo state=3 result=0 live=\d+ at\(28,10\)=1',
+      'component delete redo state=3 result=0 live=\d+ at\(28,10\)=0',
+      # Ownership: the peer Mod's component is placed through the bus, the delete
+      # that names the peer's type is refused before queueing (request id 0, the
+      # board untouched), and naming an unregistered type reaches the board read
+      # instead - NOT_FOUND, again with the peer's component still there.
+      'component delete peer placement submit=0 request=\d+',
+      'component delete peer placement state=3 result=0 instance=\d+ at\(12,10\)=1',
+      'component delete foreign type submit=-2 request=0 still=1 live=\d+->\d+',
+      'component delete unknown type submit=0 request=\d+',
+      'component delete unknown type state=4 result=-5 at\(12,10\)=1 live=\d+',
+      # Staging runs the same validation as submitting: the peer Mod's type and
+      # an out-of-range command type are both refused by a transaction too.
+      'component delete transaction validation begin=0 foreign=-2 bogus=-2 still=1')){
     if(!($taskLines | Where-Object { $_ -match $taskExpected })){
       $taskLines | Where-Object { $_ -match 'component placement' } | Select-Object -Last 8
       throw "Missing custom-prototype pin evidence: $taskExpected"
     }
+  }
+  # The delete's readback has to be a real change: live before > live after.
+  $taskDelete=$taskLines | Where-Object { $_ -match 'component delete command state=3 result=0 live=(\d+)->(\d+)' } |
+    Select-Object -Last 1
+  if(!$taskDelete){ throw 'The delete command did not report its readback' }
+  $null = $taskDelete -match 'live=(\d+)->(\d+)'
+  if([int]$Matches[1] -le [int]$Matches[2]) {
+    throw "The delete command did not remove a live component: $taskDelete"
   }
 } finally {
   $env:USERPROFILE = $taskPreviousProfile

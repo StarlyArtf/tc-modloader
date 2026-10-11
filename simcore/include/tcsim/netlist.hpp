@@ -52,12 +52,32 @@ struct EvalContext {
 using Behavior = std::function<void(const EvalContext&, const std::vector<BitVector>&,
                                     std::vector<BitVector>&)>;
 
+/* A device with its own storage - a register, a counter, a delay line.  It is
+   told its state (a vector of BitVectors, `state_size` long) as well as its
+   inputs, and writes both the next state and the outputs.  State exists because
+   these parts *hold*: the game's register keeps its value while its enable is 0,
+   and a plain input-to-output function cannot express that. */
+using StateBehavior = std::function<void(const EvalContext&, std::vector<BitVector>& state,
+                                         const std::vector<BitVector>& inputs,
+                                         std::vector<BitVector>& outputs)>;
+
 struct DeviceSpec {
     std::string name;
     DeviceKind kind = DeviceKind::kCombinational;
     std::vector<PinSpec> inputs;
     std::vector<PinSpec> outputs;
     Behavior behavior;
+    /* Stateful devices use this instead of `behavior`; `state_size` is how many
+       BitVectors the instance keeps.  `state_init` is the power-on value. */
+    StateBehavior state_behavior;
+    size_t state_size = 0;
+    std::vector<BitVector> state_init;
+    /* true when the device's first output *is* its state: such a device drives
+       its stored value from the first evaluation on, even between clock edges
+       (a register whose enable is never asserted still shows its value on the
+       board).  A device that leaves this false behaves like a plain D flip-flop
+       and only publishes on the edge. */
+    bool output_is_state = false;
     ArcDelay default_delay{};
     std::vector<Arc> arcs;
     DelayKind delay_kind = DelayKind::kInertial;
@@ -122,7 +142,7 @@ struct Net {
     BitVector value;
     BitVector previous;
     bool stimulus_active = false;
-    Logic stimulus_logic = Logic::kZ;
+    BitVector stimulus_value;
     Strength stimulus_strength = Strength::kStrong;
     uint64_t changes = 0;
     Tick last_change = -1;
@@ -193,6 +213,8 @@ public:
         instance.input_values.resize(spec->inputs.size());
         instance.input_previous.resize(spec->inputs.size());
         instance.input_change.assign(spec->inputs.size(), -1);
+        instance.state = spec->state_init;
+        instance.state.resize(spec->state_size);
         for (size_t pin = 0; pin < spec->inputs.size(); ++pin) {
             instance.input_values[pin] = BitVector(spec->inputs[pin].bits, Logic::kX);
             instance.input_previous[pin] = instance.input_values[pin];

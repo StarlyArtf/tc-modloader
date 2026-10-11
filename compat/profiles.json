@@ -80,6 +80,26 @@
           "sha256": "1612880bc7c3c198604b5b967900a32720700ebebd135b72348a3e3ac409877b"
         },
         {
+          "macro": "TC_LOADER_060_SHA",
+          "version": "0.6.0",
+          "sha256": "f609783c3330d3dc1081c4ec02a2206fee54fcac8c5c1a04580964ba67018546"
+        },
+        {
+          "macro": "TC_LOADER_080_SHA",
+          "version": "0.8.0",
+          "sha256": "5702228f261cb6c0f1c92648bfbd9b878445a6b9239df3061737468f8b1b6d81"
+        },
+        {
+          "macro": "TC_LOADER_081_SHA",
+          "version": "0.8.1",
+          "sha256": "7a600aecd63e6891150a593d67808306d34bb31d9f4956bd7c4aefc7cab8bfbf"
+        },
+        {
+          "macro": "TC_LOADER_JIT_PREVIEW_SHA",
+          "version": "0.8.1-jit-preview",
+          "sha256": "9960de0f0c6f808330457375bfbd6fa5ba9c591167a15eae7861383b1cbbd821"
+        },
+        {
           "macro": "TC_PREVIOUS_LOADER_SHA",
           "version": "previous",
           "sha256": "f41ba881ebab46b8cced4eacd76193e1af97004667082b4cff5378b1d81f60c5"

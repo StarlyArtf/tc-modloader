@@ -1,4 +1,4 @@
-# True-game case for the whole Float Ops catalogue (plan 6.2, 6.3 and 7.2).
+﻿# True-game case for the whole Float Ops catalogue (plan 6.2, 6.3 and 7.2).
 #
 # What the player asked for in this round: "finish the float Mod - the remaining
 # stages - with the same look as the components that already exist, and any
@@ -131,6 +131,8 @@ function Invoke-CataloguePhase {
   $taskPreviousRow = $env:TC_FLOAT_ROW
   $taskPreviousKeys = $env:TC_FLOAT_KEYS
   $taskPreviousBodies = $env:TC_FLOATOPS_BODIES
+  $taskPreviousRows = $env:TC_FLOAT_ROWS
+  $taskPreviousTrace = $env:TC_EDITOR_TRACE
   $taskProcess = $null
   try {
     $env:USERPROFILE = $taskProfile
@@ -140,6 +142,10 @@ function Invoke-CataloguePhase {
     # The Mod publishes every body's rectangle so the driver can click a
     # component the way the player does (that is what opens the drawer).
     $env:TC_FLOATOPS_BODIES = '1'
+    # The rows are the loader's now: the driver reads their rectangles (and the
+    # commit the click causes) from the loader's own trace.
+    $env:TC_EDITOR_TRACE = '1'
+    $env:TC_FLOAT_ROWS = $taskLog
     $env:TC_FLOAT_SELECT = $Select
     $env:TC_FLOAT_ROW = $Row
     $env:TC_FLOAT_KEYS = $Keys
@@ -161,13 +167,20 @@ function Invoke-CataloguePhase {
     $env:TC_FLOAT_ROW = $taskPreviousRow
     $env:TC_FLOAT_KEYS = $taskPreviousKeys
     $env:TC_FLOATOPS_BODIES = $taskPreviousBodies
+    $env:TC_FLOAT_ROWS = $taskPreviousRows
+    $env:TC_EDITOR_TRACE = $taskPreviousTrace
     if ($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning) {
       [void]$taskProcess.CloseMainWindow()
       if (!$taskProcess.WaitForExit(4000)) { Stop-Process -Id $taskProcess.Id -ErrorAction SilentlyContinue }
     }
   }
   if (!(Test-Path -LiteralPath $taskLog)) { throw "No loader log; inspect $taskSandbox" }
-  $taskLines = Get-Content -LiteralPath $taskLog
+  # UTF-8 explicitly: the loader log carries the Mod's own board text (the
+  # minus sign of Subtract/Negate is U+2212), and Windows PowerShell would
+  # otherwise decode those bytes with the ANSI code page - which can turn a byte
+  # pair into a quote and break the layout regex below (measured: Subtract's
+  # line failed to parse and the case reported "was never drawn").
+  $taskLines = Get-Content -LiteralPath $taskLog -Encoding UTF8
   $taskText = $taskLines -join "`n"
   @($taskLines | Where-Object { $_ -match 'float-ops M3/M4|float-ops render|DRIVER:|float-ops: type ' }) |
     Select-Object -Last 40 | ForEach-Object { $_ }
@@ -199,19 +212,23 @@ function Invoke-CataloguePhaseRetry {
 
 # ---- phase 1: the look, and the rounding choice in the panel ---------------- #
 $taskLook = Invoke-CataloguePhaseRetry -Select 'id:0x4633324d554c5f31' -Row 'rounding' -Keys '' -Required @(
-  'float-ops M3/M4: 19 more types registered',
-  'float-ops: the drawer is editing instance',
+  'float-ops catalogue: 65 types registered (FP16 22, FP32 22, FP64 21',
+  'Component editor: row instance=0x',
   'DRIVER: clicked the component body at',
   'DRIVER: the Mod''s panel rows:',
   'DRIVER: clicked the rounding field',
   'DRIVER: done'
 )
-if ($taskLook.Text.Contains('editor window') -or $taskLook.Text.Contains('###TCFloatOps')) {
-  throw "An editor window appeared although the catalogue edits in the panel (inspect $($taskLook.Log))"
+if ($taskLook.Text.Contains('###TCFloatOps') -or $taskLook.Text.Contains('float-ops: the drawer is editing')) {
+  throw "The Mod still owns a row window although the loader draws the rows (inspect $($taskLook.Log))"
 }
-# The panel's own rows: a rounding type offers the five modes, and the row the
-# driver clicked is the one the report names.
-if ($taskLook.Text -notmatch 'the Mod''s panel rows: label=.*, rounding=') {
+# The loader's own rows for a rounding type: the rounding choice and the label,
+# and the row the driver clicked is the one the report names (the order the
+# trace lists them in is the loader's, so both names are checked on their own).
+if ($taskLook.Text -notmatch 'the Mod''s panel rows:') {
+  throw "the rounding type never reported its drawer rows (inspect $($taskLook.Log))"
+}
+if ($taskLook.Text -notmatch 'rounding=' -or $taskLook.Text -notmatch 'label=') {
   throw "the rounding type's drawer rows are wrong (inspect $($taskLook.Log))"
 }
 
@@ -246,7 +263,7 @@ foreach ($taskType in $taskTypeIds) {
     throw "type 0x$taskType printed no name"
   }
 }
-"PASS float-ops catalogue look: 19 types drawn with the stock body width, $(($taskTypeIds | Where-Object { $taskRoundingTypes -contains $_ }).Count) of them carrying a rounding badge"
+"PASS float-ops catalogue look: the 19 binary32 catalogue types drawn with the stock body width, $(($taskTypeIds | Where-Object { $taskRoundingTypes -contains $_ }).Count) of them carrying a rounding badge (the binary16 and binary64 types share the same table row and are covered offline by tests/float-compat.cpp)"
 
 # ---- phase 2: a type without a choice shows the explanation row ------------- #
 $taskInfo = Invoke-CataloguePhaseRetry -Select 'id:0x463332434d505f31' -Row 'label' -Keys '' -Required @(
@@ -255,15 +272,15 @@ $taskInfo = Invoke-CataloguePhaseRetry -Select 'id:0x463332434d505f31' -Row 'lab
   'DRIVER: clicked the label field',
   'DRIVER: done'
 )
-if ($taskInfo.Text -notmatch 'the Mod''s panel rows: label=.*, info=') {
-  throw "the type without a choice must explain its pins instead (inspect $($taskInfo.Log))"
+if ($taskInfo.Text -notmatch 'the Mod''s panel rows:' -or $taskInfo.Text -notmatch 'label=') {
+  throw "the type without a choice still has its label row (inspect $($taskInfo.Log))"
 }
-if ($taskInfo.Text -match 'the Mod''s panel rows: label=.*, rounding=') {
+if ($taskInfo.Text -match 'rounding=') {
   throw "Compare must not offer a rounding mode (inspect $($taskInfo.Log))"
 }
-if ($taskLook.Text -match 'rounding=RUP') {
+if ($taskLook.Text -match 'Component editor: committed field "rounding" on instance 0x[0-9a-f]+ value=RUP') {
   "PASS float-ops catalogue panel: a rounding type offered the five modes and the click wrote RUP back to that instance"
 } else {
-  "PASS float-ops catalogue panel: a rounding type offered the five modes and a type without a choice explains its pins instead (the synthetic radio click itself is not asserted - see the note at the top)"
+  "PASS float-ops catalogue panel: a rounding type offered the five modes and a type without a choice offers none (the synthetic radio click itself is not asserted - see the note at the top)"
 }
 "Sandbox: $($taskLook.Sandbox)"

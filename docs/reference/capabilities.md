@@ -70,7 +70,7 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host, TCPlugin* plugin) {
 | `hook_chain` | `TC_CAP_HOOK_CHAIN` | `register_hook_chain` | 加入加载器拥有的钩子链：多个 Mod 共用同一目标，按优先级／Mod id 排序 |
 | `events` | `TC_CAP_EVENTS` | `add_event_listener` | 宿主事件总线：关卡加载、场景切换、仿真命令、保存 |
 | `game_handles` | `TC_CAP_GAME_HANDLES` | `get_current_game_handle`、`validate_game_handle`、`resolve_game_handle` | 带代次检查的游戏对象句柄；当前签发 Board 句柄 |
-| `services` | `TC_CAP_SERVICES` | `query_service` | 查询独立版本的游戏服务表；Board V1 句柄、V2 值快照、V3 对象句柄、V4 对象数据、V5 元件引脚、V6 连接判定、`tc.simulation` 仿真读数、`tc.io_value` 数值编辑器（读写全局输入、写常量、按位翻转、表达式求值与格式化），以及 `tc.pin_order` 左侧 IO 面板引脚顺序（按元件下标读、重排与恢复） |
+| `services` | `TC_CAP_SERVICES` | `query_service` | 查询独立版本的服务表；`tc.mod.storage` 提供隔离数据/schema 迁移，`tc.mod.settings` 提供统一声明式设置页 |
 
 能力位本身自 **0.6.0** 起提供；`ui_page` / `ui_slot` 的引入版本写在
 `sdk/tc_mod_api.h` 的注释里。加载器启动时会把自己支持的能力写进日志：

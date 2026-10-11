@@ -7,7 +7,7 @@
 
 #include <stdint.h>
 
-/* tc.component.types V1 - registering a component with the V2 value model.
+/* tc.component.types - registering components with the V2/V3 value models.
 
    Use this instead of `TCNativeComponent::registerWith` when the component has
    more than eight pins on a side, or when it wants a state size of its own:
@@ -23,7 +23,7 @@
    }
 
    static const TCComponentPinV2 ins[] = {
-       {"a", "Input A", 1, 0}, {"b", "Input B", 1, 0},   // ... up to sixteen
+       {"a", "Input A", 1, 0}, {"b", "Input B", 1, 0},   // ... up to thirty-two
    };
    static const TCComponentPinV2 outs[] = {{"y", "Output", 1, 0}};
 
@@ -41,10 +41,10 @@
    }
    ```
 
-   Every pin is one uint64_t in the callback.  `bits` may be 1..64, and the sum
-   of the input widths must stay within the host's budget (128 bits today: the
-   generated call carries two 64-bit payload words, and a wider call shape does
-   not survive the game's JIT - measured).  A direction may be empty (a pure
+   Every pin is one uint64_t in the callback.  `bits` may be 1..64, with at most
+   32 pins per direction and 2048 input bits in total.  The generated code keeps
+   the game's measured four-argument JIT call shape and stages wider inputs in
+   128-bit chunks before invoking the callback.  A direction may be empty (a pure
    source or a pure sink), and both may be empty: that is a decorative object
    which only owns a place on the board plus its per-instance configuration
    (see docs/research/text-component.md).
@@ -63,8 +63,10 @@ namespace tc {
 namespace component_types {
 
 using Api = TCComponentTypesApiV1;
+using ApiV2 = TCComponentTypesApiV2;
 using Pin = TCComponentPinV2;
 using Definition = TCComponentTypeDefinitionV2;
+using DefinitionV3 = TCComponentTypeDefinitionV3;
 
 inline bool table(const TCHost* host, Api* out) {
     if (!host || !out || !host->query_service) return false;
@@ -81,10 +83,30 @@ inline bool table(const TCHost* host, Api* out) {
     return true;
 }
 
+inline bool tableV2(const TCHost* host, ApiV2* out) {
+    if (!host || !out || !host->query_service) return false;
+    ApiV2 queried{};
+    if (host->query_service(host->context, TC_SERVICE_COMPONENT_TYPES,
+                            TC_COMPONENT_TYPES_API_VERSION_2, &queried,
+                            sizeof(queried)) != TC_SERVICE_OK)
+        return false;
+    if (queried.size < sizeof(queried) ||
+        queried.version != TC_COMPONENT_TYPES_API_VERSION_2 || !queried.context ||
+        !queried.register_definition || !queried.register_definition_v3)
+        return false;
+    *out = queried;
+    return true;
+}
+
 /* Registers one definition.  Call during tc_mod_load, like the V1 entry. */
 inline int registerDefinition(const Api& api, const Definition* definition) {
     if (!api.register_definition) return TC_COMPONENT_TYPES_ERR_UNAVAILABLE;
     return api.register_definition(api.context, definition);
+}
+
+inline int registerDefinitionV3(const ApiV2& api, const DefinitionV3* definition) {
+    if (!api.register_definition_v3) return TC_COMPONENT_TYPES_ERR_UNAVAILABLE;
+    return api.register_definition_v3(api.context, definition);
 }
 
 inline const char* errorText(int status) {
@@ -96,6 +118,7 @@ inline const char* errorText(int status) {
         case TC_COMPONENT_TYPES_ERR_UNSUPPORTED: return "the shape cannot be bridged";
         case TC_COMPONENT_TYPES_ERR_GAME: return "the game refused the definition";
         case TC_COMPONENT_TYPES_ERR_BUDGET: return "the pin widths exceed the host's budget";
+        case TC_COMPONENT_TYPES_ERR_STATE: return "the component model cannot change while a board is up";
         default: return "unknown status";
     }
 }

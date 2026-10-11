@@ -1,11 +1,16 @@
 /* The text side of the Float Ops Mod (plan 5.3).
 
-   Two vendored libraries do the hard parts and this file only adapts them:
+   Three vendored libraries do the hard parts and this file only adapts them:
 
    - fast_float parses the text to binary32 with correct rounding and without a
      locale, which is the contract plan 5.3 fixes;
-   - Ryu produces the shortest decimal digits that round-trip through binary32,
-     and the layout below turns those digits into the strings the Mod shows.
+   - Ryu produces the shortest decimal digits that round-trip - f2s for
+     binary32, d2s for binary64 - and the layout below turns those digits into
+     the strings the Mod shows;
+   - SoftFloat converts between the widths, which is all binary16 needs: it has
+     no shortest-formatter of its own, and its values are exactly binary32
+     values, so the digits of that image are shortened until they stop
+     round-tripping (shortestOf16 below).
 
    Neither library knows the project's semantics and the kernel knows nothing
    about text: the boundary between them is a `uint32_t` bit pattern. */
@@ -14,10 +19,14 @@
 
 #include "fast_float/fast_float.h"
 
+#include "environment.hpp"
+#include "format.hpp"
+
 extern "C" {
 #include "ryu/ryu.h"
 }
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +38,36 @@ constexpr uint32_t kSignMask32 = 0x80000000u;
 constexpr uint32_t kExponentMask32 = 0x7F800000u;
 constexpr uint32_t kSignificandMask32 = 0x007FFFFFu;
 constexpr int kMaxExactDigits = 19; /* fits the exactness check below */
+
+/* The three widths, as SoftFloat hands them over.  Only the conversions live
+   here: the arithmetic is the kernel's, and the text layer never parses or
+   computes a value - it only moves a bit pattern between widths. */
+float16_t toF16(uint16_t bits) {
+    float16_t value;
+    value.v = bits;
+    return value;
+}
+uint16_t fromF16(float16_t value) { return value.v; }
+float32_t toF32(uint32_t bits) {
+    float32_t value;
+    value.v = bits;
+    return value;
+}
+uint32_t fromF32(float32_t value) { return value.v; }
+
+/* binary16 -> binary32 for the shortest form below.  Exact for every input (the
+   conversion only re-biases the exponent), so no rounding mode is involved. */
+uint32_t f16Image(uint16_t bits) { return fromF32(f16_to_f32(toF16(bits))); }
+
+/* The other direction rounds (a binary32 value is generally not a binary16 one),
+   so it runs under the project's default mode rather than whatever the host
+   thread's state happens to be - and it is the last step of the round-trip test
+   below, where "the candidate parsed back to the value we started from" has to
+   mean exactly what parse_decimal() would produce for a binary16 field. */
+uint16_t f16OfImage(uint32_t bits) {
+    softfloat_environment::SoftFloatOperation operation(tcfp::FPRounding::nearest_even);
+    return fromF16(f32_to_f16(toF32(bits)));
+}
 
 bool isSpace(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
@@ -193,12 +232,10 @@ struct Shortest {
     int exponent = 0;
 };
 
-Shortest shortestOf(uint32_t bits) {
+/* Ryu writes `<sign><digits>[.<digits>]E<exponent>`, or `NaN`/`Infinity`, for
+   both widths; f2s and d2s share that notation, so one reader serves them. */
+Shortest parseRyuText(const char* buffer) {
     Shortest shortest;
-    float value = 0.f;
-    std::memcpy(&value, &bits, sizeof(value));
-    char buffer[32] = {};
-    f2s_buffered(value, buffer);
     const char* p = buffer;
     if (*p == '-') {
         shortest.negative = true;
@@ -211,7 +248,6 @@ Shortest shortestOf(uint32_t bits) {
                                     : (shortest.negative ? "-inf" : "inf");
         return shortest;
     }
-    /* Ryu writes <digits>[.<digits>]E<exponent>. */
     int exponent = 0;
     for (; *p && *p != 'E' && *p != 'e'; ++p) {
         if (*p == '.') continue;
@@ -222,6 +258,91 @@ Shortest shortestOf(uint32_t bits) {
     shortest.digits[shortest.count] = '\0';
     shortest.exponent = exponent;
     return shortest;
+}
+
+Shortest shortestOf(uint32_t bits) {
+    float value = 0.f;
+    std::memcpy(&value, &bits, sizeof(value));
+    char buffer[32] = {};
+    f2s_buffered(value, buffer);
+    return parseRyuText(buffer);
+}
+
+Shortest shortestOf64(uint64_t bits) {
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    char buffer[48] = {};
+    d2s_buffered(value, buffer);
+    return parseRyuText(buffer);
+}
+
+void renderShortest(const Shortest& shortest, char* out, size_t capacity);
+
+/* The same digits with `digits` of them kept, the rest either dropped or rounded
+   up.  A carry out of the leading digit keeps the field width and moves the
+   weight (999 -> 100 with exponent + 1), which is exactly what the decimal
+   layout expects. */
+Shortest roundedTo(const Shortest& source, int digits, bool round_up) {
+    Shortest result = source;
+    if (digits <= 0 || digits >= source.count) return result;
+    result.count = digits;
+    result.digits[digits] = '\0';
+    const char next = source.digits[digits];
+    const bool carry = round_up ? next >= '5' : next > '5';
+    if (!carry) return result;
+    int index = digits - 1;
+    while (index >= 0) {
+        if (result.digits[index] != '9') {
+            ++result.digits[index];
+            return result;
+        }
+        result.digits[index] = '0';
+        --index;
+    }
+    result.digits[0] = '1';
+    for (int i = 1; i < digits; ++i) result.digits[i] = '0';
+    result.digits[digits] = '\0';
+    result.exponent += 1;
+    return result;
+}
+
+/* Does this text parse back to this binary16 pattern?
+
+   decimal -> binary32 -> binary16 rounds exactly like decimal -> binary16:
+   binary32 carries 24 significand bits and the double-rounding rule needs
+   2*p+2 = 24 for a binary16 result.  So the second conversion is not an
+   approximation of what a binary16 field would store - it is the same value. */
+bool roundTrips16(uint64_t pattern, const Shortest& candidate) {
+    char text[48] = {};
+    renderShortest(candidate, text, sizeof(text));
+    float value = 0.f;
+    const auto answer = fast_float::from_chars(text, text + std::strlen(text), value);
+    if (answer.ec != std::errc() || answer.ptr != text + std::strlen(text)) return false;
+    uint32_t image = 0;
+    std::memcpy(&image, &value, sizeof(image));
+    return f16OfImage(image) == static_cast<uint16_t>(pattern & 0xFFFF);
+}
+
+/* The shortest decimal that round-trips through binary16.
+
+   Every binary16 value is exactly a binary32 value, so the binary32 shortest
+   would already round-trip - it is simply longer than needed (binary16's 0.1 is
+   0.0999755859375, which binary32 spells "0.099975586").  Here the binary32
+   digits are rounded to 1..n significant digits, both ways at a tie, and the
+   first candidate that parses back to the same binary16 wins, so 0.1 reads
+   "0.1" in binary16 the way it does in the other two widths.  If no shorter
+   candidate round-trips, the binary32 digits are already the answer (they are
+   the shortest that does). */
+Shortest shortestOf16(uint64_t bits) {
+    const Shortest wide = shortestOf(f16Image(static_cast<uint16_t>(bits & 0xFFFF)));
+    if (wide.special || wide.count <= 1) return wide;
+    for (int digits = 1; digits < wide.count; ++digits) {
+        for (int direction = 0; direction < 2; ++direction) {
+            const Shortest candidate = roundedTo(wide, digits, direction == 0);
+            if (roundTrips16(bits, candidate)) return candidate;
+        }
+    }
+    return wide;
 }
 
 /* Weight of the first digit, as Ryu reported it. */
@@ -301,10 +422,15 @@ void renderScientific(const Shortest& shortest, Sink& sink, bool with_sign) {
     putTwoDigitExponent(sink, leadingExponent(shortest));
 }
 
-void renderHex(uint32_t bits, Sink& sink) {
+/* The bit pattern of one width: four, eight or sixteen digits, so an FP16 value
+   reads 0x3C00 and an FP64 one 0x3FF0000000000000. */
+void renderHex(uint32_t format, uint64_t bits, Sink& sink) {
+    const int digits =
+        format == kFormatBinary16 ? 4 : (format == kFormatBinary64 ? 16 : 8);
     const char* hex = "0123456789ABCDEF";
     sink.text("0x");
-    for (int shift = 28; shift >= 0; shift -= 4) sink.put(hex[(bits >> shift) & 0xF]);
+    for (int index = digits - 1; index >= 0; --index)
+        sink.put(hex[(bits >> (index * 4)) & 0xF]);
 }
 
 }  // namespace
@@ -372,7 +498,7 @@ size_t format_scientific(uint32_t bits, char* out, size_t capacity) {
 
 size_t format_hex(uint32_t bits, char* out, size_t capacity) {
     Sink sink(out, capacity);
-    renderHex(bits, sink);
+    renderHex(kFormatBinary32, bits, sink);
     return sink.finish();
 }
 
@@ -393,7 +519,56 @@ size_t format_value(uint32_t bits, DisplayMode mode, char* out, size_t capacity)
     Sink sink(out, capacity);
     sink.text(decimal);
     sink.put(' ');
-    renderHex(bits, sink);
+    renderHex(kFormatBinary32, bits, sink);
+    return sink.finish();
+}
+
+/* ---- the same four entry points, per width (plan 6.4.1) ------------------ */
+
+size_t format_shortest_for(uint32_t format, uint64_t bits, char* out, size_t capacity) {
+    const Shortest shortest = format == kFormatBinary16
+                                  ? shortestOf16(bits)
+                                  : (format == kFormatBinary64 ? shortestOf64(bits)
+                                                               : shortestOf(bits));
+    renderShortest(shortest, out, capacity);
+    return std::strlen(out);
+}
+
+size_t format_scientific_for(uint32_t format, uint64_t bits, char* out, size_t capacity) {
+    const Shortest shortest = format == kFormatBinary16
+                                  ? shortestOf16(bits)
+                                  : (format == kFormatBinary64 ? shortestOf64(bits)
+                                                               : shortestOf(bits));
+    Sink sink(out, capacity);
+    renderScientific(shortest, sink, true);
+    return sink.finish();
+}
+
+size_t format_hex_for(uint32_t format, uint64_t bits, char* out, size_t capacity) {
+    Sink sink(out, capacity);
+    renderHex(format, bits, sink);
+    return sink.finish();
+}
+
+size_t format_value_for(uint32_t format, uint64_t bits, DisplayMode mode, char* out,
+                        size_t capacity) {
+    switch (mode) {
+        case DisplayMode::shortest:
+            return format_shortest_for(format, bits, out, capacity);
+        case DisplayMode::scientific:
+            return format_scientific_for(format, bits, out, capacity);
+        case DisplayMode::hex_only:
+            return format_hex_for(format, bits, out, capacity);
+        case DisplayMode::decimal_and_hex:
+        default:
+            break;
+    }
+    char decimal[48] = {};
+    format_shortest_for(format, bits, decimal, sizeof(decimal));
+    Sink sink(out, capacity);
+    sink.text(decimal);
+    sink.put(' ');
+    renderHex(format, bits, sink);
     return sink.finish();
 }
 

@@ -243,7 +243,7 @@ private:
             Net& net = netlist_.net(entry.net);
             if (net.stimulus_active) continue;
             net.stimulus_active = true;
-            net.stimulus_logic = Logic::kX;
+            net.stimulus_value = BitVector(net.bits, Logic::kX);
             net.stimulus_strength = Strength::kStrong;
         }
         /* One resolution pass before anything runs, so a net driven by a device
@@ -380,19 +380,42 @@ private:
         device.input_values = inputs;
 
         std::vector<BitVector> outputs;
-        if (spec.behavior) spec.behavior(context, inputs, outputs);
+        /* A device with storage is handed a scratch copy of its state and the
+           copy is committed only when this evaluation is the one that latches -
+           a register's data pin changing must not move its output, and neither
+           must a counter's reset line between edges. */
+        std::vector<BitVector> next_state;
+        const bool has_state = spec.state_size != 0;
+        if (has_state) next_state = device.state;
+        if (spec.state_behavior) spec.state_behavior(context, next_state, inputs, outputs);
+        else if (spec.behavior) spec.behavior(context, inputs, outputs);
         if (outputs.size() != spec.outputs.size()) outputs.resize(spec.outputs.size(), BitVector(1, Logic::kX));
 
         if (spec.kind == DeviceKind::kSequential) {
-            if (cause != spec.clock_pin) return; /* a data change waits for the clock */
-            const Logic clock = inputs[static_cast<size_t>(spec.clock_pin)][0];
-            if (spec.clock_edge == EdgeKind::kPosEdge && clock != Logic::kOne) return;
-            if (spec.clock_edge == EdgeKind::kNegEdge && clock != Logic::kZero) return;
-            device.last_clock_edge = now_;
-            const bool violated = checkSetup(device, spec);
-            if (violated && spec.x_on_violation) {
-                for (BitVector& output : outputs) output.fill(Logic::kX);
+            bool latches = cause == spec.clock_pin; /* a data change waits for the clock */
+            if (latches) {
+                const Logic clock = inputs[static_cast<size_t>(spec.clock_pin)][0];
+                if (spec.clock_edge == EdgeKind::kPosEdge && clock != Logic::kOne) latches = false;
+                if (spec.clock_edge == EdgeKind::kNegEdge && clock != Logic::kZero) latches = false;
             }
+            if (!latches) {
+                /* Between edges a state device with `output_is_state` still
+                   drives the value it holds; the computed next state is thrown
+                   away rather than committed. */
+                if (!spec.output_is_state || device.state.empty()) return;
+                next_state = device.state;
+            } else {
+                device.last_clock_edge = now_;
+                const bool violated = checkSetup(device, spec);
+                if (violated && spec.x_on_violation) {
+                    for (BitVector& output : outputs) output.fill(Logic::kX);
+                }
+            }
+        }
+        if (has_state && next_state.size() == device.state.size()) device.state = std::move(next_state);
+        if (spec.output_is_state && !device.state.empty()) {
+            outputs.assign(spec.outputs.size(), BitVector(1, Logic::kX));
+            outputs.assign(1, device.state[0]);
         }
 
         for (size_t pin = 0; pin < spec.outputs.size(); ++pin) {
@@ -525,7 +548,7 @@ private:
         if (net >= netlist_.nets().size()) return;
         Net& target = netlist_.net(net);
         target.stimulus_active = true;
-        target.stimulus_logic = event.value.size() ? event.value[0] : Logic::kZ;
+        target.stimulus_value = engine_detail::fitVector(event.value, target.bits);
         target.stimulus_strength = event.strength;
         resolveNet(net, kNoDevice, 0);
     }
@@ -538,7 +561,10 @@ private:
         bool conflict = false;
         for (size_t bit = 0; bit < bits; ++bit) {
             drives.clear();
-            if (net.stimulus_active) drives.push_back(Drive{net.stimulus_logic, net.stimulus_strength});
+            if (net.stimulus_active) {
+                const BitVector stimulus = engine_detail::fitVector(net.stimulus_value, bits);
+                drives.push_back(Drive{stimulus[bit], net.stimulus_strength});
+            }
             int zeros = 0;
             int ones = 0;
             for (size_t index = 0; index < net.drivers.size(); ++index) {

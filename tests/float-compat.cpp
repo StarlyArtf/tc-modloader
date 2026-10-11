@@ -9,6 +9,10 @@
 #include "../examples/float-ops/plugin.cpp"
 #undef tc_mod_load
 
+/* The width table, for the per-format checks below (plugin.cpp pulls in the
+   component catalogue, which names formats but does not need the table itself). */
+#include "../examples/float-ops/fp/format.hpp"
+
 namespace {
 
 struct CapturedDefinition {
@@ -156,9 +160,10 @@ int main() {
     TCPlugin plugin{};
     plugin.size = sizeof(plugin);
     require(float_ops_m0_test_load(&host, &plugin) == 0, "plugin load failed");
-    /* Five M0 probes, the three M2 components and the M3/M4 catalogue. */
-    require(fake.definitions.size() == 8 + floatops::catalogueCount(),
-            "expected the five M0 probes plus the three M2 components");
+    /* Five M0 probes plus every type of the catalogue - which is all of this
+       Mod's own components, one per family per format (plan 6.4.1). */
+    require(fake.definitions.size() == 5 + floatops::catalogueCount(),
+            "expected the five M0 probes plus every catalogue type");
 
     const auto& source = findDefinition(fake, "local.float-ops/m0-source");
     const auto& pass = findDefinition(fake, "local.float-ops/m0-pass");
@@ -411,8 +416,16 @@ int main() {
         {"local.float-ops/fp32-split-bits", 1, 3, splitInputs, {32, 0, 0, {}}, splitExpected},
         {"local.float-ops/fp32-make-bits", 3, 1, makeInputs, {32, 0, 0, {}}, makeExpected},
     };
-    require(sizeof(cases) / sizeof(cases[0]) == floatops::catalogueCount(),
-            "the catalogue case list and the Mod's own catalogue disagree");
+    /* The case list is the binary32 catalogue minus the three types the vertical
+       slice shipped with (Constant, Add and Display), which are rows of the same
+       catalogue now and get their own checks above. */
+    size_t binary32Types = 0;
+    for (size_t index = 0; index < floatops::catalogueCount(); ++index) {
+        const floatops::CatalogueInfo* info = floatops::catalogueAt(index);
+        if (info && info->format == 32) ++binary32Types;
+    }
+    require(sizeof(cases) / sizeof(cases[0]) + 3 == binary32Types,
+            "the binary32 case list and the Mod's own catalogue disagree");
     int roundingTypes = 0;
     for (const CatalogueCase& item : cases) {
         const auto& definition = findDefinition(fake, item.type_id);
@@ -480,9 +493,218 @@ int main() {
                 "the catalogue's schema-2 migration did not keep the rounding mode");
     }
 
-    std::cout << "PASS float-ops M0/M2/M3/M4: five public V2 probes plus the three M2 "
-                 "components and the catalogue; every catalogue type registers with its "
-                 "declared pins, the shared schema-3 configuration and the 3.0 pin lane, "
-                 "and its callback publishes the kernel's result and flags\n";
+    /* ---- the width cut: one type per family per format (plan 6.4.1) --------
+
+       The Mod registers 22 binary16 types, 22 binary32 types and 21 binary64
+       types - the binary64 Fused Multiply Add is deliberately absent, because
+       three 64-bit inputs are 192 bits against the loader's 128-bit input
+       budget.  This walks the Mod's own catalogue and checks every registration
+       against the format it was built for: its family's shape, pins whose widths
+       are that format's, the configuration layout it registered (including the
+       width byte of the default blob) and a callback driven with that width's
+       operands. */
+    struct Shape {
+        const char* board;
+        uint32_t inputs;
+        uint32_t outputs;
+    };
+    const Shape shapes[] = {
+        {"CONST", 0, 1}, {"ADD", 2, 2}, {"DISP", 1, 0},  {"SUB", 2, 2},
+        {"MUL", 2, 2},   {"DIV", 2, 2}, {"SQRT", 1, 2},  {"NEG", 1, 1},
+        {"ABS", 1, 1},   {"CMP", 2, 4}, {"CLS", 1, 1},   {"FMA", 3, 2},
+        {"REM", 2, 2},   {"RND", 1, 2}, {"MIN", 2, 2},   {"MAX", 2, 2},
+        {"I2F", 1, 2},   {"U2F", 1, 2}, {"F2I", 1, 2},   {"F2U", 1, 2},
+        {"SPLIT", 1, 3}, {"MAKE", 3, 1},
+    };
+    auto allowedWidth = [](uint32_t bits, const uint32_t* allowed, size_t count) {
+        for (size_t index = 0; index < count; ++index)
+            if (allowed[index] == bits) return true;
+        return false;
+    };
+    int perWidth[3] = {0, 0, 0};
+    for (size_t index = 0; index < floatops::catalogueCount(); ++index) {
+        const floatops::CatalogueInfo* info = floatops::catalogueAt(index);
+        require(info != nullptr, "the catalogue ended before its own count");
+        ++perWidth[info->format == 16 ? 0 : (info->format == 64 ? 2 : 1)];
+        const auto& definition = findDefinition(fake, info->type_id);
+        require(definition.definition.custom_id == info->id &&
+                    definition.definition.user ==
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(info->format)),
+                std::string(info->type_id) + " did not register its identity and width");
+        const Shape* shape = nullptr;
+        for (const Shape& candidate : shapes)
+            if (std::strcmp(candidate.board, info->board_name) == 0) shape = &candidate;
+        require(shape != nullptr, std::string("unknown family ") + info->board_name);
+        verifyShape(definition, shape->inputs, shape->outputs);
+        const tcfp::Layout& layout = tcfp::layoutFor(info->format);
+        const uint32_t allowed[] = {1u, 5u, 10u, 32u, layout.exponent_bits,
+                                    layout.significand_bits, layout.width};
+        bool carriesWord = false;
+        for (const TCComponentPinV2& pin : definition.inputs) {
+            require(allowedWidth(pin.bits, allowed, 7),
+                    std::string(info->type_id) + " has an input pin of " +
+                        std::to_string(pin.bits) + " bits");
+            carriesWord = carriesWord || pin.bits == layout.width;
+        }
+        for (const TCComponentPinV2& pin : definition.outputs) {
+            require(allowedWidth(pin.bits, allowed, 7),
+                    std::string(info->type_id) + " has an output pin of " +
+                        std::to_string(pin.bits) + " bits");
+            carriesWord = carriesWord || pin.bits == layout.width;
+        }
+        /* Make Bits is the one family without a word pin: its three inputs are
+           the fields themselves (verifying that is its own check below). */
+        if (std::strcmp(info->board_name, "MAKE") != 0)
+            require(carriesWord, std::string(info->type_id) +
+                                     " has no pin of its own width");
+        uint32_t expectedConfig = sizeof(floatops::OpsConfig);
+        if (info->layout == floatops::ConfigLayout::display)
+            expectedConfig = sizeof(floatops::DisplayConfig);
+        else if (info->layout == floatops::ConfigLayout::constant_narrow)
+            expectedConfig = sizeof(floatops::ConstantConfig);
+        else if (info->layout == floatops::ConfigLayout::constant_wide)
+            expectedConfig = sizeof(floatops::ConstantConfigWide);
+        require(definition.definition.config_size == expectedConfig &&
+                    definition.definition.config_schema == 3 &&
+                    definition.definition.default_config != nullptr,
+                std::string(info->type_id) + " registered the wrong configuration layout");
+        require(static_cast<const uint8_t*>(definition.definition.default_config)[0] ==
+                    info->format,
+                std::string(info->type_id) +
+                    "'s default configuration does not name its own width");
+        /* The Constant is the one family whose layout depends on the width, and
+           the default blob has to be the value 1.0 *in that width*: this is what
+           a freshly placed part shows, and reading a 16-byte binary32 blob with
+           the wide decoder (or the other way round) is exactly the mistake the
+           first real-game run of the width cut caught. */
+        if (info->body == floatops::BodyKind::constant_value) {
+            const uint32_t pattern_bytes =
+                info->format == 32 ? sizeof(uint32_t) : sizeof(uint64_t);
+            require(definition.definition.config_size ==
+                        (info->format == 32 ? sizeof(floatops::ConstantConfig)
+                                            : sizeof(floatops::ConstantConfigWide)),
+                    std::string(info->type_id) + " registered the wrong Constant layout");
+            uint64_t bits = 0;
+            std::memcpy(&bits, static_cast<const uint8_t*>(definition.definition.default_config) + 4,
+                        pattern_bytes);
+            const uint64_t expected_bits = info->format == 16
+                                               ? UINT64_C(0x3C00)
+                                               : (info->format == 32
+                                                      ? UINT64_C(0x3F800000)
+                                                      : UINT64_C(0x3FF0000000000000));
+            require(bits == expected_bits,
+                    std::string(info->type_id) + "'s default value is not 1.0 in its width");
+        }
+        require(definition.definition.pin_lane == 3.0f &&
+                    definition.definition.state_words == 0 &&
+                    definition.definition.gate_cost == 0 &&
+                    definition.definition.delay == 0,
+                std::string(info->type_id) + " registered the wrong definition fields");
+    }
+    require(perWidth[0] == 22 && perWidth[1] == 22 && perWidth[2] == 21,
+            "the catalogue is not 22/22/21 types across binary16/32/64");
+
+    /* The same sum in each width: 2 + 3 = 5 has to come out in the type's own
+       format, and an FP16 add must ignore the upper half of the wider wire it
+       sits on (a pattern that arrived on a 32-bit wire keeps only its 16 bits). */
+    struct AddCase {
+        const char* type_id;
+        uint64_t a;
+        uint64_t b;
+        uint64_t sum;
+    };
+    const AddCase adds[] = {
+        {"local.float-ops/fp16-add", 0x4000u, 0x4200u, 0x4500u},
+        {"local.float-ops/fp32-add", 0x40000000u, 0x40400000u, 0x40A00000u},
+        {"local.float-ops/fp64-add", UINT64_C(0x4000000000000000),
+         UINT64_C(0x4008000000000000), UINT64_C(0x4014000000000000)},
+    };
+    for (const AddCase& item : adds) {
+        const auto& definition = findDefinition(fake, item.type_id);
+        const uint32_t format = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(definition.definition.user));
+        const floatops::OpsConfig config{static_cast<uint8_t>(format), 0, 0, {}};
+        uint64_t outputs[2] = {};
+        invoke(definition, TC_LOGIC_CYCLE, &item.a, 2, outputs, 2, &config, sizeof(config),
+               3);
+        require(outputs[0] == item.sum && outputs[1] == 0,
+                std::string(item.type_id) + ": 2 + 3 did not come out as 5");
+        (void)format;
+    }
+
+    /* Three things only the binary16 add can show: a 32-bit wire whose upper
+       half is junk must not leak into the value, the instance's own rounding
+       mode has to reach the kernel (1.0 + 2^-11 is exactly halfway in binary16,
+       so RNE keeps 1.0 and RUP steps up), and a configuration that names another
+       width is refused rather than adopted - the instance falls back to its
+       registered RNE default, which is exactly the difference the halfway case
+       makes visible. */
+    {
+        const auto& add = findDefinition(fake, "local.float-ops/fp16-add");
+        const uint64_t noisy[2] = {0xFFFF0000u | 0x4000u, 0xFFFF0000u | 0x4200u};
+        const uint64_t halfway[2] = {0x3C00u, 0x0C00u};   /* 1.0, 2^-11 */
+        const floatops::OpsConfig own_rup{16, 4, 0, {}};
+        const floatops::OpsConfig foreign{32, 4, 0, {}};
+        uint64_t outputs[2] = {};
+        invoke(add, TC_LOGIC_CYCLE, noisy, 2, outputs, 2, &own_rup, sizeof(own_rup), 3);
+        require(outputs[0] == 0x4500u,
+                "an FP16 add read past its own 16 bits of the input wire");
+        invoke(add, TC_LOGIC_CYCLE, halfway, 2, outputs, 2, &own_rup, sizeof(own_rup), 3);
+        require(outputs[0] == 0x3C01u && outputs[1] == tcfp::fp_flag_nx,
+                "the FP16 add's own rounding mode did not reach the kernel");
+        invoke(add, TC_LOGIC_CYCLE, halfway, 2, outputs, 2, &foreign, sizeof(foreign), 3);
+        require(outputs[0] == 0x3C00u && outputs[1] == tcfp::fp_flag_nx,
+                "an FP16 add adopted a configuration written for another width");
+    }
+
+    /* Split Bits and Make Bits are inverses in each width, and their field pins
+       are that width's fields: -1.5 in binary16 is 0xBE00 -> 1 / 0x0F / 0x200. */
+    {
+        struct SplitCase {
+            const char* split_id;
+            const char* make_id;
+            uint32_t format;
+            uint64_t pattern;
+            uint64_t sign;
+            uint64_t exponent;
+            uint64_t significand;
+        };
+        const SplitCase splits[] = {
+            {"local.float-ops/fp16-split-bits", "local.float-ops/fp16-make-bits", 16,
+             0xBE00u, 1u, 0x0Fu, 0x200u},
+            {"local.float-ops/fp32-split-bits", "local.float-ops/fp32-make-bits", 32,
+             0xBFC00000u, 1u, 0x7Fu, 0x400000u},
+            {"local.float-ops/fp64-split-bits", "local.float-ops/fp64-make-bits", 64,
+             UINT64_C(0xBFF8000000000000), 1u, 0x3FFu, UINT64_C(0x8000000000000)},
+        };
+        for (const SplitCase& item : splits) {
+            const auto& split = findDefinition(fake, item.split_id);
+            const auto& make = findDefinition(fake, item.make_id);
+            require(split.outputs.size() == 3 && split.outputs[0].bits == 1 &&
+                        split.outputs[1].bits == tcfp::layoutFor(item.format).exponent_bits &&
+                        split.outputs[2].bits ==
+                            tcfp::layoutFor(item.format).significand_bits,
+                    std::string(item.split_id) + " does not publish this width's fields");
+            const floatops::OpsConfig config{static_cast<uint8_t>(item.format), 0, 0, {}};
+            uint64_t fields[3] = {};
+            invoke(split, TC_LOGIC_CYCLE, &item.pattern, 1, fields, 3, &config,
+                   sizeof(config), 3);
+            require(fields[0] == item.sign && fields[1] == item.exponent &&
+                        fields[2] == item.significand,
+                    std::string(item.split_id) + " split the pattern wrongly");
+            uint64_t rebuilt[1] = {};
+            invoke(make, TC_LOGIC_CYCLE, fields, 3, rebuilt, 1, &config, sizeof(config), 3);
+            require(rebuilt[0] == item.pattern,
+                    std::string(item.make_id) + " did not rebuild the pattern");
+        }
+    }
+
+    std::cout << "PASS float-ops M0/M2/M3/M4/M6: five public V2 probes plus the whole "
+                 "catalogue - 22 binary16, 22 binary32 and 21 binary64 types (no FP64 "
+                 "FMA: three 64-bit inputs exceed the 128-bit input budget); every type "
+                 "registers its family's shape, its own width on every pin, its own "
+                 "configuration layout and its width byte, and its callback computes in "
+                 "that width (2 + 3 = 5 in all three, an FP16 input ignores the upper "
+                 "half of its wire, and Split/Make round-trip per width)\n";
     return 0;
 }

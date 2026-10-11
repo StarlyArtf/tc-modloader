@@ -39,6 +39,26 @@ void readPin(const tc::TCPrototype& prototype, bool input, uint64_t index,
         << ",w" << word << ")";
 }
 
+/* The third pin list.  A Prototype keeps its declared inputs at +0x60/+0x68 and
+   its outputs at +0x80/+0x88; the same pair of fields one slot earlier
+   (+0x70/+0x78) is non-empty for exactly the storage kinds - Register, Counter,
+   Delay Line, Auto Register, Auto Delay Line - and for 0x35.  Those are the
+   kinds that declare no input pins yet still take wires on the board, so this
+   list is the missing geometry, in the same 0x38-byte entry layout as the other
+   two.  Read-only, like the rest of this probe. */
+void readHiddenPin(const tc::TCPrototype& prototype, uint64_t index,
+                   std::ostringstream& out) {
+    uint64_t count = 0;
+    void* data = nullptr;
+    memcpy(&count, prototype.bytes + 0x70, sizeof(count));
+    memcpy(&data, prototype.bytes + 0x78, sizeof(data));
+    if (!data || index >= count) return;
+    const auto* pin = reinterpret_cast<const tc::TCPin*>(data) + index;
+    const tc::TCPinPoint point = tc::pinPoint(*pin);
+    out << " hidden" << index << "=(" << point.x << "," << point.y << ",w"
+        << tc::pinWordSizeRaw(*pin) << ")";
+}
+
 }  // namespace
 
 static void frame(void*, const TCFrame* value) {
@@ -66,10 +86,17 @@ static void frame(void*, const TCFrame* value) {
              << " gates=" << tc::prototypeGateCost(prototype)
              << " delay=" << tc::prototypeDelay(prototype)
              << " inputs=" << inputs << " outputs=" << outputs;
-        for (uint64_t i = 0; i < inputs && i < 4; ++i)
+        /* All of them, not the first four: the ports 0x36/0x38 and the wide
+           Output kinds carry more than four pins, and a dump that stops at four
+           silently hides the pin a viewer would have to place.  Eight is the
+           bound the netlist builder uses. */
+        for (uint64_t i = 0; i < inputs && i < 8; ++i)
             readPin(prototype, true, i, line);
-        for (uint64_t i = 0; i < outputs && i < 4; ++i)
+        for (uint64_t i = 0; i < outputs && i < 8; ++i)
             readPin(prototype, false, i, line);
+        /* The storage kinds' own pin list (see readHiddenPin). */
+        for (uint64_t i = 0; i < 8; ++i)
+            readHiddenPin(prototype, i, line);
         // Raw pointer/count fields around the pin lists.  Some stateful kinds
         // declare their ports through different slots, so dump them all.
         auto raw = [&](size_t offset) {
@@ -80,6 +107,19 @@ static void frame(void*, const TCFrame* value) {
         line << " raw[0x58..0x80]=";
         for (size_t offset = 0x58; offset <= 0x80; offset += 8)
             line << " " << offset << ":" << raw(offset);
+        /* The palette's own words for this kind.  It is what tells a reader what
+           the game thinks a component is for (the Auto size family, for one),
+           and it is appended last so nothing that parses the geometry above has
+           to know about it. */
+        const char* description = tc::prototypeDescriptionCStr(prototype);
+        line << " desc=\"";
+        for (const char* at = description ? description : ""; *at; ++at) {
+            const unsigned char c = static_cast<unsigned char>(*at);
+            if (c == '"' || c == '\\') line << '\\' << static_cast<char>(c);
+            else if (c == '\n' || c == '\r') line << ' ';
+            else line << static_cast<char>(c);
+        }
+        line << "\"";
         report << line.str() << "\n";
     }
 

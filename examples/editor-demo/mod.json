@@ -1,0 +1,11 @@
+{
+  "format": 2,
+  "id": "local.editor-demo",
+  "name": "Editor Demo（宿主属性行）",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "演示 tc.component.editor V3：注册一个 0 引脚、48 字节配置的元件，字段表交给加载器，选中元件后底部面板里的属性行由宿主自己画、自己收输入、自己提交。字段覆盖 bool、整数、枚举下拉、字符串、浮点、RGBA 颜色、十六进制和一条自定义行（宿主开事务、Mod 画自己的预览并在右键菜单/双击/右下角拖拽里改配置）；每次提交都会打一行 log，写明这一实例的新值。不修改加载器或游戏二进制。",
+  "requires": [],
+  "capabilities": ["log", "services"],
+  "native": {"api": 1, "entry": "native/editor-demo.dll"}
+}

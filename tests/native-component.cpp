@@ -153,6 +153,42 @@ static void lifecycleDestroy(TCLogicIOV2* io) {
     if (io->phase != TC_LOGIC_DESTROY) gLifecycleDestroys = -100;
     ++gLifecycleDestroys;
 }
+/* The placement half of the lifecycle (2026-09-28): move / rotate / resize read
+   their new values from TCLogicIOV2's tail, and compile / unbind are the two
+   remaining transitions. */
+static int gMoves = 0, gRotations = 0, gResizes = 0, gCompiles = 0, gUnbinds = 0;
+static int32_t gMoveCellX = -999, gMoveCellY = -999;
+static uint32_t gMoveRotation = 999;
+static float gResizeHalfW = -1.f, gResizeHalfH = -1.f;
+static void lifecycleMove(TCLogicIOV2* io) {
+    if (io->phase != TC_LOGIC_MOVE) gMoves = -100;
+    ++gMoves;
+    if (io->size < offsetof(TCLogicIOV2, half_height) + sizeof(io->half_height)) return;
+    gMoveCellX = io->cell_x;
+    gMoveCellY = io->cell_y;
+    gMoveRotation = io->rotation;
+}
+static void lifecycleRotate(TCLogicIOV2* io) {
+    if (io->phase != TC_LOGIC_ROTATE) gRotations = -100;
+    ++gRotations;
+    if (io->size < offsetof(TCLogicIOV2, half_height) + sizeof(io->half_height)) return;
+    gMoveRotation = io->rotation;
+}
+static void lifecycleResize(TCLogicIOV2* io) {
+    if (io->phase != TC_LOGIC_RESIZE) gResizes = -100;
+    ++gResizes;
+    if (io->size < offsetof(TCLogicIOV2, half_height) + sizeof(io->half_height)) return;
+    gResizeHalfW = io->half_width;
+    gResizeHalfH = io->half_height;
+}
+static void lifecycleCompile(TCLogicIOV2* io) {
+    if (io->phase != TC_LOGIC_COMPILE) gCompiles = -100;
+    ++gCompiles;
+}
+static void lifecycleUnbind(TCLogicIOV2* io) {
+    if (io->phase != TC_LOGIC_UNBIND) gUnbinds = -100;
+    ++gUnbinds;
+}
 
 /* The encoder writes a literal-only Snappy stream, so a test can read it back
    and check a scaffold node by node.  The 0-pin scaffolds are the ones whose
@@ -249,6 +285,88 @@ inline std::vector<Node> nodes(const std::vector<uint8_t>& raw) {
     }
     return result;
 }
+struct Wire { std::vector<std::pair<int16_t,int16_t>> points; };
+inline std::vector<Wire> wires(const std::vector<uint8_t>& raw) {
+    Cursor cursor{raw};
+    cursor.skip(8 + 4 + 8 + 8);
+    cursor.skip(1 + 8 + 2 + 2);
+    cursor.skip(1 + 2 + 2 + 2);
+    cursor.skip(512);
+    const uint64_t components=cursor.take(8);
+    for(uint64_t i=0;i<components;++i) {
+        cursor.skip(2 + 2 + 2 + 1 + 8);
+        const uint64_t nameLength=cursor.take(2);cursor.skip(size_t(nameLength));
+        const uint64_t values=cursor.take(2);cursor.skip(size_t(values)*8);
+        cursor.skip(8 + 2 + 8);
+        cursor.skip(1 + 8 + 8 + 1 + 1 + 2 + 2);
+    }
+    const uint64_t count=cursor.take(8);
+    std::vector<Wire> result;
+    for(uint64_t i=0;i<count;++i) {
+        cursor.skip(1);
+        const uint64_t nameLength=cursor.take(2);cursor.skip(size_t(nameLength));
+        int16_t x=int16_t(cursor.take(2)),y=int16_t(cursor.take(2));
+        Wire wire;wire.points.push_back({x,y});
+        for(;;) {
+            const uint16_t segment=uint16_t(cursor.take(2));
+            const int length=segment&0x1fff;
+            if(!length)break;
+            const unsigned direction=(segment>>13)&7;
+            const int dx[8]={1,1,0,-1,-1,-1,0,1};
+            const int dy[8]={0,1,1,1,0,-1,-1,-1};
+            for(int step=0;step<length;++step) {
+                x=int16_t(x+dx[direction]);y=int16_t(y+dy[direction]);
+                wire.points.push_back({x,y});
+            }
+        }
+        result.push_back(std::move(wire));
+    }
+    return result;
+}
+inline void assertSeparateCollectors(const std::vector<uint8_t>& raw, unsigned inputs) {
+    const auto components=nodes(raw);
+    const auto paths=wires(raw);
+    std::vector<size_t> parent(paths.size());
+    for(size_t i=0;i<parent.size();++i)parent[i]=i;
+    const auto root=[&parent](size_t at) {
+        while(parent[at]!=at)at=parent[at];
+        return at;
+    };
+    std::map<std::pair<int16_t,int16_t>,std::vector<size_t>> crossings;
+    for(size_t i=0;i<paths.size();++i)
+        for(const auto& point:paths[i].points)crossings[point].push_back(i);
+    for(size_t i=0;i<paths.size();++i)
+        for(const auto& end:{paths[i].points.front(),paths[i].points.back()})
+            for(const auto other:crossings.at(end)) {
+                const size_t a=root(i),b=root(other);
+                if(a!=b)parent[a]=b;
+            }
+    std::set<size_t> nets;
+    for(unsigned i=0;i<inputs;++i) {
+        const auto& collector=components[inputs+i];
+        const auto point=std::make_pair(int16_t(collector.x+2),collector.y);
+        const auto& touching=crossings.at(point);
+        if(!nets.insert(root(touching.front())).second) {
+            std::cerr<<"Collector short: inputs="<<inputs<<" input="<<i<<"\n";
+            assert(false);
+        }
+    }
+    // Dependency gates have private output nets, even when cones share inputs.
+    for(size_t i=2*inputs;i<components.size();++i) {
+        const auto& gate=components[i];
+        if(gate.kind!=0x17)continue;
+        const auto point=std::make_pair(int16_t(gate.x+2),gate.y);
+        assert(nets.insert(root(crossings.at(point).front())).second);
+    }
+    for(size_t i=2*inputs;i<components.size();++i) {
+        const auto& driver=components[i];
+        if(driver.kind!=0x12&&driver.kind!=0x0c&&driver.kind!=0x19)continue;
+        const auto in=crossings.find({int16_t(driver.x-1),driver.y});
+        const auto out=crossings.find({int16_t(driver.x+2),driver.y});
+        if(in!=crossings.end()&&out!=crossings.end())
+            assert(root(in->second.front())!=root(out->second.front()));
+    }
+}
 }  // namespace reader
 int main() {
     tc::TCNativeComponent c;
@@ -269,7 +387,7 @@ int main() {
     assert(!bytes.empty() && bytes[0]==14);
     std::ofstream file("build/declarative-8x8.data",std::ios::binary);
     file.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());file.close();
-    pins[0].bits=17;assert(!tc::component_definition::valid(&d));pins[0].bits=16;
+    pins[0].bits=17;assert(tc::component_definition::valid(&d));pins[0].bits=16;
     for(auto bad:{0u,65u}) {pins[0].bits=bad;assert(!tc::component_definition::valid(&d));}pins[0].bits=16;
     d.input_count=0;d.output_count=0;
     /* No pin at all is the decorative shape (the text-note component): it owns
@@ -290,6 +408,10 @@ int main() {
     d.custom_id=0;assert(!tc::component_definition::valid(&d));d.custom_id=c.id;
     d.callback=nullptr;assert(!tc::component_definition::valid(&d));d.callback=noop;
     d.gate_cost=UINT64_MAX;assert(!tc::component_definition::valid(&d));d.gate_cost=1;
+    assert(tc::logic::outputGroupLeader({0x2,0x2,0xf,0x2},0));
+    assert(!tc::logic::outputGroupLeader({0x2,0x2,0xf,0x2},1));
+    assert(tc::logic::outputGroupLeader({0x2,0x2,0xf,0x2},2));
+    assert(!tc::logic::outputGroupLeader({0x2,0x2,0xf,0x2},3));
 
     // 0-pin scaffolds: a source has no input collector and no dependency chain,
     // a sink keeps one driver node with an unconnected output.
@@ -343,6 +465,149 @@ int main() {
         assert(reader::nodeKinds(raw).size() == 3 + 3 + 2 + 1);
     }
 
+    /* Exact output cones: address depends on instruction alone, while the ALU
+       result depends on two data inputs.  The precise scaffold therefore has
+       one shared collector per input, one gate only for the two-input cone,
+       and two independent drivers (no output-to-output chain). */
+    {
+        auto precise=d;
+        TCComponentPin ins[3]={{"instr",32},{"rs1_data",32},{"rs2_data",32}};
+        TCComponentPin outs[2]={{"rs1_addr",5},{"alu_result",32}};
+        const uint32_t dependencies[2]={0x1,0x6};
+        precise.custom_id=0xf0000000000000a4ULL;
+        precise.name="Precise dependencies";
+        precise.inputs=ins;precise.input_count=3;
+        precise.outputs=outs;precise.output_count=2;
+        std::vector<uint8_t> raw;
+        assert(reader::decode(tc::component_definition::encode(
+            precise,8,tc::component_definition::kDefaultPinLane,false,dependencies),raw));
+        const auto kinds=reader::nodeKinds(raw);
+        const uint16_t expected[]={0x4f,0x4f,0x4f,0x12,0x12,0x12,0x17,0x12,0x12,0x51,0x51};
+        assert(kinds.size()==sizeof(expected)/sizeof(expected[0]));
+        for(size_t i=0;i<kinds.size();++i)assert(kinds[i]==expected[i]);
+        /* A wire endpoint landing on another wire is an electrical join in the
+           game.  Ensure the three collector trunks stay distinct while the
+           public cones reuse their long routing columns. */
+        const auto nodes=reader::nodes(raw);
+        const auto wires=reader::wires(raw);
+        std::vector<size_t> parent(wires.size());
+        for(size_t i=0;i<parent.size();++i)parent[i]=i;
+        const auto root=[&parent](size_t at) {
+            while(parent[at]!=at)at=parent[at];
+            return at;
+        };
+        for(size_t i=0;i<wires.size();++i)for(size_t j=0;j<i;++j) {
+            const auto endpoint=[&](size_t wire,const std::pair<int16_t,int16_t>& point) {
+                return wires[wire].points.front()==point||wires[wire].points.back()==point;
+            };
+            bool joined=false;
+            for(const auto& point:wires[i].points) {
+                if(!endpoint(i,point)&&!endpoint(j,point))continue;
+                if(std::find(wires[j].points.begin(),wires[j].points.end(),point)!=
+                   wires[j].points.end()){joined=true;break;}
+            }
+            if(joined) {
+                const size_t a=root(i),b=root(j);
+                if(a!=b)parent[a]=b;
+            }
+        }
+        const auto net=[&](int16_t x,int16_t y) {
+            for(size_t i=0;i<wires.size();++i)
+                if(std::find(wires[i].points.begin(),wires[i].points.end(),
+                             std::make_pair(x,y))!=wires[i].points.end())return root(i);
+            assert(false);return size_t(0);
+        };
+        const size_t c0=net(int16_t(nodes[3].x+2),nodes[3].y);
+        const size_t c1=net(int16_t(nodes[4].x+2),nodes[4].y);
+        const size_t c2=net(int16_t(nodes[5].x+2),nodes[5].y);
+        assert(c0!=c1&&c0!=c2&&c1!=c2);
+    }
+    /* A clocked precise scaffold adds one private all-input cone and one
+       unconnected tick driver.  The public cones are unchanged: there is no
+       path from the tick back to either output pin. */
+    {
+        auto clocked=d;
+        TCComponentPin ins[3]={{"clk",1},{"a",1},{"b",1}};
+        TCComponentPin outs[2]={{"state",8},{"sum",1}};
+        const uint32_t dependencies[2]={0x0,0x6};
+        clocked.custom_id=0xf0000000000000a5ULL;
+        clocked.name="Clocked precise dependencies";
+        clocked.inputs=ins;clocked.input_count=3;
+        clocked.outputs=outs;clocked.output_count=2;
+        std::vector<uint8_t> raw;
+        assert(reader::decode(tc::component_definition::encode(
+            clocked,8,tc::component_definition::kDefaultPinLane,false,
+            dependencies,true),raw));
+        const auto kinds=reader::nodeKinds(raw);
+        const uint16_t expected[]={0x4f,0x4f,0x4f,0x12,0x12,0x12,
+                                   0x17,0x17,0x17,
+                                   0x12,0x12,0x12,0x51,0x51};
+        assert(kinds.size()==sizeof(expected)/sizeof(expected[0]));
+        for(size_t i=0;i<kinds.size();++i)assert(kinds[i]==expected[i]);
+    }
+    /* The RV32I front-end shape (5 in, 17 out) is the widest precise map in the
+       tree: four one-input cones, a three-input cone, eleven four-input cones
+       and the five-input write-back.  The gates are exactly the sum of
+       (dependencies-1) over the outputs, so the count is what proves the
+       encoder built one cone per output instead of falling back to the single
+       all-input chain (which would emit 4 gates and 48 nodes, not 39/83). */
+    {
+        auto rv32i=d;
+        static TCComponentPin ins[5];
+        for(auto& p:ins)p={"in",32};
+        static TCComponentPin outs[17];
+        for(auto& p:outs)p={"out",1};
+        const uint32_t dependencies[17]={0x1,0x2,0x2,0x2,0xf,0x1f,0x7,
+                                         0xf,0xf,0xf,0xf,0xf,0xf,0xf,0xf,0xf,0xf};
+        rv32i.custom_id=0x2927d7c021863f27ULL;
+        rv32i.name="RV32I dependencies";
+        rv32i.inputs=ins;rv32i.input_count=5;
+        rv32i.outputs=outs;rv32i.output_count=17;
+        std::vector<uint8_t> raw;
+        assert(reader::decode(tc::component_definition::encode(
+            rv32i,32,tc::component_definition::kDefaultPinLane,false,dependencies),raw));
+        const auto kinds=reader::nodeKinds(raw);
+        assert(kinds.size()==5+5+39+17+17);
+        size_t at=0;
+        for(int i=0;i<5;++i)assert(kinds[at++]==0x4f);   /* input pins */
+        for(int i=0;i<5;++i)assert(kinds[at++]==0x12);   /* one collector per input */
+        for(int i=0;i<39;++i)assert(kinds[at++]==0x17);  /* private dependency gates */
+        for(int i=0;i<17;++i)assert(kinds[at++]==0x12);  /* independent drivers */
+        for(int i=0;i<17;++i)assert(kinds[at++]==0x51);  /* output pins */
+        assert(at==kinds.size());
+        reader::assertSeparateCollectors(raw,5);
+    }
+
+    /* Routing must separate all 32 supported collectors from each other and
+       from public pin wires, for single/full-input cones and a hidden tick. */
+    for(unsigned inputs=1;inputs<=32;++inputs)for(bool tick:{false,true})
+    for(float lane:{1.0f,1.125f,1.25f,1.375f,1.5f,1.625f,1.75f,1.875f,2.0f,16.0f}) {
+        auto shape=d;
+        TCComponentPin ins[32],outs[3];
+        for(auto& pin:ins)pin={"in",1};
+        for(auto& pin:outs)pin={"out",1};
+        shape.inputs=ins;shape.input_count=inputs;
+        shape.outputs=outs;shape.output_count=3;
+        const uint32_t full=inputs==32?~uint32_t(0):(uint32_t(1)<<inputs)-1;
+        const uint32_t dependencies[3]={1u,uint32_t(1)<<(inputs-1),full};
+        std::vector<uint8_t> raw;
+        assert(reader::decode(tc::component_definition::encode(
+            shape,32,lane,false,dependencies,tick),raw));
+        reader::assertSeparateCollectors(raw,inputs);
+    }
+
+    // Fractional pin lanes must not merge cones with different dependencies.
+    {
+        auto shape=d;
+        TCComponentPin ins[3]={{"A",1},{"B",1},{"C",1}},outs[2]={{"AB",1},{"BC",1}};
+        shape.inputs=ins;shape.input_count=3;shape.outputs=outs;shape.output_count=2;
+        const uint32_t dependencies[2]={3,6};
+        std::vector<uint8_t> raw;
+        assert(reader::decode(tc::component_definition::encode(
+            shape,32,1.25f,false,dependencies),raw));
+        reader::assertSeparateCollectors(raw,3);
+    }
+
     /* Every node the scaffold adds sits inside the rectangle the pins span.
        The game renders a generated component's **inner circuit** for its menu,
        foundry and preview pictures, so a node placed further out shows up as a
@@ -394,42 +659,40 @@ int main() {
         }
     }
 
-    // V2 shapes: the V1 descriptor is capped at eight pins per direction, while
-    // the encoder (and the V2 registration that uses it) goes to sixteen as long
-    // as the total input width stays inside the two payload words.
+    // V2/V3 shapes: the V1 descriptor is capped at eight pins per direction,
+    // while the staged bridge follows the game's measured 32-pin limit.
     {
-        static TCComponentPin many[16];
-        for (unsigned i = 0; i < 16; ++i) many[i] = {"pin", 1};
+        static TCComponentPin many[33];
+        for (auto& pin : many) pin = {"pin", 1};
         auto wide = d;
         wide.custom_id = 0xf0000000000000b1ULL;
         wide.inputs = many; wide.input_count = 9; wide.outputs = many; wide.output_count = 1;
         assert(!tc::component_definition::valid(&wide));        // V1: eight pins max
-        assert(tc::component_definition::validShape(&wide, 16));
+        assert(tc::component_definition::validShape(&wide, 32));
         std::vector<uint8_t> raw;
-        assert(reader::decode(tc::component_definition::encode(wide, 16), raw));
+        assert(reader::decode(tc::component_definition::encode(wide, 32), raw));
         assert(reader::nodeKinds(raw).size() == 9 + 9 + 8 + 1 + 1);
 
-        wide.input_count = 16;
-        assert(tc::component_definition::validShape(&wide, 16));
+        wide.input_count = 32;
+        assert(tc::component_definition::validShape(&wide, 32));
         raw.clear();
-        assert(reader::decode(tc::component_definition::encode(wide, 16), raw));
-        assert(reader::nodeKinds(raw).size() == 16 + 16 + 15 + 1 + 1);
+        assert(reader::decode(tc::component_definition::encode(wide, 32), raw));
+        assert(reader::nodeKinds(raw).size() == 32 + 32 + 31 + 1 + 1);
         assert(!tc::component_definition::validShape(&wide, 8));
 
-        // The budget is the host's, not the game's: 129 input bits cannot be
-        // packed into the two payload words the generated call carries.
-        static TCComponentPin budget[2] = {{"a", 64}, {"b", 64}};
+        // Thirty-two full words are the 2048-bit staged-input boundary.
+        static TCComponentPin budget[33];
+        for (auto& pin : budget) pin = {"word", 64};
         auto over = d;
         over.custom_id = 0xf0000000000000b2ULL;
-        over.inputs = budget; over.input_count = 2;
+        over.inputs = budget; over.input_count = 32;
         over.outputs = many; over.output_count = 1;
-        assert(tc::component_definition::validShape(&over, 16));   // 128 bits exactly
-        budget[1].bits = 65;                                       // out of range
-        assert(!tc::component_definition::validShape(&over, 16));
-        TCComponentPin three[3] = {{"a", 64}, {"b", 64}, {"c", 1}};
-        auto tooWide = over;
-        tooWide.inputs = three; tooWide.input_count = 3;
-        assert(!tc::component_definition::validShape(&tooWide, 16));  // 129 bits
+        assert(tc::component_definition::validShape(&over, 32));   // 2048 bits exactly
+        budget[1].bits = 65;
+        assert(!tc::component_definition::validShape(&over, 32));
+        budget[1].bits = 64;
+        over.input_count = 33;
+        assert(!tc::component_definition::validShape(&over, 33));  // 2112 bits
     }
 
     // A 64-bit pin crossing payload words used to overrun the payload array.
@@ -474,7 +737,252 @@ int main() {
         assert(lines.back().find(">> 63")!=std::string::npos);
         emission=nullptr;
     }
-    // Wide constants become runtime lookups in both generated phases, allowing
+    // Inputs wider than the direct two-word invoke are staged as complete,
+    // cycle-tagged batches.  Exercise the maximum 32 x 64-bit V2 shape, both
+    // phases, and rejection of an incomplete batch.
+    {
+        bindings.clear();bindingKeys.clear();
+        auto staged=std::make_shared<Definition>();
+        staged->useV2=true;staged->inputs=32;staged->outputs=1;
+        staged->inputWidths.fill(64);staged->outputWidths[0]=1;
+        placeInputs(staged->inputWidths,staged->inputs,staged->inputWord,staged->inputShift);
+        staged->callbackV2=[](TCLogicIOV2* io) {
+            assert(io->input_count==32&&io->output_count==1);
+            for(uint32_t i=0;i<32;++i)
+                assert(io->inputs[i]==(0x1020304050607000ULL+i));
+            io->outputs[0]=1;
+        };
+        auto stagedBinding=std::make_shared<Binding>();stagedBinding->definition=staged;
+        bindings.push_back(stagedBinding);
+        const uint64_t cycle=41;
+        for(uint32_t chunk=0;chunk<kMaxInputChunks;++chunk) {
+            const uint64_t lo=0x1020304050607000ULL+chunk*2;
+            const uint64_t hi=lo+1;
+            assert(stageInput(1,(cycle+1)*32+chunk,lo,hi,false)==1);
+        }
+        assert(invokeStaged(1,cycle,kMaxInputChunks,TC_LOGIC_CYCLE)==1);
+        assert(stagedBinding->calls==1);
+        for(uint32_t chunk=0;chunk<kMaxInputChunks;++chunk) {
+            const uint64_t lo=0x1020304050607000ULL+chunk*2;
+            const uint64_t hi=lo+1;
+            assert(stageInput(1,chunk,lo,hi,false)==1); // encoded cycle -1
+        }
+        assert(invokeStaged(1,-1,kMaxInputChunks,TC_LOGIC_CYCLE)==1);
+        assert(stagedBinding->calls==2);
+        assert(stageInput(1,(cycle+2)*32,0,0,false)==1);
+        assert(invokeStaged(1,cycle+1,kMaxInputChunks,TC_LOGIC_CYCLE)==0);
+        assert(stagedBinding->calls==2);
+        for(uint32_t chunk=0;chunk<kMaxInputChunks;++chunk) {
+            const uint64_t lo=0x1020304050607000ULL+chunk*2;
+            const uint64_t hi=lo+1;
+            assert(stageInput(1,(cycle+1)*32+16+chunk,lo,hi,false)==1);
+        }
+        assert(invokeStaged(1,cycle,kMaxInputChunks,TC_LOGIC_REFRESH)==1);
+        assert(stagedBinding->peeks==1);
+
+        Emission::Instance emitted{};
+        emitted.inputs=32;emitted.outputs=1;emitted.widths.fill(64);
+        for(uint32_t i=0;i<32;++i)emitted.operands.push_back("vid"+std::to_string(100+i));
+        const auto generated=invocationText(emitted,7,false);
+        assert(generated.prefix.find("tc_logic_stage")!=std::string::npos);
+        assert(generated.prefix.find("tc_is7vc15")!=std::string::npos);
+        assert(generated.prefix.find("vid100")!=std::string::npos);
+        assert(generated.prefix.find("vid131")!=std::string::npos);
+        assert(generated.expression.find("tc_logic_invoke_staged")!=std::string::npos);
+        assert(stateSlot(1,31,63)<stateSlot(2,0,0));
+        assert(stateSlot(2,0,0)-stateSlot(1,0,0)==2048);
+        assert(stateSlot(32,31,63)<0x9c4000);
+        bindings.clear();
+    }
+    // Precise cones invoke every driver independently in REFRESH and pack only
+    // the inputs that can reach that output.  This is the loop-breaking path
+    // used by combinational TC-Verilog cores around a built-in register file.
+    {
+        Emission::Instance emitted{};
+        emitted.inputs=3;emitted.outputs=2;emitted.widths={64,64,64};
+        emitted.operands={"vid1","vid2","vid3"};
+        emitted.preciseDependencies=true;
+        emitted.outputDependencies={0x1,0x6};
+        const auto address=invocationText(emitted,9,false,0);
+        assert(address.expression.find("tc_logic_output")!=std::string::npos);
+        assert(address.expression.find("vid1")!=std::string::npos);
+        assert(address.expression.find("vid2")==std::string::npos);
+        const auto result=invocationText(emitted,9,false,1);
+        assert(result.prefix.find("tc_logic_stage")!=std::string::npos);
+        assert(result.prefix.find("vid1")==std::string::npos);
+        assert(result.prefix.find("vid2")!=std::string::npos);
+        assert(result.prefix.find("vid3")!=std::string::npos);
+        assert(result.expression.find("tc_logic_output_staged")!=std::string::npos);
+
+        /* The hidden clocked sink deliberately ignores the per-output mask:
+           it packs the complete tuple and calls the once-per-cycle entry, not
+           the independent REFRESH-output entry. */
+        const auto tick=invocationText(emitted,9,false,0,true);
+        assert(tick.prefix.find("vid1")!=std::string::npos);
+        assert(tick.prefix.find("vid2")!=std::string::npos);
+        assert(tick.prefix.find("vid3")!=std::string::npos);
+        assert(tick.expression.find("tc_logic_tick_staged")!=std::string::npos);
+        assert(tick.expression.find("tc_logic_output_staged")==std::string::npos);
+
+        Emission::Instance directTick{};
+        directTick.inputs=1;directTick.outputs=1;directTick.widths={1};
+        directTick.operands={"vid4"};directTick.preciseDependencies=true;
+        directTick.outputDependencies={0x1};
+        const auto fastTick=invocationText(directTick,9,false,0,true);
+        assert(fastTick.expression.find("tc_logic_tick")!=std::string::npos);
+        assert(fastTick.expression.find("tc_logic_invoke")==std::string::npos);
+
+        /* V3 emits one drive-plane prelude per public output plus the private
+           tick.  Their locals share a generated function scope, so every one
+           needs a distinct suffix; duplicate tc_zin/tc_is/tc_io names made the
+           game reject multi-output TC-Verilog as a circular dependency. */
+        emitted.v3=true;emitted.drives={"zid1","zid2","zid3"};
+        const auto v3Address=invocationText(emitted,9,false,0);
+        const auto v3Result=invocationText(emitted,9,false,1);
+        const auto v3Tick=invocationText(emitted,9,false,0,true);
+        assert(v3Address.prefix.find("tc_zin9o0")!=std::string::npos);
+        assert(v3Result.prefix.find("tc_is9o1")!=std::string::npos);
+        assert(v3Tick.prefix.find("tc_is9t")!=std::string::npos);
+        assert(v3Address.prefix.find("tc_zin9 =")==std::string::npos);
+
+        bindings.clear();bindingKeys.clear();
+        auto precise=std::make_shared<Definition>();
+        precise->useV2=true;precise->inputs=3;precise->outputs=2;
+        precise->inputWidths={1,1,1};precise->outputWidths={1,1};
+        placeInputs(precise->inputWidths,3,precise->inputWord,precise->inputShift);
+        precise->callbackV2=[](TCLogicIOV2* io) {
+            assert(io->phase==TC_LOGIC_REFRESH);
+            io->outputs[0]=io->inputs[0];
+            io->outputs[1]=io->inputs[1]^io->inputs[2];
+        };
+        auto binding=std::make_shared<Binding>();binding->definition=precise;
+        bindings.push_back(binding);
+        /* selector = (cycle + 1) * 32 + output */
+        assert(invokeOutput(1,(7+1)*32+0,0x1,0)==1);
+        assert(invokeOutput(1,(7+1)*32+1,0x6,0)==0);
+        assert(binding->calls==0&&binding->peeks==2);
+        bindings.clear();
+
+        /* Grouped V3 publication updates only outputs in the selected mask.
+           A later, interleaved group must not erase an earlier follower. */
+        auto grouped=std::make_shared<Definition>();
+        grouped->useV3=true;grouped->inputs=2;grouped->outputs=3;
+        grouped->inputWidths={1,1};grouped->outputWidths={1,1,1};
+        grouped->outputDependencies={0x1,0x2,0x1};grouped->groupedOutputs=true;
+        placeInputs(grouped->inputWidths,2,grouped->inputWord,grouped->inputShift);
+        grouped->callbackV3=[](TCLogicIOV3* io) {
+            const uint32_t selected=(io->reserved&~kOutputGroupSelector)-1;
+            if(selected==0) {io->outputs[0]={1,1};io->outputs[2]={1,1};}
+            else if(selected==1) io->outputs[1]={1,1};
+        };
+        auto groupedBinding=std::make_shared<Binding>();groupedBinding->definition=grouped;
+        bindings.push_back(groupedBinding);
+        assert(invokeOutput(1,(3+1)*32+0,0x1,0)==1);
+        assert(readOutput(1,2)==1);
+        assert(invokeOutput(1,(3+1)*32+1,0x2,0)==1);
+        assert(readOutput(1,2)==1);
+        bindings.clear();
+    }
+    // V3 stages the drive plane beside the value plane instead of silently
+    // treating the words above bit 127 as driven zeroes.
+    {
+        auto staged=std::make_shared<Definition>();
+        staged->useV3=true;staged->inputs=3;staged->outputs=1;
+        staged->inputWidths={64,64,64};staged->outputWidths[0]=1;
+        placeInputs(staged->inputWidths,staged->inputs,staged->inputWord,staged->inputShift);
+        staged->callbackV3=[](TCLogicIOV3* io) {
+            assert(io->inputs[0].value==0x11&&io->inputs[0].drive_mask==~uint64_t(0));
+            assert(io->inputs[1].value==0&&io->inputs[1].drive_mask==0);
+            assert(io->inputs[2].value==0x33&&io->inputs[2].drive_mask==~uint64_t(0));
+            io->outputs[0]={1,1};
+        };
+        auto stagedBinding=std::make_shared<Binding>();stagedBinding->definition=staged;
+        bindings.push_back(stagedBinding);
+        const uint64_t cycle=9;
+        assert(stageInput(1,(cycle+1)*32+0,0x11,0x22,false)==1);
+        assert(stageInput(1,(cycle+1)*32+1,0x33,0,false)==1);
+        assert(stageInput(1,(cycle+1)*32+0,~uint64_t(0),0,true)==1);
+        assert(stageInput(1,(cycle+1)*32+1,~uint64_t(0),0,true)==1);
+        assert(invokeStaged(1,cycle,2,TC_LOGIC_CYCLE)==1);
+        Emission::Instance emitted{};emitted.v3=true;emitted.inputs=3;emitted.outputs=1;
+        emitted.widths={64,64,64};emitted.operands={"vid1","vid2","vid3"};
+        emitted.drives={"1","0","1"};
+        const auto generated=invocationText(emitted,8,false);
+        assert(generated.prefix.find("tc_logic_stage")!=std::string::npos);
+        assert(generated.prefix.find("tc_logic_drive_stage")!=std::string::npos);
+        assert(generated.expression.find("tc_logic_invoke_staged")!=std::string::npos);
+        bindings.clear();
+    }
+    // V3 carries the game's resolved drive flag beside each value and emits
+    // outputs through a real Switch.  The callback sees Z rather than a pulled
+    // low, while a driven word retains all of its bits.
+    {
+        bindings.clear();bindingKeys.clear();
+        auto v3=std::make_shared<Definition>();
+        v3->api.user=nullptr;v3->useV3=true;v3->callbackV3=[](TCLogicIOV3* io) {
+            assert(io->version==TC_LOGIC_IO_V3_VERSION_1);
+            assert(io->input_count==2&&io->output_count==2);
+            assert(io->inputs[0].drive_mask==0&&io->inputs[0].value==0);
+            assert(io->inputs[1].drive_mask==0xff&&io->inputs[1].value==0xa5);
+            assert(io->outputs[0].drive_mask==0&&io->outputs[0].value==0);
+            if(io->state&&io->state_words)++io->state[0];
+            io->outputs[0]={1,0};       // value under Z is canonicalised away
+            io->outputs[1]={0xa5,0xff};
+        };
+        v3->inputs=2;v3->outputs=2;v3->inputWidths={1,8};v3->outputWidths={1,8};
+        v3->wideOutputs=true;
+        placeInputs(v3->inputWidths,2,v3->inputWord,v3->inputShift);
+        auto v3Binding=std::make_shared<Binding>();v3Binding->definition=v3;
+        v3Binding->state={5};v3Binding->refreshState={0};
+        bindings.push_back(v3Binding);
+        assert(latchInputDrive(1,0x1fe,0)==1);
+        assert(invoke(1,7,0x14b,0,TC_LOGIC_CYCLE)==0);
+        assert(readOutputDrive(1,0)==0&&readOutput(1,0)==0);
+        assert(readOutputDrive(1,1)==1&&v3Binding->outputs[1]==0xa5);
+        assert(v3Binding->state[0]==6);
+        assert(latchInputDrive(1,0x1fe,0)==1);
+        assert(invoke(1,7,0x14b,0,TC_LOGIC_REFRESH)==0);
+        assert(v3Binding->state[0]==6);  // REFRESH ran against the scratch copy
+
+        originalLine=output;
+        for(bool refresh:{false,true}) {
+            Emission e;e.instances[1].generated=true;e.instances[1].v3=true;
+            auto& i=e.instances[1];i.inputs=1;i.outputs=1;i.widths={1};i.outWidths={1};
+            i.preciseDependencies=true;i.outputDependencies={0x1};
+            i.operands.resize(1);i.drives.resize(1);
+            e.nodes[10]={1,0,false,true,false};e.nodes[15]={1,0,true,false,true};
+            emission=&e;lines.clear();
+            if(refresh) {
+                /* The real generator splits these across add_line calls. */
+                emit("var vid100 = U1 0");
+                emit("var and_field_id100 = ~vid100");
+            }
+            else
+                emit("let zid100 = vid100 >= and_field_id100");
+            emit("// 10");
+            emit(refresh?"let value_id10 = ~(load(<U1>, #SIMULATION_STATE + 100))":
+                         "var vid10 = U1 ~(U1 vid100)");
+            emit("// 15");
+            const std::string switchBody=(refresh?"store(#SIMULATION_STATE + 15, U1 0)\n":"")+
+                std::string("var vid15 = U1 0\nvar and_field_id15 = ~vid15\n")+
+                "if (U1 0) != 0 {\n    let value = U1 (U1 vid10)\n"+
+                "    vid15 |= value\n    and_field_id15 &= value\n}\n"+
+                "if vid15 > and_field_id15 { halt() }\nlet zid15 = vid15 >= and_field_id15";
+            emit(switchBody);
+            assert(e.rewritten==1&&!i.failed);
+            const std::string& generated=lines.back();
+            assert(generated.find("tc_logic_drive_in")!=std::string::npos);
+            assert(generated.find("tc_zin1o0")!=std::string::npos);
+            assert(generated.find("tc_io1o0")!=std::string::npos);
+            assert(generated.find("tc_logic_output")!=std::string::npos);
+            assert(generated.find("tc_logic_drive_out")!=std::string::npos);
+            assert(generated.find("let zid15")!=std::string::npos);
+            assert(generated.find(refresh?"#SIMULATION_STATE + 99":"zid100")!=std::string::npos);
+            emission=nullptr;
+        }
+        bindings.clear();
+    }
+    // Wide constants become direct runtime loads in both generated phases, allowing
     // a UI edit to change their value without compiling the whole board again.
     for(bool refresh:{false,true}) {
         Emission e;
@@ -484,8 +992,16 @@ int main() {
         emit(refresh?"let value_id316 = ( 10 & 0xffffffffffffffff)":
                      "var vid316 = U64 ( 10 & 0xffffffffffffffff)");
         assert(e.rewritten==1);
-        assert(lines.back().find("tc_dynamic_constant")!=std::string::npos);
-        assert(lines.back().find("4805296447517530978")!=std::string::npos);
+        assert(lines.back().find("tc_dynamic_constant")==std::string::npos);
+        const std::string loadPrefix="load(<U64>, Ptr ";
+        const auto loadAt=lines.back().find(loadPrefix);
+        assert(loadAt!=std::string::npos && "wide constants still cross the DLL on every cycle");
+        const auto address=std::stoull(lines.back().substr(loadAt+loadPrefix.size()));
+        auto* slot=reinterpret_cast<std::atomic<uint64_t>*>(static_cast<uintptr_t>(address));
+        setDynamicConstant(4805296447517530978ULL,42);
+        assert(slot->load(std::memory_order_relaxed)==42);
+        for(uint64_t id=10000;id<12000;++id)setDynamicConstant(id,id);
+        assert(slot->load(std::memory_order_relaxed)==42);
         emission=nullptr;
     }
     setDynamicConstant(7,11);
@@ -505,6 +1021,11 @@ int main() {
         lifecycle.on_clone = &lifecycleClone;
         lifecycle.on_load = &lifecycleLoad;
         lifecycle.on_save = &lifecycleSave;
+        lifecycle.on_move = &lifecycleMove;
+        lifecycle.on_rotate = &lifecycleRotate;
+        lifecycle.on_resize = &lifecycleResize;
+        lifecycle.on_compile = &lifecycleCompile;
+        lifecycle.on_unbind = &lifecycleUnbind;
 
         bindings.clear();
         bindingKeys.clear();
@@ -556,6 +1077,25 @@ int main() {
         assert(gClones == 0);   // an ordinary bind is not a duplication
         assert(gLifecycleConfigSeen == 0x11);   // default config is visible to on_create
         assert(first->state[0] == 0x5a5a && second->state[0] == 0x5a5a);   // on_create wrote state
+
+        /* Placement: the host hands the reading from the board record to the
+           registry, and only a *change* becomes a callback (the first reading
+           seeds the binding - being compiled is not a move). */
+        updateInstanceGeometry(shared->api.custom_id, first->instance, -5, 12, 0);
+        assert(gMoves == 0 && gRotations == 0);
+        updateInstanceGeometry(shared->api.custom_id, first->instance, -3, 12, 0);
+        assert(gMoves == 1 && gMoveCellX == -3 && gMoveCellY == 12);
+        updateInstanceGeometry(shared->api.custom_id, first->instance, -3, 12, 2);
+        assert(gRotations == 1 && gMoveRotation == 2 && gMoves == 1);
+        updateInstanceFootprint(shared->api.custom_id, first->instance, 3.f, 2.f);
+        assert(gResizes == 1 && gResizeHalfW == 3.f && gResizeHalfH == 2.f);
+        updateInstanceFootprint(shared->api.custom_id, first->instance, 3.f, 2.f);
+        assert(gResizes == 1);   /* an unchanged footprint is not a resize */
+        {
+            std::lock_guard<std::mutex> lock(first->mutex);
+            notifyCompile(*first);
+        }
+        assert(gCompiles == 1);
 
         TCComponentInstanceHandle handles[4]{};
         uint32_t written = 0, total = 0;
@@ -931,8 +1471,19 @@ int main() {
             }
             clearTailAccess();
         }
+        /* The other release path, checked last so every case above still has its
+           instances: the board itself went away, so the instances are not
+           deleted - that is TC_LOGIC_UNBIND, not TC_LOGIC_DESTROY. */
+        {
+            const int destroysBefore = gLifecycleDestroys;
+            const size_t live = liveInstanceCount();
+            releaseInstances(nullptr, "test: board left");
+            assert(live > 0 && gUnbinds == static_cast<int>(live));
+            assert(gLifecycleDestroys == destroysBefore);
+            assert(liveInstanceCount() == 0);
+        }
         bindings.clear();
         bindingKeys.clear();
     }
-    std::cout<<"PASS declarative API guards, 8x8 definition, invalid shapes, cross-word payloads, collector ordering, emission phases and runtime constants\n";
+    std::cout<<"PASS declarative API guards, 32-pin/2048-bit staged inputs, invalid shapes, cross-word payloads, collector ordering, emission phases and runtime constants\n";
 }

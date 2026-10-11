@@ -110,6 +110,13 @@ std::string target = "constant", keys = "2.5", row_kind = "value", level_name;
 uint64_t target_custom_id = 0, target_instance = 0;
 std::string report_path, bodies_path;
 std::vector<RowBox> rows;
+/* The loader's row window, from its own trace: the visible part of a row - not
+   its mathematical centre - is what a player can click when the window is
+   clamped onto the screen. */
+float panel_x = 0.f, panel_y = 0.f, panel_w = 0.f, panel_h = 0.f;
+bool panel_valid = false;
+float settled_x = -1.f, settled_y = -1.f;
+int settled_reads = 0;
 float scale_x = 1.f, scale_y = 1.f;
 int client_width = 0, client_height = 0;
 tc::TCGameModel game;
@@ -167,6 +174,87 @@ HWND findWindow() {
     return found;
 }
 
+/* ---- a picture of the panel ---------------------------------------------
+
+   "Re-enter the sandbox and the input boxes disappear" is a question about what
+   reached the framebuffer, and the row trace cannot answer it: the widgets are
+   submitted (and traced) even when another window is painted over them.  The
+   capture is the game's own technique - glReadPixels into a bottom-up 32-bit BMP
+   (tests/icon-probe.cpp does the same for the palette). */
+using GetIntegervFn = void (*)(unsigned, int*);
+using ReadPixelsFn = void (*)(int, int, int, int, unsigned, unsigned, void*);
+using PixelStoreFn = void (*)(unsigned, int);
+GetIntegervFn getIntegerv = nullptr;
+ReadPixelsFn readPixels = nullptr;
+PixelStoreFn pixelStore = nullptr;
+
+void loadGl() {
+    HMODULE module = LoadLibraryA("opengl32.dll");
+    if (!module) return;
+    void* address = reinterpret_cast<void*>(GetProcAddress(module, "glGetIntegerv"));
+    std::memcpy(&getIntegerv, &address, sizeof(getIntegerv));
+    address = reinterpret_cast<void*>(GetProcAddress(module, "glReadPixels"));
+    std::memcpy(&readPixels, &address, sizeof(readPixels));
+    address = reinterpret_cast<void*>(GetProcAddress(module, "glPixelStorei"));
+    std::memcpy(&pixelStore, &address, sizeof(pixelStore));
+}
+
+void writeLe32(unsigned char* out, unsigned value) {
+    out[0] = static_cast<unsigned char>(value & 0xff);
+    out[1] = static_cast<unsigned char>((value >> 8) & 0xff);
+    out[2] = static_cast<unsigned char>((value >> 16) & 0xff);
+    out[3] = static_cast<unsigned char>((value >> 24) & 0xff);
+}
+
+bool captureFrameTo(const char* path) {
+    if (!getIntegerv || !readPixels || !pixelStore || !path) return false;
+    int viewport[4] = {};
+    getIntegerv(0x0ba2 /* GL_VIEWPORT */, viewport);
+    const int width = viewport[2], height = viewport[3];
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return false;
+    std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4u);
+    pixelStore(0x0d05 /* GL_PACK_ALIGNMENT */, 1);
+    readPixels(viewport[0], viewport[1], width, height, 0x1908 /* GL_RGBA */,
+               0x1401 /* GL_UNSIGNED_BYTE */, pixels.data());
+    std::FILE* file = std::fopen(path, "wb");
+    if (!file) return false;
+    const unsigned pixelBytes = static_cast<unsigned>(width) * height * 4u;
+    unsigned char header[54] = {};
+    header[0] = 'B'; header[1] = 'M';
+    writeLe32(header + 2, 54u + pixelBytes);
+    writeLe32(header + 10, 54u);
+    writeLe32(header + 14, 40u);
+    writeLe32(header + 18, static_cast<unsigned>(width));
+    writeLe32(header + 22, static_cast<unsigned>(-height));
+    header[26] = 1; header[28] = 32;
+    writeLe32(header + 34, pixelBytes);
+    std::fwrite(header, 1, sizeof(header), file);
+    std::vector<unsigned char> row(static_cast<size_t>(width) * 4u);
+    for (int y = 0; y < height; ++y) {
+        const unsigned char* source =
+            pixels.data() + static_cast<size_t>(height - 1 - y) * width * 4u;
+        for (int x = 0; x < width; ++x) {
+            row[static_cast<size_t>(x) * 4 + 0] = source[static_cast<size_t>(x) * 4 + 2];
+            row[static_cast<size_t>(x) * 4 + 1] = source[static_cast<size_t>(x) * 4 + 1];
+            row[static_cast<size_t>(x) * 4 + 2] = source[static_cast<size_t>(x) * 4 + 0];
+            row[static_cast<size_t>(x) * 4 + 3] = 255;
+        }
+        std::fwrite(row.data(), 1, row.size(), file);
+    }
+    std::fclose(file);
+    return true;
+}
+
+void capturePanel(const char* label) {
+    if (!host || !host->data_directory_utf8) return;
+    if (!getIntegerv) loadGl();
+    char path[512] = {};
+    std::snprintf(path, sizeof(path), "%s\\panel.bmp", host->data_directory_utf8);
+    say(std::string("DRIVER: ") + (captureFrameTo(path) ? "captured the panel" :
+                                    "could not capture the panel") +
+        " (" + label + ") -> " + path);
+}
+
 /* The panel rows the Mod painted, read from the file it rewrites (the same recipe
    tests/float-panel-driver.cpp uses).  The header carries the instance and the
    frame the rows were written for, which is what tells a re-entered board's rows
@@ -184,53 +272,71 @@ bool readPanelFile(PanelFile* out) {
     std::FILE* file = std::fopen(report_path.c_str(), "rb");
     if (!file) return false;
     PanelFile parsed;
-    char line[256] = {};
+    char line[512] = {};
+    int seen = 0;
     while (std::fgets(line, sizeof(line), file)) {
-        unsigned long long value = 0;
-        int number = 0;
+        /* The rows are the loader's now (tc.component.editor), so they are read
+           from its own trace instead of a file this Mod used to write:
+
+             Component editor: row instance=0x… field="value" rect=x0,y0,x1,y1 …
+
+           `frame` becomes the number of row lines seen for the newest instance -
+           it grows whenever the host draws the rows again, which is what this
+           driver compares across a level re-entry. */
         float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
+        unsigned long long instance = 0;
         char kind[64] = {};
-        if (std::sscanf(line, "instance 0x%llx", &value) == 1) {
-            parsed.instance = value;
-            continue;
-        }
-        if (std::sscanf(line, "type 0x%llx", &value) == 1) {
-            parsed.type = value;
-            continue;
-        }
-        if (std::sscanf(line, "frame %d", &number) == 1) {
-            parsed.frame = number;
-            continue;
-        }
-        if (std::sscanf(line, "rows %d", &number) == 1) {
-            parsed.row_count = number;
-            continue;
-        }
-        if (std::sscanf(line, "field %63s %f %f %f %f", kind, &x0, &y0, &x1, &y1) == 5) {
-            for (RowBox& box : parsed.rows) {
-                if (box.kind != kind) continue;
-                box.field_min_x = x0;
-                box.field_min_y = y0;
-                box.field_max_x = x1;
-                box.field_max_y = y1;
-                box.field_valid = x1 > x0 && y1 > y0;
-                break;
+        {
+            float px = 0.f, py = 0.f, pw = 0.f, ph = 0.f;
+            if (std::sscanf(line,
+                            "Component editor: window instance=%*s pos=%f,%f size=%f,%f",
+                            &px, &py, &pw, &ph) == 4) {
+                panel_x = px;
+                panel_y = py;
+                panel_w = pw;
+                panel_h = ph;
+                panel_valid = pw > 0.f && ph > 0.f;
+                continue;
             }
+        }
+        if (std::sscanf(line,
+                        "Component editor: row instance=0x%llx field=\"%63[^\"]\" "
+                        "rect=%f,%f,%f,%f",
+                        &instance, kind, &x0, &y0, &x1, &y1) != 6)
             continue;
+        if (instance != parsed.instance) {
+            /* The drawer turned to another component: its list starts over, the
+               way a rewritten file would have. */
+            parsed.instance = instance;
+            parsed.rows.clear();
+            seen = 0;
         }
-        if (std::sscanf(line, "row %63s %f %f %f %f", kind, &x0, &y0, &x1, &y1) == 5) {
-            RowBox box;
-            box.kind = kind;
-            box.min_x = x0;
-            box.min_y = y0;
-            box.max_x = x1;
-            box.max_y = y1;
-            box.valid = x1 > x0 && y1 > y0;
-            parsed.rows.push_back(box);
+        ++seen;
+        RowBox box;
+        box.kind = kind;
+        box.min_x = x0;
+        box.min_y = y0;
+        box.max_x = x1;
+        box.max_y = y1;
+        box.valid = x1 > x0 && y1 > y0;
+        box.field_min_x = x0;
+        box.field_min_y = y0;
+        box.field_max_x = x1;
+        box.field_max_y = y1;
+        box.field_valid = box.valid;
+        bool replaced = false;
+        for (RowBox& existing : parsed.rows) {
+            if (existing.kind != box.kind) continue;
+            existing = box;
+            replaced = true;
+            break;
         }
+        if (!replaced) parsed.rows.push_back(box);
     }
     std::fclose(file);
-    if (parsed.frame < 0 || parsed.instance == 0) return false;
+    if (seen == 0 || parsed.instance == 0) return false;
+    parsed.frame = seen;
+    parsed.row_count = static_cast<int>(parsed.rows.size());
     *out = parsed;
     return true;
 }
@@ -601,12 +707,42 @@ void tick(void*, const TCFrame* frame) {
             return;
         }
         case 3: {
+            /* Re-read and wait for two reads that agree: the loader clamps its
+               row window onto the screen and only traces about once a second,
+               so the first batch after the drawer opens can still be the
+               unclamped rectangle (the same rule as
+               tests/float-panel-driver.cpp). */
+            {
+                PanelFile again;
+                if (readPanelFile(&again)) rows = again.rows;
+            }
             const RowBox* entry = row(row_kind.c_str());
             if (!entry) return;
-            const float x = entry->field_valid ? (entry->field_min_x + entry->field_max_x) * 0.5f
-                                               : (entry->min_x + entry->max_x) * 0.5f;
-            const float y = entry->field_valid ? (entry->field_min_y + entry->field_max_y) * 0.5f
-                                               : (entry->min_y + entry->max_y) * 0.5f;
+            float x = entry->field_valid ? (entry->field_min_x + entry->field_max_x) * 0.5f
+                                         : (entry->min_x + entry->max_x) * 0.5f;
+            float y = entry->field_valid ? (entry->field_min_y + entry->field_max_y) * 0.5f
+                                         : (entry->min_y + entry->max_y) * 0.5f;
+            if (panel_valid) {
+                const float low = panel_y + 2.f;
+                const float high = panel_y + panel_h - 2.f;
+                if (y < low) y = low;
+                if (y > high) y = high;
+                const float left = panel_x + 2.f;
+                const float right = panel_x + panel_w - 2.f;
+                if (x < left) x = left;
+                if (x > right) x = right;
+            }
+            if (x != settled_x || y != settled_y) {
+                settled_x = x;
+                settled_y = y;
+                settled_reads = 0;
+                stage_frame = frame->frame_number;
+                return;
+            }
+            if (++settled_reads < 2) {
+                stage_frame = frame->frame_number;
+                return;
+            }
             if (frame->frame_number - stage_frame < 40) {
                 moveTo(x, y);
                 return;
@@ -706,6 +842,11 @@ void tick(void*, const TCFrame* frame) {
             return;
         case 11:
             if (frame->frame_number - stage_frame < 60) return;
+            /* A picture of the panel the player is complaining about, because
+               "the input boxes disappear" is a *pixels* problem: the rows are
+               still submitted and traced when another window is drawn over them.
+               tests/float-reentry-playtest.ps1 keeps this beside the log. */
+            capturePanel("after re-entry with rows");
             say("DRIVER: done");
             finished = true;
             return;

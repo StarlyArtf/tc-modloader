@@ -68,7 +68,7 @@ Symbol profile: 23/23 aliases resolved
 Board snapshots: selection counters armed
 Board pins: prototype reads armed, 125 built-in kinds
 Simulation reads: armed, state buffer 10240000 bytes
-Board edits: component placement armed; wire placement stays out of the command bus (...)
+Board edits: component placement armed, component deletion armed; wire placement stays out of the command bus (...)
 ```
 
 ### 测试与文档
@@ -76,7 +76,8 @@ Board edits: component placement armed; wire placement stays out of the command 
 - 离线单测（`build.ps1` 内执行，7 个）：`game-model`、`game-handles`、`services`、`board-objects`、
   `board-pins`、`simulation`、`board-edits`。
 - 真机用例（游戏层）：`game-handle-probe`（Board V1–V6、命令、生命周期、事务、仿真、连接、编辑）、
-  `component-placement`（菜单放置 + V5 引脚 + 命令放置 + 两步事务 + undo/redo）；
+  `component-placement`（菜单放置 + V5 引脚 + 命令放置 + 两步事务 + undo/redo + 可撤销删除命令与
+  类型归属，后者用同一个沙盒里的第二个包 `local.editor-demo` 做对照）；
   `kind-list` 提供 `build/kinds.txt`，是引脚偏移的独立基准。
 - SDK 文档：`docs/sdk/services.md`（V1–V6 + simulation）、`commands.md`、`lifecycle.md`、
   `transactions.md`。研究日志：`docs/research/board-object-fields.md`（含尚未核实的线索）。

@@ -1,0 +1,10 @@
+{
+  "format": 2,
+  "id": "dev.speed-probe",
+  "name": "仿真测速探针",
+  "version": "0.1.0",
+  "author": "TC Mod Loader",
+  "description": "每秒把当前关卡的仿真速度（cycles/sec）与 cycle 数写进 loader.log。用来比较不同棋盘 / 不同元件的仿真主频；不注册任何元件，不碰存档。",
+  "capabilities": ["log", "symbol"],
+  "native": {"api": 1, "entry": "native/speed-probe.dll"}
+}

@@ -52,6 +52,28 @@ V2 的 `TCLogicIOV2` 还在结构尾部追加了只读的 `config/config_size/co
 持有，RESET 不清除；回调只能在本次调用期间读取，并须先用 `size` 判断这些尾字段是否存在。
 配置的声明与更新见 [services.md](services.md#tccomponentstorage配置与仿真状态快照)。
 
+### TCLogicIOV3：三态值模型
+
+`TCLogicIOV3` 把每个引脚从一个 `uint64_t` 改为 `TCLogicValueV3 { value,
+drive_mask }`。同一位上 `drive_mask=1` 时由 `value` 区分 0/1，`drive_mask=0`
+时为游戏的高阻态 Z；引脚宽度之外的位与 Z 位的 `value` 都规范化为 0。游戏里的 0/1
+冲突是短路错误 E，不作为第四种值送进回调。
+
+宿主在每次 V3 回调前把输出数组清成 Z；回调须在 CYCLE 与 REFRESH 都写 `value` 和
+`drive_mask`，返回后宿主再按引脚宽度掩码并清掉 Z 位的 `value`。RESET 与状态提交规则不变。
+
+通过 `tc.component.types` API V2 的 `register_definition_v3` 注册
+`TCComponentTypeDefinitionV3` 后，宿主会调用 `TCLogicCallbackV3`。≤128 位的数值仍走原有两个
+64 位 payload；更宽的数值与驱动平面都在 invoke 前按 128 位分块暂存。输出脚的生成骨架不是把 Z 当成 0，而是
+真的使用游戏原版 bit/word Switch：`drive_mask=0` 时不加入网络驱动，非 Z 时继续走原版的
+OR/AND 合并和 0/1 冲突短路检测。
+
+当前游戏的 word Switch 只有一个整字使能位，因此注册式 V3 的字宽引脚目前是**整脚三态**：
+输入 `drive_mask` 只会是 0 或该脚全宽掩码；输出也必须返回这两者之一。部分位驱动会保守地
+把整脚发成 Z 并记一条诊断。字段仍保留逐位 mask，便于 Verilog 前端表达并允许未来在不换
+回调 ABI 的情况下扩展。V3 的阶段、状态、配置与位置字段沿用 V2 语义，但 V2/V3 引脚元素
+类型不同，禁止互相强制转换。
+
 | phase | 调用时机 | `outputs[]` | `state[8]` |
 |---|---|---|---|
 | `TC_LOGIC_CYCLE` | 每个仿真周期 | 写回该元件输出脚 | 写回 |
@@ -71,10 +93,10 @@ V2 的 `TCLogicIOV2` 还在结构尾部追加了只读的 `config/config_size/co
 
 | 项目 | 规则 |
 |---|---|
-| 引脚数 | `TCNativeComponent`（V1）每方向最多 8 个；`tc.component.types`（V2，见 [services.md](services.md#tccomponenttypes注册一个-v2-元件定义)）到 16 个。**一个方向可以为 0**（纯源无输入、纯汇无输出，两个方向不能同时为 0）。0 输入时依赖链不存在，0 输出时最后一个逻辑节点是"输出悬空"的驱动门，回调就在它上面跑——实测见 [research/custom-component-pins.md](../research/custom-component-pins.md) |
+| 引脚数 | `TCNativeComponent`（V1）每方向最多 8 个；`tc.component.types`（V2/V3，见 [services.md](services.md#tccomponenttypes注册一个-v2-元件定义)）到 32 个。**一个方向可以为 0**（纯源无输入、纯汇无输出，两个方向不能同时为 0）。0 输入时依赖链不存在，0 输出时最后一个逻辑节点是"输出悬空"的驱动门，回调就在它上面跑——实测见 [research/custom-component-pins.md](../research/custom-component-pins.md) |
 | 位宽 | 每个引脚 1–64 位 |
-| 总输入宽度 | ≤128 位（打包成两个 payload 字）。**这是硬约束**：生成代码里的外调只能可靠地传 4 个参数，扩到 6 个时第 5、6 个参数收到的是垃圾（2026-09-22 实测，见 [research/custom-component-pins.md](../research/custom-component-pins.md)） |
-| 内部门 | 每个输出脚对应一个可识别的逻辑节点（`0x03`–`0x0b`、`0x12`–`0x1e`、`0x2a`）；生成式脚手架（`register_component`）的节点数必须是 `(输入数 ? 2×输入数−1 : 0) + 输出数 + (输出数为 0 ? 1 : 0)` |
+| 总输入宽度 | V1 ≤512 位；V2/V3 ≤2048 位。≤128 位直接打包；更宽时按 128 位分块暂存。单次外调仍保持实测可靠的 4 参数形状 |
+| 内部门 | 每个输出脚对应一个可识别的逻辑节点（V3 另含 `0x0c` bit Switch；`0x03`–`0x0c`、`0x12`–`0x1e`、`0x2a`）；生成式脚手架的节点数必须是 `(输入数 ? 2×输入数−1 : 0) + 输出数 + (输出数为 0 ? 1 : 0)` |
 | 回调输入元组 | 第一个输出门的操作数列表，顺序即回调 `inputs[]` 顺序，必须与定义输入脚数一致 |
 | 输出顺序 | 元件的输出脚顺序 |
 
@@ -91,9 +113,9 @@ Native logic: registered custom 0x44424c385f303031 inputs=1 outputs=1 in0=(-2,0,
 
 | 约束 | 结论 |
 |---|---|
-| 生成代码的外调最多 4 个参数（更多会触发游戏 JIT 的 `register_frame.nim(119,3) ... == EXP_NULL` 断言） | 输入按引脚位宽打包进两个 payload 字：`invoke(token, cycle, lo, hi)` |
+| 生成代码的外调最多 4 个参数（更多会触发游戏 JIT 的 `register_frame.nim(119,3) ... == EXP_NULL` 断言） | ≤128 位走 `invoke(token, cycle, lo, hi)`；更宽输入先重复 `stage(token, selector, lo, hi)`，完整、周期匹配的分块到齐后再 invoke |
 | 外调返回值只有**按 1 位消费**才可靠（按 U8/U64 消费时关卡读到空值） | 字宽输出来自预留状态槽，生成代码按位 `load(<U1>, #SIMULATION_STATE + n)` 组字，形式与游戏 `com_maker_bit_8` 一致 |
-| 状态槽需要固定位置 | 字宽输出占用状态缓冲区 `0x9a0000` 起、每实例 512 字节、最多 32 个实例；超大型板子理论上可能冲突 |
+| 状态槽需要固定位置 | 字宽输出占用状态缓冲区 `0x9a0000` 起、每实例 2048 字节（32×64 位）、最多 32 个实例；全部槽位在本构建状态缓冲区边界内 |
 
 ## 写元件定义（自建夹具同样适用）
 

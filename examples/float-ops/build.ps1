@@ -58,6 +58,15 @@ try {
     & $taskDecimalTest
     if ($LASTEXITCODE) { throw 'Float Ops text-layer test failed' }
 
+    # The width cut's own text case: every binary16 pattern, a binary64 sample and
+    # the named spellings of all three formats (tests/float-text.cpp).
+    $taskWidthTest = Join-Path $taskBuild 'float-text-test.exe'
+    & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
+      (Join-Path $taskRoot 'tests\float-text.cpp') $taskObjects -o $taskWidthTest
+    if ($LASTEXITCODE) { throw 'Float Ops width text test did not compile' }
+    & $taskWidthTest
+    if ($LASTEXITCODE) { throw 'Float Ops width text test failed' }
+
     $taskTest = Join-Path $taskBuild 'float-compat-test.exe'
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
       (Join-Path $taskRoot 'tests\float-compat.cpp') $taskObjects -o $taskTest
@@ -102,8 +111,10 @@ try {
   & $taskIconTool $taskIcons | Out-Host
   if ($LASTEXITCODE) { throw 'Float Ops icon generation failed' }
   $taskIconCount = @(Get-ChildItem -LiteralPath $taskIcons -Filter '*.png').Count
-  if ($taskIconCount -ne 22) {
-    throw "Expected the 22 catalogue pictures, the generator wrote $taskIconCount"
+  # Every registered type gets a picture: 22 families, minus the FP64 FMA, times
+  # the three widths (plan 6.4.1).
+  if ($taskIconCount -ne 65) {
+    throw "Expected the 65 component pictures, the generator wrote $taskIconCount"
   }
 
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mod.json') -Destination $taskStage

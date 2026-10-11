@@ -31,7 +31,7 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* host, TCPlugin*) {
 ## 契约
 
 - `inputs` / `outputs` 的数组顺序就是回调的 `inputs[]` / `outputs[]` 顺序。
-- 每方向 0–8 脚（两个方向不能同时为 0：纯源无输入、纯汇无输出都可以，见 [research/custom-component-pins.md](../research/custom-component-pins.md)），每脚 1–64 位，总输入 ≤128 位；门数和延迟为非负且不超过 `INT64_MAX`。
+- 每方向 0–8 脚（两个方向不能同时为 0：纯源无输入、纯汇无输出都可以，见 [research/custom-component-pins.md](../research/custom-component-pins.md)），每脚 1–64 位，总输入 ≤512 位；门数和延迟为非负且不超过 `INT64_MAX`。需要 9–32 脚时使用 `tc.component.types` V2/V3，其总输入上限为 2048 位。
 - 名称和引脚名为 UTF-8；`shapeSvg` 可选。不提供时使用游戏默认形状。
 - 引脚名指针只需在 `registerWith` 调用期间有效；回调及 `user` 在插件运行期间有效。
 - 仅在 `tc_mod_load` 期间调用。无需先加载 `TCMod` 或传入虚构的目录。
@@ -72,7 +72,7 @@ C ABI 是 `TCHost` 尾部新增的 `register_component`，参数为
 接到后五个输入，并让关卡判定读取最后两个输出，验证采集顺序和末端输出驱动。
 两者都验证界面刷新与 40 周期关卡无失配，不表示完整通关。
 `-Single` 用例验证单输入／单输出字节元件，通过 `double_number` 的全部 16 周期。
-单元测试另覆盖参数拒绝、旧宿主、跨 64 位边界的 128 位输入打包。
+单元测试另覆盖参数拒绝、旧宿主、跨 64 位边界的直接打包，以及 2048 位分块输入。
 16/32/64 位游戏关卡、有状态元件及字宽输出 32 token 限制仍按
 [验证范围](../verification.md) 与 [限制](../reference/limits.md) 执行。
 

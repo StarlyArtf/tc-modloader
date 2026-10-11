@@ -94,6 +94,7 @@ void (*g_getMousePos)(MousePoint*) = nullptr;
 tc::TCBoardModel g_board;                  /* the game's own selected-component set */
 TCBoardApiV4 g_boardApi{};                 /* instance id -> Board sequence index */
 tc::component_instances::Api g_instancesApi{};
+tc::component_instances::ApiV2 g_instancesV2{};
 tc::component_storage::Api g_storageApi{};
 TCIoValueApiV1 ioValue{};                  /* the game's own value parser/formatter */
 using RefreshSimulationFn = void (*)(void*);
@@ -449,14 +450,19 @@ void drawTapeBit(const TCComponentRenderFrameV1& frame, uint32_t color,
 
    It is read from the *game's* asset at load time rather than shipped in the
    package, so the face follows the game's art instead of carrying a copy of it.
-   The loader's own texture loader only reads paths inside the package
-   (src/native.hpp: it insists on "native/"), so the file is opened from the game
-   root, decoded with WIC - the same decoder the loader uses - and uploaded
-   through host->create_ui_texture.
 
-   Anything missing on the way (an older loader without the texture API, a build
-   whose asset moved, a machine where WIC refuses) leaves g_bitSpriteReady false
-   and the hand-drawn drop above is used instead: the readout never disappears. */
+   Anything missing on the way (an older loader without tc.component.render V7,
+   a build whose asset moved, a file the decoder refuses) leaves g_bitSpriteReady
+   false and the hand-drawn drop above is used instead: the readout never
+   disappears.
+
+   Both halves come from the loader: V7 loads the sheet (it reads the file,
+   decodes it with the same WIC path it uses for plugin textures, owns the GL
+   object and frees it with this plugin) and the draw table's V3 image primitive
+   paints the quad, whose four corners follow the component's own rotation.
+   Before that cut this file carried its own WIC decoder, its own COM apartment,
+   a host texture handle and three engine entry points; none of that is needed
+   any more. */
 constexpr float kSpritePitchPx = 100.f;
 constexpr int kSpriteColumnLow = 0;
 constexpr int kSpriteColumnHigh = 1;
@@ -468,77 +474,15 @@ constexpr int spriteColumn(uint8_t level) {
     return (level & 1u) ? kSpriteColumnHigh : kSpriteColumnLow;
 }
 
-struct SpriteVec2 { float x, y; };
-using AddImageQuadFn = void (*)(void*, uint64_t, SpriteVec2, SpriteVec2,
-                                SpriteVec2, SpriteVec2, SpriteVec2, SpriteVec2,
-                                SpriteVec2, SpriteVec2, uint32_t);
-
-TCUiTexture g_bitSprite{};
+TCComponentRenderImageV1 g_bitSprite{};
 bool g_bitSpriteReady = false;
-AddImageQuadFn g_addImageQuad = nullptr;
-void* (*g_backgroundList)(void*) = nullptr;
-void* (*g_mainViewport)() = nullptr;
+/* Where the last drawn value mark landed, in client pixels: the driver build
+   reads that pixel back to prove the image really reached the screen. */
+std::mutex g_markMutex;
+float g_markCentreX = -1.f, g_markCentreY = -1.f;
 
-template <class T>
-struct SpriteCom {
-    T* p = nullptr;
-    ~SpriteCom() { if (p) p->Release(); }
-    T** out() { return &p; }
-    T* operator->() const { return p; }
-};
-
-/* Decode a PNG's bytes to straight-alpha RGBA, exactly the way the loader
-   decodes the images it loads for plugins (src/ui_texture.hpp). */
-bool decodeSprite(const std::vector<unsigned char>& bytes,
-                  std::vector<unsigned char>* rgba, uint32_t* width,
-                  uint32_t* height) {
-    if (bytes.empty() || bytes.size() > 64u * 1024u * 1024u) return false;
-    const HRESULT initialised = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(initialised) && initialised != RPC_E_CHANGED_MODE) return false;
-    struct Apartment {
-        bool owned;
-        ~Apartment() { if (owned) CoUninitialize(); }
-    } apartment{SUCCEEDED(initialised)};
-
-    SpriteCom<IWICImagingFactory> factory;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
-                                reinterpret_cast<void**>(factory.out()))))
-        return false;
-    SpriteCom<IWICStream> stream;
-    SpriteCom<IWICBitmapDecoder> decoder;
-    SpriteCom<IWICBitmapFrameDecode> frame;
-    SpriteCom<IWICFormatConverter> converter;
-    if (FAILED(factory->CreateStream(stream.out())) ||
-        FAILED(stream->InitializeFromMemory(
-            const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()))) ||
-        FAILED(factory->CreateDecoderFromStream(stream.p, nullptr,
-                                                WICDecodeMetadataCacheOnDemand,
-                                                decoder.out())) ||
-        FAILED(decoder->GetFrame(0, frame.out())))
-        return false;
-    UINT w = 0, h = 0;
-    if (FAILED(frame->GetSize(&w, &h)) || !w || !h || w > 4096 || h > 4096)
-        return false;
-    if (FAILED(factory->CreateFormatConverter(converter.out())) ||
-        FAILED(converter->Initialize(frame.p, GUID_WICPixelFormat32bppRGBA,
-                                     WICBitmapDitherTypeNone, nullptr, 0.0,
-                                     WICBitmapPaletteTypeCustom)))
-        return false;
-    std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4u);
-    if (FAILED(converter->CopyPixels(nullptr, w * 4u,
-                                     static_cast<UINT>(pixels.size()),
-                                     pixels.data())))
-        return false;
-    *rgba = std::move(pixels);
-    *width = w;
-    *height = h;
-    return true;
-}
-
-/* The game root, from this plugin's own data directory (the loader hands out
-   <gameRoot>/tc-modloader-data/plugin-data/<mod id>; the same three levels the
-   interactive map is read from). */
+/* The game root is three levels above this Mod's own data directory
+   (<gameRoot>/tc-modloader-data/plugin-data/<mod id>). */
 bool gamePath(const char* relative, std::string* out) {
     if (!host || !host->data_directory_utf8) return false;
     std::string path = host->data_directory_utf8;
@@ -548,70 +492,32 @@ bool gamePath(const char* relative, std::string* out) {
     return true;
 }
 
-void loadBitSprite(const TCHost* h) {
-    if (g_bitSpriteReady) return;
-    if (!h->engine_proc) return;
-    if (h->size < offsetof(TCHost, release_ui_texture) + sizeof(h->release_ui_texture) ||
-        !h->create_ui_texture) {
-        note("clock: this loader has no texture API; the value mark stays hand-drawn");
-        return;
+bool loadBitSprite(const TCHost* h) {
+    if (g_bitSpriteReady) return true;
+    tc::component_render::ApiV7 render{};
+    if (!tc::component_render::tableV7(h, &render)) {
+        note("clock: this loader has no tc.component.render V7; the value mark stays hand-drawn");
+        return false;
     }
-    void* image = h->engine_proc(h->context, "ImDrawList_AddImageQuad");
-    void* background = h->engine_proc(h->context, "igGetBackgroundDrawList");
-    void* viewport = h->engine_proc(h->context, "igGetMainViewport");
-    if (!image || !background || !viewport) {
-        note("clock: the renderer has no image entry points; the value mark stays hand-drawn");
-        return;
-    }
-
     std::string path;
-    if (!gamePath("asset/io_state/io_state.png", &path)) return;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        note("clock: asset/io_state/io_state.png not found; the value mark stays hand-drawn");
-        return;
+    if (!gamePath("asset/io_state/io_state.png", &path)) return false;
+    TCComponentRenderImageV1 image{};
+    const int status = tc::component_render::loadImage(render, "bit-sprite", path.c_str(), &image);
+    if (status != TC_COMPONENT_RENDER_OK || !image.image) {
+        note(std::string("clock: the game's bit sprite could not be loaded (") +
+             tc::component_render::errorText(status) + "); the value mark stays hand-drawn");
+        return false;
     }
-    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(input)),
-                                     std::istreambuf_iterator<char>());
-    input.close();
-
-    std::vector<unsigned char> rgba;
-    uint32_t width = 0, height = 0;
-    if (!decodeSprite(bytes, &rgba, &width, &height)) {
-        note("clock: the game's bit sprite could not be decoded; the value mark stays hand-drawn");
-        return;
-    }
-    TCUiTexturePixels pixels{};
-    pixels.size = sizeof(pixels);
-    pixels.width = width;
-    pixels.height = height;
-    pixels.filter = 0;                     /* linear */
-    pixels.rgba = rgba.data();
-    pixels.byte_count = rgba.size();
-    TCUiTexture created{};
-    created.size = sizeof(created);
-    if (h->create_ui_texture(h->context, &pixels, &created) != 0) {
-        note("clock: the game's bit sprite could not be uploaded; the value mark stays hand-drawn");
-        return;
-    }
-    g_bitSprite = created;
-    std::memcpy(&g_addImageQuad, &image, sizeof(g_addImageQuad));
-    std::memcpy(&g_backgroundList, &background, sizeof(g_backgroundList));
-    std::memcpy(&g_mainViewport, &viewport, sizeof(g_mainViewport));
+    g_bitSprite = image;
     g_bitSpriteReady = true;
-    char detail[160] = {};
-    snprintf(detail, sizeof(detail),
-             "clock: the game's own bit sprite is loaded (%ux%u) for the value mark",
-             width, height);
-    note(detail);
+    note("clock: the game's own bit sprite came from tc.component.render V7 (" +
+         std::to_string(image.width) + "x" + std::to_string(image.height) + ", revision " +
+         std::to_string(image.revision) + ")");
+    return true;
 }
 
-/* One cell of that sheet, drawn as a quad whose four corners follow the
-   component's own rotation (an axis-aligned image would stand upright inside a
-   rotated face). */
 void drawSpriteMark(const TCComponentRenderFrameV1& frame, uint8_t level) {
-    if (!g_bitSpriteReady || !g_addImageQuad || !g_backgroundList || !g_mainViewport)
-        return;
+    if (!g_bitSpriteReady || !g_bitSprite.image) return;
     const int column = spriteColumn(level);
     const float u0 = (column * kSpritePitchPx) / static_cast<float>(g_bitSprite.width);
     const float u1 = ((column + 1) * kSpritePitchPx) / static_cast<float>(g_bitSprite.width);
@@ -619,23 +525,28 @@ void drawSpriteMark(const TCComponentRenderFrameV1& frame, uint8_t level) {
     const float v1 = ((kSpriteRow + 1) * kSpritePitchPx) /
                      static_cast<float>(g_bitSprite.height);
     const float half = kMarkSize * 0.5f;
-    float corners[4][2] = {};
     const float local[4][2] = {{kMarkX - half, -half},
                                {kMarkX + half, -half},
                                {kMarkX + half, half},
                                {kMarkX - half, half}};
-    for (int i = 0; i < 4; ++i)
-        tc::component_render::localToScreen(frame, local[i][0], local[i][1],
-                                            &corners[i][0], &corners[i][1]);
-    SpriteVec2 points[4] = {};
-    for (int i = 0; i < 4; ++i) points[i] = SpriteVec2{corners[i][0], corners[i][1]};
-    void* list = g_backgroundList(g_mainViewport());
-    if (!list) return;
-    g_addImageQuad(list, g_bitSprite.renderer_id,
-                   points[0], points[1], points[2], points[3],
-                   SpriteVec2{u0, v0}, SpriteVec2{u1, v0},
-                   SpriteVec2{u1, v1}, SpriteVec2{u0, v1},
-                   0xffffffffu);
+    TCComponentRenderQuadV1 quad{};
+    tc::component_render::localToScreen(frame, local[0][0], local[0][1], &quad.x0, &quad.y0);
+    tc::component_render::localToScreen(frame, local[1][0], local[1][1], &quad.x1, &quad.y1);
+    tc::component_render::localToScreen(frame, local[2][0], local[2][1], &quad.x2, &quad.y2);
+    tc::component_render::localToScreen(frame, local[3][0], local[3][1], &quad.x3, &quad.y3);
+    quad.u0 = u0; quad.v0 = v0;
+    quad.u1 = u1; quad.v1 = v0;
+    quad.u2 = u1; quad.v2 = v1;
+    quad.u3 = u0; quad.v3 = v1;
+    /* The cell's own pixels: a Mod that loaded this image keeps painting it
+       across reloads, and a replaced key shows the new pixels on the next frame
+       without the Mod touching the handle. */
+    tc::component_render::image(frame, g_bitSprite.image, quad, 0xffffffffu);
+    {
+        std::lock_guard<std::mutex> lock(g_markMutex);
+        g_markCentreX = (quad.x0 + quad.x2) * 0.5f;
+        g_markCentreY = (quad.y0 + quad.y2) * 0.5f;
+    }
 }
 
 /* The period readout: seven-segment digits drawn from the same vector strokes
@@ -908,12 +819,84 @@ std::map<uint64_t, uint64_t> g_selectionKeyOf; /* instance id -> selection-set k
 std::vector<TCGameHandle> g_componentHandles;
 uint64_t g_mapAge = 0;                     /* frames since the map was refreshed */
 
-/* The loader publishes "instance top-level" pairs next to the game on every
-   compile (interactive-map.txt); the Mod's own data directory sits inside
-   <gameRoot>/tc-modloader-data/plugin-data/<mod>, so the file is three levels
-   up.  Without it the selection set cannot be matched to our instances. */
-void refreshParentMap() {
+/* instance id -> the id the game's selection set addresses.  tc.component.
+   instances V2 answers this directly (the loader learns the pair in the same
+   compile walk that used to be the only way to see it); an older loader has no
+   such call, and then the loader's diagnostic file is still read - it sits
+   three levels above this Mod's own data directory, next to the game. */
+bool refreshParentMapFromService() {
+    if (!g_instancesV2.top_level_id) return false;
+    std::map<uint64_t, uint64_t> fresh;
+    std::vector<TCComponentInstanceHandle> handles;
+    /* One bounded diagnostic per type: a type that never answers is exactly the
+       thing a reader of the log needs to see, and the values only change when
+       the board does. */
+    static int lastStatus[3] = {INT_MAX, INT_MAX, INT_MAX};
+    static uint32_t lastWritten[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    const uint64_t ids[3] = {kSwitchId, kButtonId, kClockId};
+    for (size_t slot = 0; slot < 3; ++slot) {
+        const uint64_t customId = ids[slot];
+        uint32_t written = 0, total = 0;
+        handles.assign(16, TCComponentInstanceHandle{});
+        int status = tc::component_instances::enumerate(
+            g_instancesApi, customId, handles.data(),
+            static_cast<uint32_t>(handles.size()), &written, &total);
+        if (status == TC_COMPONENT_INSTANCES_ERR_RANGE && total > handles.size()) {
+            handles.resize(total);
+            status = tc::component_instances::enumerate(
+                g_instancesApi, customId, handles.data(),
+                static_cast<uint32_t>(handles.size()), &written, &total);
+        }
+        if (lastStatus[slot] != status || lastWritten[slot] != written) {
+            lastStatus[slot] = status;
+            lastWritten[slot] = written;
+            char detail[160] = {};
+            snprintf(detail, sizeof(detail),
+                     "interactive: enumerate(0x%llx) status=%d written=%u total=%u",
+                     static_cast<unsigned long long>(customId), status,
+                     static_cast<unsigned>(written), static_cast<unsigned>(total));
+            note(detail);
+        }
+        if (status != TC_COMPONENT_INSTANCES_OK) continue;
+        for (uint32_t index = 0; index < written; ++index) {
+            uint64_t top = 0;
+            const int topStatus =
+                tc::component_instances::topLevelId(g_instancesV2, handles[index], &top);
+            if (topStatus == TC_COMPONENT_INSTANCES_OK) {
+                fresh[handles[index].instance_id] = top;
+            } else {
+                static int reportedStatus = INT_MAX;
+                if (reportedStatus != topStatus) {
+                    reportedStatus = topStatus;
+                    note("interactive: top_level_id failed for 0x" +
+                         std::to_string(handles[index].instance_id) + " with " +
+                         tc::component_instances::errorText(topStatus));
+                }
+            }
+        }
+    }
+    /* Authoritative: an empty answer means "none of ours is on the board", not
+       "the map is stale" - the service is asked, so it cannot be missing. */
+    g_parentOf.swap(fresh);
+    /* One line per distinct size, so a playtest can assert that the ids came
+       from the service and not from the diagnostic file. */
+    static uint64_t logged = ~uint64_t(0);
+    if (logged != fresh.size()) {
+        logged = fresh.size();
+        note("interactive: " + std::to_string(fresh.size()) +
+             " top level id(s) from tc.component.instances V2");
+    }
+    return true;
+}
+
+void refreshParentMapFromFile() {
     if (!host || !host->data_directory_utf8) return;
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        note("interactive: this loader has no tc.component.instances V2; "
+             "reading the interactive-map.txt diagnostic instead");
+    }
     std::string path = host->data_directory_utf8;
     path += "/../../../interactive-map.txt";
     std::ifstream in(path);
@@ -925,6 +908,20 @@ void refreshParentMap() {
             std::strtoull(parent.c_str(), nullptr, 16);
     }
     if (!fresh.empty()) g_parentOf.swap(fresh);
+}
+
+void refreshParentMap() {
+    if (refreshParentMapFromService()) return;
+    refreshParentMapFromFile();
+}
+
+/* When to ask again: the compile that binds the first instance lands between two
+   of the slow ticks, so an empty map retries quickly (a nested component would
+   otherwise stay unmatched for the next half second).  Once it has an entry, the
+   slow tick is enough - the mapping only changes when the board does. */
+bool parentMapDue() {
+    const uint64_t age = g_mapAge++;
+    return (age % 30u) == 0u || (g_parentOf.empty() && (age % 5u) == 0u);
 }
 
 uint64_t topLevelOf(uint64_t instance) {
@@ -1148,7 +1145,7 @@ void interactiveFrameExperimental(void* user, const TCFrame* frame) {
     (void)user;
     (void)frame;
     if (!g_board.valid()) return;
-    if ((g_mapAge++ % 30u) == 0u) refreshParentMap();
+    if (parentMapDue()) refreshParentMap();
     /* Object handles are frame-scoped, so enumerate in the same frame they are
        consumed.  Boards are small and this only retains the two interactive
        component types. */
@@ -1513,7 +1510,7 @@ void interactiveFrame(void* user, const TCFrame* frame) {
         if (g_editingClock) closeClockEditor("the board went away");
         return;
     }
-    if ((g_mapAge++ % 30u) == 0u) refreshParentMap();
+    if (parentMapDue()) refreshParentMap();
     refreshSelectionKeys();
 
     const bool haveMouse = g_mouseClicked != nullptr;
@@ -1697,7 +1694,13 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
        setting if either is missing). */
     g_board.load(h);
     (void)tc::boardService(h, &g_boardApi);
-    (void)tc::component_instances::table(h, &g_instancesApi);
+    /* V2 when the loader has it (it answers the selection/top-level pair for
+       our instances); the V1 table is the V1 half of the same service, so an
+       older loader still gets everything except that call. */
+    if (tc::component_instances::tableV2(h, &g_instancesV2))
+        g_instancesApi = tc::component_instances::v1(g_instancesV2);
+    else
+        (void)tc::component_instances::table(h, &g_instancesApi);
     (void)tc::component_storage::table(h, &g_storageApi);
     /* Soft dependencies for the value window: the game's own ImGui (through
        tc_ui) and its own expression evaluator (tc.io_value).  Without either,

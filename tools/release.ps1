@@ -193,6 +193,16 @@ if (!$AllowDirty -and $taskGit) {
   if ($taskAfterBuild.Count) { throw 'Build changed the clean working tree; release refused.' }
 }
 
+# The installer is a release artifact too, and it is a *pair*: the loader it
+# embeds has to be the one this release ships, and its version block has to be
+# what VERSION says.  build.ps1 keeps them in step by construction; this reads
+# the pair back out of the PE file so a -UseExistingBuild run (or a dist/ whose
+# tc-loader.dll was replaced by hand) cannot publish the wrong one
+# (tools/ReleaseTools.psm1).
+$taskInstaller = Assert-TcInstallerMatchesRelease -Repo $taskRepo
+Write-Host ("Installer: embeds dist\tc-loader.dll (" + $taskInstaller.LoaderSha256.Substring(0, 8) +
+            "...), version " + $taskInstaller.Version)
+
 $taskWork = Join-Path $taskRepo ('build\release-work-' + [guid]::NewGuid().ToString('N'))
 $taskSourceStage = Join-Path $taskWork 'source'
 $taskPlayerStage = Join-Path $taskWork 'player'

@@ -18,6 +18,7 @@
    ended. */
 
 #include "../../sdk/tc_component_types.h"
+#include "../../sdk/tc_component_render.h"
 
 #include "components.hpp"
 #include "fp/fp32.hpp"
@@ -278,6 +279,11 @@ const ProbeDefinition kProbes[] = {
 };
 
 int registerProbes(const TCHost* host, const tc::component_types::Api& types) {
+    /* The probes are Mod-owned types too: no player-editable schematic exists
+       behind them, so the drawer's "edit in the foundry" button is dropped for
+       them exactly like the production types (V6 carries V4's call). */
+    tc::component_render::ApiV6 render{};
+    const bool hideFoundry = tc::component_render::tableV6(host, &render);
     for (const ProbeDefinition& probe : kProbes) {
         probe.telemetry->host = host;
         probe.telemetry->cycles.store(0, std::memory_order_relaxed);
@@ -315,6 +321,8 @@ int registerProbes(const TCHost* host, const tc::component_types::Api& types) {
             report(host, 2, message);
             return status;
         }
+        if (hideFoundry)
+            (void)tc::component_render::setFoundryButton(render, probe.customId, false);
     }
     return TC_COMPONENT_TYPES_OK;
 }
