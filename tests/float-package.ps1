@@ -52,8 +52,10 @@ if (@($taskEnabled.native.PSObject.Properties.Name) -notcontains 'local.float-op
 # again): the plugin hands the loader those very paths.
 $taskIcons = Join-Path $taskSandbox 'asset\float-ops-icons'
 $taskDeployed = @(Get-ChildItem -LiteralPath $taskIcons -Filter '*.png' -ErrorAction SilentlyContinue)
-if ($taskDeployed.Count -ne 22) {
-  throw "Expected the 22 component pictures to be deployed, found $($taskDeployed.Count)"
+# One picture per registered type: 22 families across FP16/FP32/FP64 minus the
+# FP64 Fused Multiply Add (three 64-bit inputs exceed the 128-bit input budget).
+if ($taskDeployed.Count -ne 65) {
+  throw "Expected the 65 component pictures to be deployed, found $($taskDeployed.Count)"
 }
 
 & $taskCli $taskSandbox disable-all | Out-Host

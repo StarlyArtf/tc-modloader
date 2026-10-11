@@ -20,6 +20,7 @@
    The release-candidate qualification with Berkeley TestFloat (plan 10.1) is a
    separate, heavier step; this test is the fast gate that runs on every build. */
 
+#include "../examples/float-ops/fp/format.hpp"
 #include "../examples/float-ops/fp/fp32.hpp"
 #include "data/float32/fp32-vectors.generated.hpp"
 
@@ -479,6 +480,269 @@ bool checkConversions(std::vector<std::string>& failures) {
     return failures.empty();
 }
 
+/* The width table (fp/format.hpp): the same twelve operations in binary16,
+   binary32 and binary64 behind one entry point.  Every expectation below is a
+   value the standard fixes - 1/3 and 0.1+0.2 in their own formats, the
+   saturated integer bounds of decision D2, the signed-zero rule of the 2019
+   minimumNumber/maximumNumber pair - so this file still never computes an
+   expected result itself.
+
+   The binary32 rows double as the agreement check: this table delegates
+   binary32 to fp32.cpp, and the two must answer with the same bits and the
+   same flags. */
+void checkWidthTable(std::vector<std::string>& failures) {
+    auto expectBits = [&failures](const std::string& name, uint64_t actual, uint64_t wanted) {
+        if (actual != wanted) {
+            char buffer[192];
+            std::snprintf(buffer, sizeof(buffer), "width table: %s gave 0x%llX, wanted 0x%llX",
+                          name.c_str(), static_cast<unsigned long long>(actual),
+                          static_cast<unsigned long long>(wanted));
+            failures.push_back(buffer);
+        }
+    };
+    auto expectFlags = [&failures](const std::string& name, uint8_t actual, uint8_t wanted) {
+        if (actual != wanted) {
+            char buffer[192];
+            std::snprintf(buffer, sizeof(buffer), "width table: %s flags 0x%02X, wanted 0x%02X",
+                          name.c_str(), actual, wanted);
+            failures.push_back(buffer);
+        }
+    };
+    auto expectBool = [&failures](const std::string& name, bool actual, bool wanted) {
+        if (actual != wanted)
+            failures.push_back("width table: " + name + (actual ? " held" : " did not hold"));
+    };
+
+    /* Only the three widths exist; anything else is refused rather than
+       quietly treated as binary32. */
+    for (uint32_t format : {0u, 8u, 24u, 128u})
+        expectBool(std::to_string(format) + " is not a format",
+                   tcfp::formatOps(format) == nullptr, true);
+    for (uint32_t format : {16u, 32u, 64u}) {
+        const tcfp::FormatOps* ops = tcfp::formatOps(format);
+        expectBool(std::to_string(format) + " has an implementation", ops != nullptr, true);
+        if (!ops) continue;
+        expectBits(std::to_string(format) + " reports its own width",
+                   ops->layout->width, format);
+    }
+    expectBits("the width box cycles 16->32", tcfp::nextFormat(16), 32);
+    expectBits("the width box cycles 32->64", tcfp::nextFormat(32), 64);
+    expectBits("the width box cycles 64->16", tcfp::nextFormat(64), 16);
+
+    /* ---- binary16 ---- */
+    const tcfp::FormatOps& f16 = *tcfp::formatOps(16);
+    tcfp::FormatResult result = f16.add(0x3C00, 0x3C00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 1+1", result.bits, 0x4000);
+    expectFlags("f16 1+1", result.flags, 0);
+    result = f16.subtract(0x3C00, 0x3C00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 1-1", result.bits, 0x0000);
+    expectFlags("f16 1-1", result.flags, 0);
+    result = f16.divide(0x3C00, 0x4200, tcfp::FPRounding::nearest_even);
+    expectBits("f16 1/3", result.bits, 0x3555);
+    expectFlags("f16 1/3", result.flags, tcfp::fp_flag_nx);
+    result = f16.square_root(0x4400, tcfp::FPRounding::nearest_even);
+    expectBits("f16 sqrt(4)", result.bits, 0x4000);
+    expectFlags("f16 sqrt(4)", result.flags, 0);
+    /* The largest finite binary16 doubled overflows to the default NaN's
+       neighbour, the infinity, and says so. */
+    result = f16.add(0x7BFF, 0x7BFF, tcfp::FPRounding::nearest_even);
+    expectBits("f16 65504+65504", result.bits, 0x7C00);
+    expectFlags("f16 65504+65504", result.flags, tcfp::fp_flag_of | tcfp::fp_flag_nx);
+    /* An exact subnormal result is not an underflow (tininess after rounding,
+       and the flag asks for an inexact result too). */
+    result = f16.multiply(0x0400, 0x3800, tcfp::FPRounding::nearest_even);
+    expectBits("f16 2^-14 * 0.5", result.bits, 0x0200);
+    expectFlags("f16 2^-14 * 0.5", result.flags, 0);
+    result = f16.fused_multiply_add(0x3C00, 0x4000, 0xC000, tcfp::FPRounding::nearest_even);
+    expectBits("f16 1*2 + -2", result.bits, 0x0000);
+    expectFlags("f16 1*2 + -2", result.flags, 0);
+    result = f16.round_to_integral_exact(0x3E00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 round(1.5) RNE", result.bits, 0x4000);
+    expectFlags("f16 round(1.5) RNE", result.flags, tcfp::fp_flag_nx);
+    result = f16.remainder(0x4500, 0x4000);
+    expectBits("f16 5 rem 2", result.bits, 0x3C00);
+    expectFlags("f16 5 rem 2", result.flags, 0);
+    /* Arithmetic never carries a NaN payload (plan 2.4). */
+    result = f16.add(0x7E01, 0x3C00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 qNaN + 1 is canonical", result.bits, 0x7E00);
+    expectFlags("f16 qNaN + 1 is canonical", result.flags, 0);
+
+    const tcfp::FormatRelation relation = f16.compare(0x8000, 0x0000);
+    expectBool("f16 -0 == +0", relation.eq, true);
+    expectBool("f16 -0 == +0 is ordered", relation.un, false);
+    const tcfp::FormatRelation unordered = f16.compare(0x7C01, 0x3C00);
+    expectBool("f16 sNaN is unordered", unordered.un, true);
+    expectFlags("f16 sNaN signals", unordered.flags, tcfp::fp_flag_nv);
+    expectBits("f16 classify -0", f16.classify(0x8000), tcfp::fp_class_negative_zero);
+    expectBits("f16 classify 65504", f16.classify(0x7BFF), tcfp::fp_class_positive_normal);
+    expectBits("f16 classify subnormal", f16.classify(0x0001),
+               tcfp::fp_class_positive_subnormal);
+    expectBits("f16 classify qNaN", f16.classify(0x7E00), tcfp::fp_class_quiet_nan);
+    expectBool("f16 is_nan(qNaN)", f16.is_nan(0x7E00), true);
+    expectBool("f16 is_signaling_nan(sNaN)", f16.is_signaling_nan(0x7C01), true);
+    expectBool("f16 is_signaling_nan(qNaN)", f16.is_signaling_nan(0x7E00), false);
+    expectBool("f16 is_infinite(+inf)", f16.is_infinite(0x7C00), true);
+    expectBool("f16 is_subnormal(min subnormal)", f16.is_subnormal(0x0001), true);
+    expectBool("f16 is_negative(-1)", f16.is_negative(0xBC00), true);
+    expectBits("f16 negate(1)", f16.negate(0x3C00), 0xBC00);
+    expectBits("f16 absolute(-1)", f16.absolute(0xBC00), 0x3C00);
+    expectBits("f16 copy_sign(1,-0)", f16.copy_sign(0x3C00, 0x8000), 0xBC00);
+    expectBits("f16 minimum(-0,+0)", f16.minimum_number(0x8000, 0x0000).bits, 0x8000);
+    expectBits("f16 maximum(-0,+0)", f16.maximum_number(0x8000, 0x0000).bits, 0x0000);
+    expectBits("f16 mask keeps 16 bits", f16.mask(UINT64_C(0x1234FFFF)), 0xFFFF);
+
+    /* The integer conversions, including the two directions of decision D2. */
+    result = f16.from_i32(-3, tcfp::FPRounding::nearest_even);
+    expectBits("f16 from -3", result.bits, 0xC200);
+    expectFlags("f16 from -3", result.flags, 0);
+    result = f16.from_u32(1000, tcfp::FPRounding::nearest_even);
+    expectBits("f16 from 1000", result.bits, 0x63D0);
+    expectFlags("f16 from 1000", result.flags, 0);
+    tcfp::FormatIntResult integer = f16.to_i32(0x4000, tcfp::FPRounding::nearest_even);
+    expectBits("f16 2 -> i32", integer.value, 2);
+    expectFlags("f16 2 -> i32", integer.flags, 0);
+    /* Every finite binary16 fits an int32, so only a NaN or an infinity can be
+       out of range here. */
+    integer = f16.to_i32(0x7BFF, tcfp::FPRounding::nearest_even);
+    expectBits("f16 65504 -> i32", integer.value, 65504);
+    expectFlags("f16 65504 -> i32", integer.flags, 0);
+    integer = f16.to_i32(0x7E00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 NaN -> i32", integer.value, UINT64_C(0x7FFFFFFF));
+    expectFlags("f16 NaN -> i32", integer.flags, tcfp::fp_flag_nv);
+    integer = f16.to_i32(0xFC00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 -inf -> i32", integer.value, UINT64_C(0x80000000));
+    expectFlags("f16 -inf -> i32", integer.flags, tcfp::fp_flag_nv);
+    integer = f16.to_u32(0xBC00, tcfp::FPRounding::nearest_even);
+    expectBits("f16 -1 -> u32", integer.value, 0);
+    expectFlags("f16 -1 -> u32", integer.flags, tcfp::fp_flag_nv);
+    integer = f16.to_u32(0x8000, tcfp::FPRounding::nearest_even);
+    expectBits("f16 -0 -> u32", integer.value, 0);
+    expectFlags("f16 -0 -> u32", integer.flags, 0);
+
+    /* ---- binary64 ---- */
+    const tcfp::FormatOps& f64 = *tcfp::formatOps(64);
+    result = f64.add(UINT64_C(0x3FF0000000000000), UINT64_C(0x3FF0000000000000),
+                     tcfp::FPRounding::nearest_even);
+    expectBits("f64 1+1", result.bits, UINT64_C(0x4000000000000000));
+    expectFlags("f64 1+1", result.flags, 0);
+    result = f64.add(UINT64_C(0x3FB999999999999A), UINT64_C(0x3FC999999999999A),
+                     tcfp::FPRounding::nearest_even);
+    expectBits("f64 0.1+0.2", result.bits, UINT64_C(0x3FD3333333333334));
+    expectFlags("f64 0.1+0.2", result.flags, tcfp::fp_flag_nx);
+    result = f64.divide(UINT64_C(0x3FF0000000000000), UINT64_C(0x4008000000000000),
+                        tcfp::FPRounding::nearest_even);
+    expectBits("f64 1/3", result.bits, UINT64_C(0x3FD5555555555555));
+    expectFlags("f64 1/3", result.flags, tcfp::fp_flag_nx);
+    result = f64.square_root(UINT64_C(0x4000000000000000), tcfp::FPRounding::nearest_even);
+    expectBits("f64 sqrt(2)", result.bits, UINT64_C(0x3FF6A09E667F3BCD));
+    expectFlags("f64 sqrt(2)", result.flags, tcfp::fp_flag_nx);
+    result = f64.multiply(UINT64_C(0x3FF0000000000000), UINT64_C(0x0000000000000001),
+                          tcfp::FPRounding::nearest_even);
+    expectBits("f64 1 * min subnormal", result.bits, UINT64_C(0x0000000000000001));
+    expectFlags("f64 1 * min subnormal", result.flags, 0);
+    expectBits("f64 classify -inf", f64.classify(UINT64_C(0xFFF0000000000000)),
+               tcfp::fp_class_negative_infinity);
+    expectBits("f64 classify max finite", f64.classify(UINT64_C(0x7FEFFFFFFFFFFFFF)),
+               tcfp::fp_class_positive_normal);
+    const tcfp::FormatRelation wide = f64.compare(UINT64_C(0x3FF0000000000000),
+                                                  UINT64_C(0x4000000000000000));
+    expectBool("f64 1 < 2", wide.lt, true);
+    expectBits("f64 negate(1)", f64.negate(UINT64_C(0x3FF0000000000000)),
+               UINT64_C(0xBFF0000000000000));
+    expectBits("f64 minimum(-0,+0)", f64.minimum_number(0, UINT64_C(0x8000000000000000)).bits,
+               UINT64_C(0x8000000000000000));
+    expectBits("f64 maximum(-0,+0)", f64.maximum_number(0, UINT64_C(0x8000000000000000)).bits, 0);
+
+    result = f64.from_i32(-1, tcfp::FPRounding::nearest_even);
+    expectBits("f64 from -1", result.bits, UINT64_C(0xBFF0000000000000));
+    expectFlags("f64 from -1", result.flags, 0);
+    result = f64.from_u32(0xFFFFFFFFu, tcfp::FPRounding::nearest_even);
+    expectBits("f64 from 4294967295", result.bits, UINT64_C(0x41EFFFFFFFE00000));
+    expectFlags("f64 from 4294967295", result.flags, 0);
+    /* Here the int32 range *is* reachable, so the saturating policy shows. */
+    integer = f64.to_i32(UINT64_C(0x41E0000000000000), tcfp::FPRounding::nearest_even);
+    expectBits("f64 2^31 -> i32", integer.value, UINT64_C(0x7FFFFFFF));
+    expectFlags("f64 2^31 -> i32", integer.flags, tcfp::fp_flag_nv);
+    integer = f64.to_i32(UINT64_C(0xC1E0000000000000), tcfp::FPRounding::nearest_even);
+    expectBits("f64 -2^31 -> i32", integer.value, UINT64_C(0x80000000));
+    expectFlags("f64 -2^31 -> i32", integer.flags, 0);
+    integer = f64.to_i32(UINT64_C(0xC1E0000000000001), tcfp::FPRounding::nearest_even);
+    expectBits("f64 below -2^31 -> i32", integer.value, UINT64_C(0x80000000));
+    expectFlags("f64 below -2^31 -> i32", integer.flags, tcfp::fp_flag_nv);
+    integer = f64.to_u32(UINT64_C(0x41EFFFFFFFE00000), tcfp::FPRounding::nearest_even);
+    expectBits("f64 4294967295 -> u32", integer.value, UINT64_C(0xFFFFFFFF));
+    expectFlags("f64 4294967295 -> u32", integer.flags, 0);
+    integer = f64.to_u32(UINT64_C(0x41F0000000000000), tcfp::FPRounding::nearest_even);
+    expectBits("f64 2^32 -> u32", integer.value, UINT64_C(0xFFFFFFFF));
+    expectFlags("f64 2^32 -> u32", integer.flags, tcfp::fp_flag_nv);
+
+    /* Split Bits and Make Bits are inverses in every width, which is what makes
+       one component definition able to serve all three. */
+    const uint64_t patterns16[] = {0x3C00, 0x3555, 0x8001, 0x7E00, 0xFC00};
+    for (uint64_t pattern : patterns16) {
+        const tcfp::FormatFields fields = f16.split(pattern);
+        expectBits("f16 make(split(x))", f16.make_bits(fields.sign, fields.exponent,
+                                                      fields.significand),
+                   pattern);
+    }
+    const uint64_t patterns64[] = {UINT64_C(0x3FF0000000000000), UINT64_C(0x8000000000000001),
+                                   UINT64_C(0x7FF8000000000000),
+                                   UINT64_C(0xFFF0000000000000)};
+    for (uint64_t pattern : patterns64) {
+        const tcfp::FormatFields fields = f64.split(pattern);
+        expectBits("f64 make(split(x))", f64.make_bits(fields.sign, fields.exponent,
+                                                      fields.significand),
+                   pattern);
+    }
+
+    /* ---- binary32 delegates, so the two must agree exactly ---- */
+    const tcfp::FormatOps& f32 = *tcfp::formatOps(32);
+    struct Agreement {
+        uint32_t a;
+        uint32_t b;
+        tcfp::FPRounding rounding;
+    };
+    const Agreement additions[] = {
+        {0x3F800000u, 0x3F800000u, tcfp::FPRounding::nearest_even},
+        {0x3F800000u, 0x33800000u, tcfp::FPRounding::nearest_even},
+        {0x7F7FFFFFu, 0x7F7FFFFFu, tcfp::FPRounding::nearest_even},
+        {0x3F800000u, 0xBF800000u, tcfp::FPRounding::toward_positive},
+        {0x7FC00001u, 0x3F800000u, tcfp::FPRounding::nearest_even},
+        {0x00000001u, 0x00000001u, tcfp::FPRounding::nearest_even},
+    };
+    for (const Agreement& item : additions) {
+        const FP32Result expected = tcfp::fp32_add(item.a, item.b, item.rounding);
+        const tcfp::FormatResult actual = f32.add(item.a, item.b, item.rounding);
+        expectBits("f32 agrees with fp32.cpp", actual.bits, expected.bits);
+        expectFlags("f32 agrees with fp32.cpp", actual.flags, expected.flags);
+    }
+    const uint32_t classifyPatterns[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x7F800000u,
+                                         0xFF800000u, 0x7FC00000u, 0x7F800001u, 0x3F800000u};
+    for (uint32_t pattern : classifyPatterns)
+        expectBits("f32 classify agrees with fp32.cpp", f32.classify(pattern),
+                   tcfp::fp32_classify(pattern));
+    const uint32_t comparePatterns[][2] = {
+        {0x3F800000u, 0x40000000u}, {0x80000000u, 0x00000000u}, {0x7FC00000u, 0x3F800000u},
+        {0xBF800000u, 0xBF7FFFFFu}, {0x7F800001u, 0x7FC00000u},
+    };
+    for (const auto& pair : comparePatterns) {
+        const FP32Relation expected = tcfp::fp32_compare(pair[0], pair[1]);
+        const tcfp::FormatRelation actual = f32.compare(pair[0], pair[1]);
+        expectBool("f32 compare agrees with fp32.cpp (lt)", actual.lt == expected.lt, true);
+        expectBool("f32 compare agrees with fp32.cpp (eq)", actual.eq == expected.eq, true);
+        expectBool("f32 compare agrees with fp32.cpp (gt)", actual.gt == expected.gt, true);
+        expectBool("f32 compare agrees with fp32.cpp (un)", actual.un == expected.un, true);
+        expectFlags("f32 compare agrees with fp32.cpp (flags)", actual.flags, expected.flags);
+    }
+    const int32_t integerPatterns[] = {0, 1, -1, 16777216, -2147483647 - 1, 2147483520};
+    for (int32_t value : integerPatterns) {
+        const tcfp::FormatResult actual = f32.from_i32(value, tcfp::FPRounding::nearest_even);
+        const FP32Result expected = tcfp::fp32_from_i32(value, tcfp::FPRounding::nearest_even);
+        expectBits("f32 from_i32 agrees with fp32.cpp", actual.bits, expected.bits);
+        expectFlags("f32 from_i32 agrees with fp32.cpp", actual.flags, expected.flags);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -493,6 +757,7 @@ int main() {
     checkFlagIsolation(failures);
     checkModeIsolation(failures);
     checkConversions(failures);
+    checkWidthTable(failures);
     const bool threadsOk = checkThreadIsolation(failures);
 
     if (!failures.empty()) {

@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -186,7 +187,19 @@ static bool stateOffsetFor(const std::string& componentId, uint64_t* offset) {
         cachedSize = newestSize;
     }
     const std::string& text = cachedText;
-    const size_t at = text.find(needle);
+    size_t at = text.find(needle);
+    if (at == std::string::npos) {
+        const std::string marker = "// runtime constant " + componentId;
+        for (size_t candidate = text.find(marker); candidate != std::string::npos;) {
+            const size_t end = candidate + marker.size();
+            if (end == text.size() || text[end] == '\n' || text[end] == '\r' ||
+                text[end] == ' ' || text[end] == '\t') {
+                at = candidate;
+                break;
+            }
+            candidate = text.find(marker, end);
+        }
+    }
     if (at == std::string::npos) return false;
     const size_t rawStart = text.rfind('\n', at);
     const size_t lineStart = rawStart == std::string::npos ? 0 : rawStart + 1;
@@ -593,6 +606,12 @@ static void frame(void*, const TCFrame*) {
             break;
         }
         case 2: {
+            // Runtime JIT checks do not depend on a visible drawer or mouse.
+            const char* runtimeOnly=std::getenv("TC_TEST_PUNCH_RUNTIME_ONLY");
+            if(runtimeOnly && runtimeOnly[0]=='1') {
+                say("runtime-only: checking setter and state without drawer wait");
+                stage=3;stageFrames=0;break;
+            }
             openDrawer(view, constantIndex);
             const std::string line = lastLineWith(readText(logPath), "punch tape: geometry drawer");
             if (parseGeometry(line, &geometry)) {
@@ -651,7 +670,8 @@ static void frame(void*, const TCFrame*) {
                 runUpdateSequence(view, constantIndex, constantId, mask);
                 runStateCheck(std::to_string(constantId), constantWidth,
                               mask & (0x5A5A5A5A5A5A5A5AULL >> 16));
-                runRealClicks(constantId, constantWidth);
+                const char* runtimeOnly=std::getenv("TC_TEST_PUNCH_RUNTIME_ONLY");
+                if(!(runtimeOnly && runtimeOnly[0]=='1'))runRealClicks(constantId, constantWidth);
             }
             break;
         }

@@ -1,7 +1,11 @@
 #pragma once
 #include "../sdk/tc_mod_api.h"
 #include "../sdk/tc_game_model.h"
+#include "component_container.hpp"
 #include "component_registry.hpp"
+#include "keyboard_fix.hpp"
+#include "simulation_jit.hpp"
+#include "rv32_intrinsic.hpp"
 #include "scope_capture.hpp"
 #include "../vendor/minhook/include/MinHook.h"   /* hooking the code generator */
 #include <array>
@@ -25,17 +29,25 @@
 #include "component_tail.hpp"
 
 namespace tc::logic {
-// The generated invoke call keeps the verified four-argument shape
-// (token, cycle, payload lo, payload hi), so up to 128 input bits fit.
+// Every foreign call keeps the verified four-argument shape.  Inputs wider than
+// the invoke call's two payload words are staged in 128-bit chunks first.
 /* A V2 definition (tc.component.types) may declare more pins than the V1
    callback struct can carry; the bridge's own arrays are sized for the larger
    shape, and `supportedScaffold` keeps V1 definitions at eight. */
-inline constexpr uint32_t kMaxBridgePins=16;
+inline constexpr uint32_t kMaxBridgePins=32;
 inline constexpr uint32_t kMaxBridgeInputs=kMaxBridgePins;
 inline constexpr uint32_t kMaxBridgeOutputs=kMaxBridgePins;
 inline constexpr uint32_t kMaxPinBits=64;
-inline constexpr uint32_t kMaxInputBits=128;
+inline constexpr uint32_t kMaxInputBits=2048;
+inline constexpr uint32_t kInputWordBits=64;
+inline constexpr uint32_t kInputWordsPerCall=2;
+inline constexpr uint32_t kMaxInputWords=kMaxInputBits/kInputWordBits;
+inline constexpr uint32_t kMaxInputChunks=kMaxInputWords/kInputWordsPerCall;
 inline constexpr uint32_t kMaxConfigBytes=64u*1024u;
+/* Private TC-Verilog selector: run the CYCLE/edge logic but do not evaluate a
+   visible output cone afterwards. */
+inline constexpr uint32_t kTickOnlySelector=~uint32_t(0);
+inline constexpr uint32_t kOutputGroupSelector=uint32_t(1)<<31;
 struct Definition {
     TCLogicDefinition api;
     uint32_t inputs=0,outputs=0;
@@ -45,12 +57,24 @@ struct Definition {
     std::array<uint32_t,kMaxBridgeInputs> inputWord{};
     std::array<uint32_t,kMaxBridgeInputs> inputShift{};
     uint32_t inputBits=0;
+    /* Empty keeps the historical all-input dependency chain.  Otherwise one
+       mask per output describes the real combinational cone. */
+    std::vector<uint32_t> outputDependencies;
+    /* One hidden all-input sink runs the sequential CYCLE callback.  It has no
+       public output, so it cannot participate in a combinational feedback
+       path; visible precise drivers evaluate the callback in REFRESH only. */
+    bool clockedTick=false;
+    bool groupedOutputs=false;
+    std::vector<std::string> inlinePrefixes;
+    std::vector<std::string> inlineExpressions;
     bool wideOutputs=false;
     bool active=false;
-    /* V2 (tc.component.types): the callback takes TCLogicIOV2 with borrowed
-       arrays, and the per-instance state size comes from the definition. */
+    /* V2/V3 (tc.component.types): callbacks take borrowed arrays and the
+       per-instance state size comes from the definition. */
     bool useV2=false;
+    bool useV3=false;
     TCLogicCallbackV2 callbackV2=nullptr;
+    TCLogicCallbackV3 callbackV3=nullptr;
     uint32_t stateWords=8;
     const TCComponentLifecycleV1* lifecycle=nullptr;
     uint32_t configSchema=0;
@@ -62,7 +86,7 @@ struct Definition {
     TCComponentConfigMigration migrateConfig=nullptr;
     void* migrationUser=nullptr;
 };
-// Pack contiguously, including pins crossing the two-word boundary.
+// Pack contiguously, including pins crossing a 64-bit word boundary.
 inline void placeInputs(const std::array<uint32_t,kMaxBridgeInputs>& widths,uint32_t count,
                         std::array<uint32_t,kMaxBridgeInputs>& word,
                         std::array<uint32_t,kMaxBridgeInputs>& shift) {
@@ -74,13 +98,36 @@ inline void placeInputs(const std::array<uint32_t,kMaxBridgeInputs>& widths,uint
     }
 }
 struct Binding {
+    struct InputStage {
+        std::array<uint64_t,kMaxInputWords> values{};
+        std::array<uint64_t,kMaxInputWords> drives{};
+        uint64_t valueCycle=0,driveCycle=0;
+        uint32_t valueChunks=0,driveChunks=0;
+        bool valueCycleValid=false,driveCycleValid=false;
+    };
     std::shared_ptr<Definition> definition;
     uint64_t instance=0;
+    /* The id the game's selection set and its own top-level lookups address
+       this component by: the component's own id when it sits directly on the
+       board, otherwise the id of the custom component that contains it.  Filled
+       by the same compile walk that used to publish interactive-map.txt, and
+       what tc.component.instances V2 hands back. */
+    uint64_t topLevel=0;
     /* Host-issued generation: a handle from before the slot was rebound is
        refused instead of resolving to whatever lives there now. */
     uint64_t generation=0;
     uint64_t calls=0,peeks=0,resets=0;
     bool created=false;
+    /* Where the instance sits, as the host last read it from the board record.
+       The first reading only seeds these fields (being compiled is not a move);
+       a later change is what TC_LOGIC_MOVE / TC_LOGIC_ROTATE announce. */
+    int32_t cellX=0,cellY=0;
+    uint32_t rotation=0;
+    bool geometryKnown=false;
+    /* The footprint the host last announced, in board cells (half extents).  A
+       change is TC_LOGIC_RESIZE. */
+    float halfWidth=0.f,halfHeight=0.f;
+    bool sizeKnown=false;
     /* The host created this instance by duplicating another one: its first bind
        announces that through TC_LOGIC_CLONE after on_create. */
     bool clonePending=false;
@@ -94,6 +141,7 @@ struct Binding {
     /* `state` is sized by the definition (V1 definitions keep the historical
        eight words); `outputs` holds one word per output pin. */
     std::vector<uint64_t> state;
+    std::vector<uint64_t> refreshState;
     std::vector<uint8_t> config;
     uint64_t configRevision=1;
     /* Set when the instance's component record owns a tail table this build can
@@ -114,6 +162,19 @@ struct Binding {
     /* Borrowed arrays handed to a V2 callback, kept here so a call never
        allocates on the simulation thread. */
     std::array<uint64_t,kMaxBridgeInputs> v2Inputs{};
+    std::array<TCLogicValueV3,kMaxBridgeInputs> v3Inputs{};
+    std::array<TCLogicValueV3,kMaxBridgeOutputs> v3Outputs{};
+    /* The generated program latches the drive plane separately.  The two-word
+       fast path fills the first entries; wider V3 inputs use the same chunked
+       staging protocol as their value plane. */
+    std::array<uint64_t,kMaxInputWords> inputDrive{};
+    bool inputDriveReady=false;
+    /* CYCLE and REFRESH can be prepared independently.  A selector carried by
+       each stage call identifies phase, cycle and chunk, so stale or incomplete
+       batches are rejected instead of being mixed into a callback. */
+    std::array<InputStage,2> inputStages{};
+    bool inputStageWarned=false;
+    bool partialDriveWarned=false;
     std::mutex mutex;
 };
 inline std::mutex registryMutex;
@@ -121,19 +182,39 @@ inline std::unordered_map<uint64_t,std::shared_ptr<Definition>> definitions;
 inline std::vector<std::shared_ptr<Binding>> bindings;
 inline std::map<std::pair<uint64_t,uint64_t>,uint64_t> bindingKeys;
 inline std::atomic<uint64_t> instanceGeneration{0};
-/* Wide constants are emitted as runtime lookups instead of literals.  The
+/* Wide constants are emitted as runtime loads instead of literals.  The
    board keeps owning/persisting the setting; this mirror lets the JIT observe
    a punch-tape edit without recompiling a large circuit. */
 inline std::mutex dynamicConstantMutex;
-inline std::unordered_map<uint64_t,uint64_t> dynamicConstants;
-inline void setDynamicConstant(uint64_t component,uint64_t value) {
-    std::lock_guard<std::mutex> lock(dynamicConstantMutex);
-    dynamicConstants[component]=value;
-}
-inline uint64_t getDynamicConstant(uint64_t component,uint64_t fallback) {
+/* Slots are separately allocated and never removed, so a simulation thread may
+   cache their address across unordered_map rehashes.  Edits are rare; reads are
+   on the generated program's hot path and use the slot address directly.
+   The exported lookup keeps its TLS cache for older compiled callers. */
+inline std::unordered_map<uint64_t,std::unique_ptr<std::atomic<uint64_t>>> dynamicConstants;
+inline std::atomic<uint64_t>* dynamicConstantSlot(uint64_t component,uint64_t initial) {
     std::lock_guard<std::mutex> lock(dynamicConstantMutex);
     auto found=dynamicConstants.find(component);
-    return found==dynamicConstants.end()?fallback:found->second;
+    if(found!=dynamicConstants.end())return found->second.get();
+    auto slot=std::make_unique<std::atomic<uint64_t>>(initial);
+    auto* result=slot.get();
+    dynamicConstants.emplace(component,std::move(slot));
+    return result;
+}
+inline void setDynamicConstant(uint64_t component,uint64_t value) {
+    dynamicConstantSlot(component,value)->store(value,std::memory_order_relaxed);
+}
+inline uint64_t getDynamicConstant(uint64_t component,uint64_t fallback) {
+    thread_local uint64_t lastComponent=~uint64_t(0);
+    thread_local std::atomic<uint64_t>* lastSlot=nullptr;
+    if(lastSlot&&lastComponent==component)
+        return lastSlot->load(std::memory_order_relaxed);
+    thread_local std::unordered_map<uint64_t,std::atomic<uint64_t>*> cache;
+    auto found=cache.find(component);
+    if(found==cache.end())
+        found=cache.emplace(component,dynamicConstantSlot(component,fallback)).first;
+    lastComponent=component;
+    lastSlot=found->second;
+    return lastSlot->load(std::memory_order_relaxed);
 }
 inline std::function<void(const std::string&)> logger;
 inline bool installed=false;
@@ -148,24 +229,9 @@ inline bool dumpSourceEnabled() {
     return enabled;
 }
 
-/* ---- How wide can a foreign call be? ---------------------------------------
-
-   The bridge packs every callback's inputs into two 64-bit payload words, so
-   input pins beyond 128 bits need a wider call (or a host buffer).  Whether the
-   JIT can carry more than the verified four arguments is a property of the game,
-   so it is measured rather than assumed: with TC_MODLOADER_BRIDGE_WIDE=1 the
-   emitter appends two extra, *different*, cycle-derived words to every call and
-   the entry point recomputes them.  A mismatch means the extra arguments did
-   not survive the JIT (or were clobbered); a clean run means the payload can
-   grow.  Off by default, and it changes nothing about the values the callback
-   sees. */
-inline bool wideCallEnabled() {
-    static const bool enabled=[]{
-        const char* value=std::getenv("TC_MODLOADER_BRIDGE_WIDE");
-        return value&&value[0]&&value[0]!='0';
-    }();
-    return enabled;
-}
+/* Six-argument bridge calls were measured and found unreliable in the game's
+   JIT.  The diagnostic entry points remain registered for old development
+   captures, but production emission uses the four-argument staged protocol. */
 inline void (*getPrototype)(uint64_t,void*)=nullptr;
 inline void (*destroyPrototype)(void*)=nullptr;
 // Simulation state buffer: foreign call results cannot be consumed as words, so
@@ -173,7 +239,9 @@ inline void (*destroyPrototype)(void*)=nullptr;
 // loads them back the same way the game's own word components do.
 inline unsigned char** stateBuffer=nullptr;
 inline constexpr uint64_t kBridgeStateBase=0x9a0000;
-inline constexpr uint64_t kBridgeStateStride=512;
+/* One byte per output bit: 32 pins x 64 bits.  All 32 token slots end at
+   0x9b0000, below the pinned build's 0x9c4000 simulation-state boundary. */
+inline constexpr uint64_t kBridgeStateStride=kMaxBridgeOutputs*kMaxPinBits;
 inline constexpr uint64_t kBridgeStateTokens=32;
 inline uint64_t stateSlot(uint64_t token,uint32_t pin,uint32_t bit) {
     return kBridgeStateBase+(token-1)*kBridgeStateStride+pin*64+bit;
@@ -217,8 +285,8 @@ inline std::string pinText(const PinGeometry& pin) {
     if(!pin.present)return "(missing)";
     return "("+std::to_string(pin.x)+","+std::to_string(pin.y)+",w"+std::to_string(pin.word)+")";
 }
-// Shape validation.  Only 2 x 1-bit in, 1 x 1-bit out is bridged; the game
-// itself keeps generating code for every other part of the board.
+// Shape validation for the imported scaffold; the game keeps generating code
+// for every ordinary part of the board around these custom pins.
 inline std::string describePrototype(uint64_t custom_id,const TCPrototype& p) {
     const uint64_t inputs=prototypeInputCount(p),outputs=prototypeOutputCount(p);
     std::string text="custom "+hex64(custom_id)+" inputs="+std::to_string(inputs)+
@@ -228,15 +296,16 @@ inline std::string describePrototype(uint64_t custom_id,const TCPrototype& p) {
     return text;
 }
 // Shape limits of the bridge: `maxPins` pins per direction (eight for a V1
-// definition, sixteen for V2), each 1..64 bits, with the total input width
-// fitting the two payload words of the invoke call.
+// definition, thirty-two for V2/V3), each 1..64 bits, with the total input width
+// fitting the staged-input batch.
 inline bool supportedScaffold(uint64_t custom_id,const TCPrototype& p,std::string& detail,
                               std::array<uint32_t,kMaxBridgeInputs>& inputWidths,
                               std::array<uint32_t,kMaxBridgeOutputs>& outputWidths,
-                              uint32_t& inputBits,uint32_t maxPins=kMaxBridgeInputs) {
+                              uint32_t& inputBits,uint32_t maxInputs=kMaxBridgeInputs,
+                              uint32_t maxOutputs=kMaxBridgeOutputs) {
     detail=describePrototype(custom_id,p);
     const uint64_t inputs=prototypeInputCount(p),outputs=prototypeOutputCount(p);
-    if(inputs>maxPins||outputs>maxPins)return false;
+    if(inputs>maxInputs||outputs>maxOutputs)return false;
     inputBits=0;
     for(uint64_t i=0;i<inputs;++i) {
         const auto pin=readPinGeometry(p,true,i);
@@ -263,16 +332,16 @@ inline int add(const TCLogicDefinition* d,const char* owner_mod=nullptr) {
     std::array<uint32_t,kMaxBridgeInputs> inputWidths{};
     std::array<uint32_t,kMaxBridgeOutputs> outputWidths{};
     uint32_t inputBits=0;
-    const bool valid=supportedScaffold(d->custom_id,p,detail,inputWidths,outputWidths,inputBits);
+    const bool valid=supportedScaffold(d->custom_id,p,detail,inputWidths,outputWidths,inputBits,8,8);
     const uint32_t inputs=valid?static_cast<uint32_t>(prototypeInputCount(p)):0;
     const uint32_t outputs=valid?static_cast<uint32_t>(prototypeOutputCount(p)):0;
     destroyPrototype(&p);
     if(!valid) {
         note("registration rejected: "+detail+
-             " (supported shape is up to eight pins per direction, each 1..64 bits, total input width <= 128)");
+             " (supported V1 shape is up to eight pins per direction, each 1..64 bits, total input width <= 512)");
         tc::component_registry::noteRefused(d->custom_id,owner_mod?owner_mod:"","",
             "the bridge supports up to eight pins per direction, each 1..64 bits, "
-            "with at most 128 input bits in total; "+detail);
+            "with at most 512 input bits in total; "+detail);
         return -2;
     }
     std::lock_guard<std::mutex> lock(registryMutex);
@@ -317,11 +386,34 @@ struct V2Registration {
     uint32_t migrationVersion=0;
     TCComponentConfigMigration migrateConfig=nullptr;
     void* migrationUser=nullptr;
+    std::vector<uint32_t> outputDependencies;
+    bool clockedTick=false;
+    bool groupedOutputs=false;
+    std::vector<std::string> inlinePrefixes;
+    std::vector<std::string> inlineExpressions;
 };
-inline int addV2(const V2Registration& registration) {
+struct V3Registration {
+    uint64_t custom_id=0;
+    TCLogicCallbackV3 callback=nullptr;
+    void* user=nullptr;
+    uint32_t stateWords=0;
+    const char* owner_mod=nullptr;
+    const TCComponentLifecycleV1* lifecycle=nullptr;
+    uint32_t configSchema=0;
+    std::vector<uint8_t> defaultConfig;
+    uint32_t migrationVersion=0;
+    TCComponentConfigMigration migrateConfig=nullptr;
+    void* migrationUser=nullptr;
+    std::vector<uint32_t> outputDependencies;
+    bool clockedTick=false;
+    bool groupedOutputs=false;
+    std::vector<std::string> inlinePrefixes;
+    std::vector<std::string> inlineExpressions;
+};
+inline int addVersioned(const V2Registration& registration,TCLogicCallbackV3 callbackV3) {
     if(!installed)return -1;
-    if(!registration.custom_id||!registration.callback) {
-        note("registration rejected: malformed V2 definition");
+    if(!registration.custom_id||(!registration.callback&&!callbackV3)) {
+        note("registration rejected: malformed versioned definition");
         return TC_COMPONENT_TYPES_ERR_ARGUMENT;
     }
     const uint64_t custom_id=registration.custom_id;
@@ -332,17 +424,17 @@ inline int addV2(const V2Registration& registration) {
     std::array<uint32_t,kMaxBridgeOutputs> outputWidths{};
     uint32_t inputBits=0;
     const bool shapeOk=supportedScaffold(custom_id,p,detail,inputWidths,outputWidths,inputBits,
-                                         kMaxBridgePins);
+                                         kMaxBridgeInputs,kMaxBridgeOutputs);
     const uint32_t inputs=shapeOk?static_cast<uint32_t>(prototypeInputCount(p)):0;
     const uint32_t outputs=shapeOk?static_cast<uint32_t>(prototypeOutputCount(p)):0;
     destroyPrototype(&p);
     if(!shapeOk) {
         note("registration rejected: "+detail+
-             " (V2 shape is up to sixteen pins per direction, each 1..64 bits, "
-             "total input width <= 128)");
+             " (V2/V3 shape is up to thirty-two pins per direction, each 1..64 bits, "
+             "total input width <= 2048)");
         tc::component_registry::noteRefused(custom_id,owner_mod?owner_mod:"","",
-            "the bridge supports up to sixteen pins per direction, each 1..64 bits, "
-            "with at most 128 input bits in total; "+detail);
+            "the bridge supports up to thirty-two pins per direction, each 1..64 bits, "
+            "with at most 2048 input bits in total; "+detail);
         return TC_COMPONENT_TYPES_ERR_UNSUPPORTED;
     }
     std::lock_guard<std::mutex> lock(registryMutex);
@@ -357,8 +449,10 @@ inline int addV2(const V2Registration& registration) {
     entry->api.custom_id=custom_id;
     entry->api.callback=nullptr;
     entry->api.user=registration.user;
-    entry->useV2=true;
+    entry->useV2=callbackV3==nullptr;
+    entry->useV3=callbackV3!=nullptr;
     entry->callbackV2=registration.callback;
+    entry->callbackV3=callbackV3;
     entry->stateWords=registration.stateWords;
     entry->lifecycle=registration.lifecycle;
     entry->configSchema=registration.configSchema;
@@ -367,12 +461,39 @@ inline int addV2(const V2Registration& registration) {
     entry->migrateConfig=registration.migrateConfig;
     entry->migrationUser=registration.migrationUser;
     entry->inputs=inputs;entry->outputs=outputs;
+    if(registration.outputDependencies.size()==outputs)
+        entry->outputDependencies=registration.outputDependencies;
+    entry->clockedTick=registration.clockedTick&&!entry->outputDependencies.empty();
+    entry->groupedOutputs=registration.groupedOutputs&&!entry->outputDependencies.empty()&&
+                          callbackV3!=nullptr;
+    if(registration.inlineExpressions.size()==outputs) {
+        entry->inlinePrefixes=registration.inlinePrefixes;
+        entry->inlineExpressions=registration.inlineExpressions;
+        entry->groupedOutputs=false;
+    }
     entry->inputWidths=inputWidths;entry->outputWidths=outputWidths;entry->inputBits=inputBits;
     for(uint32_t i=0;i<outputs;++i)if(outputWidths[i]>1)entry->wideOutputs=true;
     placeInputs(entry->inputWidths,inputs,entry->inputWord,entry->inputShift);
     definitions.emplace(custom_id,std::move(entry));
-    note("registered "+detail+" shape="+std::to_string(inputs)+"in/"+std::to_string(outputs)+
-         "out v2 state="+std::to_string(registration.stateWords));
+    std::string registrationNote="registered "+detail+" shape="+std::to_string(inputs)+"in/"+
+        std::to_string(outputs)+"out "+(callbackV3?"v3":"v2")+" state="+
+        std::to_string(registration.stateWords);
+    /* The exact dependency map is what the game's cycle check sees, so print it
+       with the rest of the shape: a false "combinational loop" is diagnosed by
+       comparing these masks with the wires a board builds around the part. */
+    if(outputs&&registration.outputDependencies.size()==outputs) {
+        registrationNote+=" deps=";
+        for(uint32_t i=0;i<outputs;++i) {
+            if(i)registrationNote+=",";
+            char mask[16];
+            std::snprintf(mask,sizeof(mask),"0x%x",registration.outputDependencies[i]);
+            registrationNote+=mask;
+        }
+        if(registration.clockedTick)registrationNote+=" tick=hidden";
+        if(registration.groupedOutputs&&callbackV3)registrationNote+=" groups=shared-mask";
+        if(registration.inlineExpressions.size()==outputs)registrationNote+=" jit=inline";
+    }
+    note(registrationNote);
     {
         std::vector<tc::component_registry::Pin> inputPins,outputPins;
         for(uint32_t i=0;i<inputs;++i)inputPins.push_back({std::string(),inputWidths[i]});
@@ -381,17 +502,56 @@ inline int addV2(const V2Registration& registration) {
     }
     return 0;
 }
+inline int addV2(const V2Registration& registration) {
+    return addVersioned(registration,nullptr);
+}
+inline int addV3(const V3Registration& registration) {
+    V2Registration common;
+    common.custom_id=registration.custom_id;
+    common.user=registration.user;
+    common.stateWords=registration.stateWords;
+    common.owner_mod=registration.owner_mod;
+    common.lifecycle=registration.lifecycle;
+    common.configSchema=registration.configSchema;
+    common.defaultConfig=registration.defaultConfig;
+    common.migrationVersion=registration.migrationVersion;
+    common.migrateConfig=registration.migrateConfig;
+    common.migrationUser=registration.migrationUser;
+    common.outputDependencies=registration.outputDependencies;
+    common.clockedTick=registration.clockedTick;
+    common.groupedOutputs=registration.groupedOutputs;
+    common.inlinePrefixes=registration.inlinePrefixes;
+    common.inlineExpressions=registration.inlineExpressions;
+    return addVersioned(common,registration.callback);
+}
 inline void finish(const std::vector<uint64_t>& ids,bool success) {
     std::lock_guard<std::mutex> lock(registryMutex);
     for(auto id:ids) {auto it=definitions.find(id);if(it==definitions.end())continue;
         if(success)it->second->active=true;else definitions.erase(it);}
 }
-// Runs the callback once for an instance and keeps its outputs for the
-// tc_logic_out readback used by the remaining output drivers.  Input words
-// arrive packed into two payload arguments because the generated code cannot
-// pass more than four arguments through the JIT without tripping its register
-// allocator; each pin is masked to its declared width.
-inline uint64_t invoke(uint64_t token,int64_t cycle,uint64_t packedLo,uint64_t packedHi,uint32_t phase) noexcept {
+using InputPayload = std::array<uint64_t,kMaxInputWords>;
+
+// The <=128-bit fast path latches the V3 drive plane in one four-argument call.
+inline uint64_t latchInputDrive(uint64_t token,uint64_t packedLo,uint64_t packedHi) noexcept {
+    try {
+        std::shared_ptr<Binding> binding;
+        {std::lock_guard<std::mutex> lock(registryMutex);if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
+        if(!binding||!binding->active||!binding->definition->useV3)return 0;
+        std::lock_guard<std::mutex> lock(binding->mutex);
+        binding->inputDrive.fill(0);
+        binding->inputDrive[0]=packedLo;
+        binding->inputDrive[1]=packedHi;
+        binding->inputDriveReady=true;
+        return 1;
+    } catch(...) { return 0; }
+}
+
+// Runs the callback once and keeps its outputs for the remaining output
+// drivers.  `payload` is either the two-word fast path or a complete staged
+// batch; each callback pin is reconstructed and masked to its declared width.
+inline uint64_t invokePayload(uint64_t token,int64_t cycle,const InputPayload& payload,
+                              const InputPayload* stagedDrive,uint32_t phase,
+                              uint32_t requestedOutput=0) noexcept {
     try {
         std::shared_ptr<Binding> binding;
         {std::lock_guard<std::mutex> lock(registryMutex);if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
@@ -399,7 +559,82 @@ inline uint64_t invoke(uint64_t token,int64_t cycle,uint64_t packedLo,uint64_t p
         std::lock_guard<std::mutex> lock(binding->mutex);
         const uint32_t inputCount=binding->definition->inputs;
         const uint32_t outputCount=binding->definition->outputs;
-        const uint64_t payload[2]={packedLo,packedHi};
+        if(binding->definition->useV3) {
+            InputPayload defaultDrive{};
+            const InputPayload* drivePayload=stagedDrive;
+            if(!drivePayload) {
+                if(binding->inputDriveReady)drivePayload=&binding->inputDrive;
+                else {defaultDrive.fill(~uint64_t(0));drivePayload=&defaultDrive;}
+            }
+            binding->inputDriveReady=false;
+            for(uint32_t i=0;i<inputCount;++i) {
+                const uint32_t bits=binding->definition->inputWidths[i];
+                const uint64_t mask=bits>=64?~uint64_t(0):((uint64_t(1)<<bits)-1);
+                const auto word=binding->definition->inputWord[i];
+                const auto shift=binding->definition->inputShift[i];
+                uint64_t value=payload[word]>>shift;
+                uint64_t drive=(*drivePayload)[word]>>shift;
+                if(shift+bits>64) {
+                    value|=payload[word+1]<<(64-shift);
+                    drive|=(*drivePayload)[word+1]<<(64-shift);
+                }
+                drive&=mask;
+                binding->v3Inputs[i]={value&drive,drive};
+            }
+            std::array<TCLogicValueV3,kMaxBridgeOutputs> callbackOutputs{};
+            TCLogicIOV3 io{};
+            io.size=sizeof(io);io.version=TC_LOGIC_IO_V3_VERSION_1;io.phase=phase;
+            io.instance_id=binding->instance;io.cycle=cycle;
+            io.input_count=inputCount;io.output_count=outputCount;
+            if(phase==TC_LOGIC_REFRESH) {
+                if(binding->refreshState.size()!=binding->state.size())binding->refreshState.resize(binding->state.size());
+                std::copy(binding->state.begin(),binding->state.end(),binding->refreshState.begin());
+            }
+            io.inputs=binding->v3Inputs.data();io.outputs=callbackOutputs.data();
+            io.state=binding->state.empty()?nullptr:
+                (phase==TC_LOGIC_REFRESH?binding->refreshState.data():binding->state.data());
+            io.state_words=static_cast<uint32_t>(binding->state.size());
+            /* Private bridge convention: zero means the complete component;
+               N+1 asks a dependency-isolated callback to evaluate output N.
+               TC-Verilog consumes it, ordinary V3 callbacks may ignore it. */
+            io.reserved=requestedOutput;
+            io.user=binding->definition->api.user;
+            io.config=binding->config.empty()?nullptr:binding->config.data();
+            io.config_size=static_cast<uint32_t>(binding->config.size());
+            io.config_schema=binding->definition->configSchema;
+            binding->definition->callbackV3(&io);
+            if(phase==TC_LOGIC_CYCLE)++binding->calls; else ++binding->peeks;
+            if(phase==TC_LOGIC_CYCLE&&!binding->state.empty())
+                std::copy(io.state,io.state+io.state_words,binding->state.begin());
+            for(uint32_t i=0;i<outputCount;++i) {
+                bool publish=requestedOutput!=kTickOnlySelector;
+                if(publish&&(requestedOutput&kOutputGroupSelector)!=0) {
+                    const uint32_t selected=(requestedOutput&~kOutputGroupSelector)-1;
+                    publish=selected<binding->definition->outputDependencies.size()&&
+                            i<binding->definition->outputDependencies.size()&&
+                            binding->definition->outputDependencies[i]==
+                                binding->definition->outputDependencies[selected];
+                }
+                if(!publish)continue;
+                const uint32_t bits=binding->definition->outputWidths[i];
+                const uint64_t mask=bits>=64?~uint64_t(0):((uint64_t(1)<<bits)-1);
+                uint64_t drive=callbackOutputs[i].drive_mask&mask;
+                if(drive!=0&&drive!=mask) {
+                    drive=0;
+                    if(!binding->partialDriveWarned) {
+                        binding->partialDriveWarned=true;
+                        note("instance "+hex64(binding->instance)+
+                             " returned a partial V3 drive mask; the game's word Switch can only drive or disconnect the whole pin");
+                    }
+                }
+                binding->v3Outputs[i].drive_mask=drive;
+                binding->v3Outputs[i].value=callbackOutputs[i].value&drive;
+                binding->outputs[i]=binding->v3Outputs[i].value;
+            }
+            if(binding->definition->wideOutputs)
+                publishWordOutputs(token,binding->outputs.data(),outputCount);
+            return outputCount?binding->outputs[0]:0;
+        }
         if(binding->definition->useV2) {
             /* V2: the callback gets the counts and borrowed arrays, so a shape
                with more than eight pins works and the state size is the
@@ -417,9 +652,14 @@ inline uint64_t invoke(uint64_t token,int64_t cycle,uint64_t packedLo,uint64_t p
             io.size=sizeof(io);io.version=TC_LOGIC_IO_V2_VERSION_1;io.phase=phase;
             io.instance_id=binding->instance;io.cycle=cycle;
             io.input_count=inputCount;io.output_count=outputCount;
+            if(phase==TC_LOGIC_REFRESH) {
+                if(binding->refreshState.size()!=binding->state.size())binding->refreshState.resize(binding->state.size());
+                std::copy(binding->state.begin(),binding->state.end(),binding->refreshState.begin());
+            }
             io.inputs=binding->v2Inputs.data();
             io.outputs=binding->outputs.data();
-            io.state=binding->state.empty()?nullptr:binding->state.data();
+            io.state=binding->state.empty()?nullptr:
+                (phase==TC_LOGIC_REFRESH?binding->refreshState.data():binding->state.data());
             io.state_words=static_cast<uint32_t>(binding->state.size());
             io.user=binding->definition->api.user;
             io.config=binding->config.empty()?nullptr:binding->config.data();
@@ -454,6 +694,141 @@ inline uint64_t invoke(uint64_t token,int64_t cycle,uint64_t packedLo,uint64_t p
         return binding->outputs[0];
     }catch(...) {if(logger)logger("Native logic: callback threw; outputs forced to zero");return 0;}
 }
+
+inline uint64_t invoke(uint64_t token,int64_t cycle,uint64_t packedLo,uint64_t packedHi,
+                       uint32_t phase) noexcept {
+    InputPayload payload{};
+    payload[0]=packedLo;payload[1]=packedHi;
+    return invokePayload(token,cycle,payload,nullptr,phase);
+}
+
+inline uint64_t invokeTick(uint64_t token,int64_t cycle,uint64_t packedLo,
+                           uint64_t packedHi) noexcept {
+    InputPayload payload{};
+    payload[0]=packedLo;payload[1]=packedHi;
+    return invokePayload(token,cycle,payload,nullptr,TC_LOGIC_CYCLE,kTickOnlySelector);
+}
+
+inline uint64_t invokeOutput(uint64_t token,uint64_t selector,uint64_t packedLo,
+                             uint64_t packedHi) noexcept {
+    const uint32_t output=static_cast<uint32_t>(selector&31u);
+    const int64_t cycle=static_cast<int64_t>(selector>>5)-1;
+    InputPayload payload{};
+    payload[0]=packedLo;payload[1]=packedHi;
+    invokePayload(token,cycle,payload,nullptr,TC_LOGIC_REFRESH,
+                  kOutputGroupSelector|(output+1));
+    try {
+        std::shared_ptr<Binding> binding;
+        {std::lock_guard<std::mutex> lock(registryMutex);
+         if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
+        if(!binding||!binding->active)return 0;
+        std::lock_guard<std::mutex> lock(binding->mutex);
+        return output<binding->definition->outputs?binding->outputs[output]&1:0;
+    } catch(...) {return 0;}
+}
+
+/* Wider inputs keep the JIT-safe four-argument call shape.  The second argument
+   encodes `(cycle + 1) * 32 + phase * 16 + chunk`; the +1 bias preserves the
+   simulator's initial cycle -1 in this unsigned transport.  Each chunk contributes two words.
+   Separate CYCLE/REFRESH banks prevent one phase from consuming the other's
+   partially prepared batch. */
+inline uint64_t stageInput(uint64_t token,uint64_t selector,uint64_t packedLo,
+                           uint64_t packedHi,bool drivePlane) noexcept {
+    try {
+        const uint32_t chunk=static_cast<uint32_t>(selector&15u);
+        const uint32_t stagePhase=static_cast<uint32_t>((selector>>4)&1u);
+        const uint64_t cycle=selector>>5;
+        if(chunk>=kMaxInputChunks)return 0;
+        std::shared_ptr<Binding> binding;
+        {std::lock_guard<std::mutex> lock(registryMutex);
+         if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
+        if(!binding||!binding->active||(drivePlane&&!binding->definition->useV3))return 0;
+        std::lock_guard<std::mutex> lock(binding->mutex);
+        auto& stage=binding->inputStages[stagePhase];
+        auto& words=drivePlane?stage.drives:stage.values;
+        auto& stagedCycle=drivePlane?stage.driveCycle:stage.valueCycle;
+        auto& cycleValid=drivePlane?stage.driveCycleValid:stage.valueCycleValid;
+        auto& chunks=drivePlane?stage.driveChunks:stage.valueChunks;
+        if(!cycleValid||stagedCycle!=cycle) {
+            words.fill(0);chunks=0;stagedCycle=cycle;cycleValid=true;
+        }
+        words[chunk*kInputWordsPerCall]=packedLo;
+        words[chunk*kInputWordsPerCall+1]=packedHi;
+        chunks|=uint32_t(1)<<chunk;
+        return 1;
+    } catch(...) { return 0; }
+}
+
+inline uint64_t invokeStaged(uint64_t token,int64_t cycle,uint64_t chunkCount,
+                             uint32_t phase,uint32_t requestedOutput=0) noexcept {
+    try {
+        if(chunkCount<=1||chunkCount>kMaxInputChunks)return 0;
+        std::shared_ptr<Binding> binding;
+        {std::lock_guard<std::mutex> lock(registryMutex);
+         if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
+        if(!binding||!binding->active)return 0;
+        InputPayload values{},drives{};
+        bool useV3=false,ready=false;
+        {
+            std::lock_guard<std::mutex> lock(binding->mutex);
+            const uint32_t stagePhase=phase==TC_LOGIC_REFRESH?1u:0u;
+            auto& stage=binding->inputStages[stagePhase];
+            const uint32_t expected=(uint32_t(1)<<static_cast<uint32_t>(chunkCount))-1u;
+            const uint64_t expectedCycle=static_cast<uint64_t>(cycle)+1;
+            useV3=binding->definition->useV3;
+            ready=stage.valueCycleValid&&stage.valueCycle==expectedCycle&&
+                  (stage.valueChunks&expected)==expected;
+            if(useV3)
+                ready=ready&&stage.driveCycleValid&&stage.driveCycle==expectedCycle&&
+                      (stage.driveChunks&expected)==expected;
+            if(ready) {values=stage.values;if(useV3)drives=stage.drives;}
+            stage.valueChunks=stage.driveChunks=0;
+            stage.valueCycleValid=stage.driveCycleValid=false;
+            if(!ready&&!binding->inputStageWarned) {
+                binding->inputStageWarned=true;
+                note("instance token "+std::to_string(token)+
+                     " received an incomplete staged input batch");
+            }
+        }
+        if(!ready)return 0;
+        return invokePayload(token,cycle,values,useV3?&drives:nullptr,phase,requestedOutput);
+    } catch(...) { return 0; }
+}
+/* Independent output evaluation consumes the same staged batch but always
+   executes the callback as REFRESH.  The game's CYCLE/REFRESH distinction only
+   selects the staging bank; it must not advance callback state once per output. */
+inline uint64_t invokeStagedOutput(uint64_t token,int64_t cycle,uint64_t chunkCount,
+                                   uint32_t stagePhase,uint32_t output) noexcept {
+    try {
+        if(chunkCount<=1||chunkCount>kMaxInputChunks)return 0;
+        std::shared_ptr<Binding> binding;
+        {std::lock_guard<std::mutex> lock(registryMutex);
+         if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
+        if(!binding||!binding->active)return 0;
+        InputPayload values{},drives{};
+        bool useV3=false,ready=false;
+        {
+            std::lock_guard<std::mutex> lock(binding->mutex);
+            auto& stage=binding->inputStages[stagePhase==TC_LOGIC_REFRESH?1u:0u];
+            const uint32_t expected=(uint32_t(1)<<static_cast<uint32_t>(chunkCount))-1u;
+            const uint64_t expectedCycle=static_cast<uint64_t>(cycle)+1;
+            useV3=binding->definition->useV3;
+            ready=stage.valueCycleValid&&stage.valueCycle==expectedCycle&&
+                  (stage.valueChunks&expected)==expected;
+            if(useV3)
+                ready=ready&&stage.driveCycleValid&&stage.driveCycle==expectedCycle&&
+                      (stage.driveChunks&expected)==expected;
+            if(ready){values=stage.values;if(useV3)drives=stage.drives;}
+            stage.valueChunks=stage.driveChunks=0;
+            stage.valueCycleValid=stage.driveCycleValid=false;
+        }
+        if(!ready)return 0;
+        invokePayload(token,cycle,values,useV3?&drives:nullptr,TC_LOGIC_REFRESH,
+                      kOutputGroupSelector|(output+1));
+        std::lock_guard<std::mutex> lock(binding->mutex);
+        return output<binding->definition->outputs?binding->outputs[output]&1:0;
+    } catch(...) {return 0;}
+}
 inline uint64_t readOutput(uint64_t token,uint64_t index) noexcept {
     try {
         std::shared_ptr<Binding> binding;
@@ -461,6 +836,18 @@ inline uint64_t readOutput(uint64_t token,uint64_t index) noexcept {
         if(!binding||!binding->active)return 0;
         std::lock_guard<std::mutex> lock(binding->mutex);
         return index<kMaxBridgeOutputs?binding->outputs[index]&1:0;
+    }catch(...) {return 0;}
+}
+inline uint64_t readOutputDrive(uint64_t token,uint64_t index) noexcept {
+    try {
+        std::shared_ptr<Binding> binding;
+        {std::lock_guard<std::mutex> lock(registryMutex);if(!token||token>bindings.size())return 0;binding=bindings[token-1];}
+        if(!binding||!binding->active||!binding->definition->useV3)return 0;
+        std::lock_guard<std::mutex> lock(binding->mutex);
+        if(index>=binding->definition->outputs||index>=kMaxBridgeOutputs)return 0;
+        const uint32_t bits=binding->definition->outputWidths[static_cast<size_t>(index)];
+        const uint64_t mask=bits>=64?~uint64_t(0):((uint64_t(1)<<bits)-1);
+        return binding->v3Outputs[static_cast<size_t>(index)].drive_mask==mask?1:0;
     }catch(...) {return 0;}
 }
 // One bit of a previously computed output word.  Word-width pins are assembled
@@ -486,6 +873,29 @@ inline void reset() noexcept {
             ++binding->resets;
             std::fill(binding->state.begin(),binding->state.end(),0);
             binding->outputs.fill(0);
+            std::fill(binding->v3Inputs.begin(),binding->v3Inputs.end(),TCLogicValueV3{});
+            std::fill(binding->v3Outputs.begin(),binding->v3Outputs.end(),TCLogicValueV3{});
+            binding->inputDrive.fill(0);
+            binding->inputDriveReady=false;
+            binding->inputStages={};
+            binding->inputStageWarned=false;
+            if(binding->definition->useV3) {
+                TCLogicIOV3 io{};io.size=sizeof(io);io.version=TC_LOGIC_IO_V3_VERSION_1;
+                io.phase=TC_LOGIC_RESET;io.instance_id=binding->instance;io.cycle=-1;
+                io.input_count=binding->definition->inputs;
+                io.output_count=binding->definition->outputs;
+                io.inputs=binding->v3Inputs.data();io.outputs=binding->v3Outputs.data();
+                io.state=binding->state.empty()?nullptr:binding->state.data();
+                io.state_words=static_cast<uint32_t>(binding->state.size());
+                io.user=binding->definition->api.user;
+                io.config=binding->config.empty()?nullptr:binding->config.data();
+                io.config_size=static_cast<uint32_t>(binding->config.size());
+                io.config_schema=binding->definition->configSchema;
+                binding->definition->callbackV3(&io);
+                if(!binding->state.empty())
+                    std::copy(io.state,io.state+io.state_words,binding->state.begin());
+                continue;
+            }
             if(binding->definition->useV2) {
                 TCLogicIOV2 io{};io.size=sizeof(io);io.version=TC_LOGIC_IO_V2_VERSION_1;
                 io.phase=TC_LOGIC_RESET;io.instance_id=binding->instance;io.cycle=-1;
@@ -536,6 +946,13 @@ inline void callV2Locked(Binding& binding,uint32_t phase,TCLogicCallbackV2 callb
     io.config=binding.config.empty()?nullptr:binding.config.data();
     io.config_size=static_cast<uint32_t>(binding.config.size());
     io.config_schema=definition->configSchema;
+    /* The placement tail (see TCLogicIOV2): every lifecycle phase may read it,
+       and the phases that change it are MOVE / ROTATE / RESIZE. */
+    io.cell_x=binding.cellX;
+    io.cell_y=binding.cellY;
+    io.rotation=binding.rotation;
+    io.half_width=binding.halfWidth;
+    io.half_height=binding.halfHeight;
     callback(&io);
     /* Lifecycle and RESET are not simulation phases: their writes are committed
        immediately, because there is no cycle for them to be discarded with. */
@@ -639,6 +1056,122 @@ inline void notifyLoad(Binding& binding) {
         note("lifecycle on_load threw for instance "+hex64(binding.instance));
     }
 }
+/* ---- placement: MOVE / ROTATE / RESIZE -------------------------------------
+
+   The board record is the authority for where an instance sits and which way it
+   points, so the host reads it once per frame (native.hpp's poll) and hands the
+   reading here; the binding keeps the last reading and only a *change* becomes a
+   callback.  The first reading seeds the binding - being compiled is not a
+   move.  All three callbacks run with the binding's lock held, like
+   on_create/on_destroy, and read the new values from the IO's placement tail. */
+inline void notifyMove(Binding& binding) {
+    const TCComponentLifecycleV1* lifecycle=binding.definition->lifecycle;
+    if(!lifecycle)return;
+    const size_t tail=offsetof(TCComponentLifecycleV1,on_move)+sizeof(lifecycle->on_move);
+    if(lifecycle->size<tail||!lifecycle->on_move)return;
+    try {
+        callV2Locked(binding,TC_LOGIC_MOVE,lifecycle->on_move,-1);
+    } catch(...) {
+        note("lifecycle on_move threw for instance "+hex64(binding.instance));
+    }
+}
+inline void notifyRotate(Binding& binding) {
+    const TCComponentLifecycleV1* lifecycle=binding.definition->lifecycle;
+    if(!lifecycle)return;
+    const size_t tail=offsetof(TCComponentLifecycleV1,on_rotate)+sizeof(lifecycle->on_rotate);
+    if(lifecycle->size<tail||!lifecycle->on_rotate)return;
+    try {
+        callV2Locked(binding,TC_LOGIC_ROTATE,lifecycle->on_rotate,-1);
+    } catch(...) {
+        note("lifecycle on_rotate threw for instance "+hex64(binding.instance));
+    }
+}
+inline void notifyResize(Binding& binding) {
+    const TCComponentLifecycleV1* lifecycle=binding.definition->lifecycle;
+    if(!lifecycle)return;
+    const size_t tail=offsetof(TCComponentLifecycleV1,on_resize)+sizeof(lifecycle->on_resize);
+    if(lifecycle->size<tail||!lifecycle->on_resize)return;
+    try {
+        callV2Locked(binding,TC_LOGIC_RESIZE,lifecycle->on_resize,-1);
+    } catch(...) {
+        note("lifecycle on_resize threw for instance "+hex64(binding.instance));
+    }
+}
+/* The board compiled with this instance in it: once per compile, after the
+   bindings for that compile exist. */
+inline void notifyCompile(Binding& binding) {
+    const TCComponentLifecycleV1* lifecycle=binding.definition->lifecycle;
+    if(!lifecycle)return;
+    const size_t tail=offsetof(TCComponentLifecycleV1,on_compile)+sizeof(lifecycle->on_compile);
+    if(lifecycle->size<tail||!lifecycle->on_compile)return;
+    try {
+        callV2Locked(binding,TC_LOGIC_COMPILE,lifecycle->on_compile,-1);
+    } catch(...) {
+        note("lifecycle on_compile threw for instance "+hex64(binding.instance));
+    }
+}
+/* The host dropped the binding while the instance itself was not deleted: the
+   board went away (leaving the level) or the loader is shutting down.  A
+   component the player *deleted* arrives as TC_LOGIC_DESTROY instead. */
+inline void notifyUnbind(Binding& binding) {
+    const TCComponentLifecycleV1* lifecycle=binding.definition->lifecycle;
+    if(!lifecycle)return;
+    const size_t tail=offsetof(TCComponentLifecycleV1,on_unbind)+sizeof(lifecycle->on_unbind);
+    if(lifecycle->size<tail||!lifecycle->on_unbind)return;
+    try {
+        callV2Locked(binding,TC_LOGIC_UNBIND,lifecycle->on_unbind,-1);
+    } catch(...) {
+        note("lifecycle on_unbind threw for instance "+hex64(binding.instance));
+    }
+}
+/* The host's per-frame reading of one instance's board record (native.hpp's
+   poll).  `rotation` is the record's direction byte; the first reading seeds the
+   binding and fires nothing. */
+inline void updateInstanceGeometry(uint64_t customId,uint64_t instance,
+                                   int32_t cellX,int32_t cellY,uint32_t rotation) {
+    std::shared_ptr<Binding> binding;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        const auto found=bindingKeys.find(std::make_pair(customId,instance));
+        if(found==bindingKeys.end())return;
+        const size_t slot=static_cast<size_t>(found->second);
+        if(slot==0||slot>bindings.size()||!bindings[slot-1]||!bindings[slot-1]->active)return;
+        binding=bindings[slot-1];
+    }
+    std::lock_guard<std::mutex> lock(binding->mutex);
+    if(!binding->geometryKnown) {
+        binding->cellX=cellX;binding->cellY=cellY;binding->rotation=rotation;
+        binding->geometryKnown=true;
+        return;
+    }
+    const bool moved=binding->cellX!=cellX||binding->cellY!=cellY;
+    const bool rotated=binding->rotation!=rotation;
+    binding->cellX=cellX;binding->cellY=cellY;binding->rotation=rotation;
+    if(moved)notifyMove(*binding);
+    if(rotated)notifyRotate(*binding);
+}
+/* The footprint the host announced for one instance (tc.component.geometry's
+   per-instance rectangle, or the type's own declaration once the instance
+   exists).  A change fires TC_LOGIC_RESIZE; the first one only seeds. */
+inline void updateInstanceFootprint(uint64_t customId,uint64_t instance,
+                                    float halfWidth,float halfHeight) {
+    std::shared_ptr<Binding> binding;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        const auto found=bindingKeys.find(std::make_pair(customId,instance));
+        if(found==bindingKeys.end())return;
+        const size_t slot=static_cast<size_t>(found->second);
+        if(slot==0||slot>bindings.size()||!bindings[slot-1]||!bindings[slot-1]->active)return;
+        binding=bindings[slot-1];
+    }
+    std::lock_guard<std::mutex> lock(binding->mutex);
+    if(binding->sizeKnown&&binding->halfWidth==halfWidth&&binding->halfHeight==halfHeight)return;
+    binding->halfWidth=halfWidth;binding->halfHeight=halfHeight;
+    binding->sizeKnown=true;
+    /* Any change is worth announcing, including the first: the instance's size
+       genuinely stopped being the type's declared default. */
+    notifyResize(*binding);
+}
 /* Every live instance of the current board hears that the game is about to write
    a circuit out.  The callbacks run with their own binding lock held (like
    on_create) but the registry lock is released first, so a callback may submit
@@ -717,7 +1250,13 @@ inline void releaseInstances(const std::set<std::pair<uint64_t,uint64_t>>* survi
     }
     for(auto& binding:dropped) {
         std::lock_guard<std::mutex> lock(binding->mutex);
-        notifyDestroy(*binding);
+        /* Two different events share this path: a compile that no longer contains
+           the instance means the player deleted it (TC_LOGIC_DESTROY), while
+           "everything" (survivors == null) means the board itself went away -
+           leaving the level, or the loader shutting down - and the component is
+           still out there in the schematic (TC_LOGIC_UNBIND). */
+        if(survivors)notifyDestroy(*binding);
+        else notifyUnbind(*binding);
     }
     if(!dropped.empty())
         note("released "+std::to_string(dropped.size())+" instance(s) ("+reason+")");
@@ -748,6 +1287,44 @@ inline int instanceValidate(const TCComponentInstanceHandle* handle) {
     std::shared_ptr<Binding> binding;
     return instanceMatches(handle,binding)?TC_COMPONENT_INSTANCES_OK
                                          :TC_COMPONENT_INSTANCES_ERR_STALE;
+}
+/* tc.component.instances V2: the id the game addresses this component by when
+   it is selected or walked from the top.  Captured by the compile walk (see
+   Binding::topLevel), so this is a lookup, not a re-read of the board - an
+   instance handle only exists for a component that walk bound. */
+inline int instanceTopLevelId(const TCComponentInstanceHandle* handle,uint64_t* out) {
+    if(!handle||!out)return TC_COMPONENT_INSTANCES_ERR_ARGUMENT;
+    *out=0;
+    std::lock_guard<std::mutex> lock(registryMutex);
+    for(auto& binding:bindings) {
+        if(!binding||!binding->active)continue;
+        if(binding->definition->api.custom_id!=handle->custom_id)continue;
+        if(binding->instance!=handle->instance_id)continue;
+        if(binding->generation!=handle->generation)return TC_COMPONENT_INSTANCES_ERR_STALE;
+        *out=binding->topLevel?binding->topLevel:binding->instance;
+        return TC_COMPONENT_INSTANCES_OK;
+    }
+    return TC_COMPONENT_INSTANCES_ERR_STALE;
+}
+/* Builds the handle for an instance the host is already naming by its
+   (custom id, board id) pair - the way the component drawer and the editor rows
+   identify what they are showing.  False when no live binding carries that
+   pair, so the caller keeps its "not bound yet" path instead of inventing a
+   generation. */
+inline bool instanceHandleOf(uint64_t customId,uint64_t instance,
+                             TCComponentInstanceHandle* out) {
+    if(!out)return false;
+    std::lock_guard<std::mutex> lock(registryMutex);
+    const auto found=bindingKeys.find(std::make_pair(customId,instance));
+    if(found==bindingKeys.end())return false;
+    const size_t slot=static_cast<size_t>(found->second);
+    if(slot==0||slot>bindings.size()||!bindings[slot-1]||!bindings[slot-1]->active)return false;
+    out->size=sizeof(*out);
+    out->version=TC_COMPONENT_INSTANCES_API_VERSION_1;
+    out->custom_id=customId;
+    out->instance_id=instance;
+    out->generation=bindings[slot-1]->generation;
+    return true;
 }
 inline int instanceEnumerate(uint64_t custom_id,TCComponentInstanceHandle* out,uint32_t capacity,
                              uint32_t* written,uint32_t* total) {
@@ -1337,9 +1914,18 @@ using CompileRun=void(*)(void*,void*,void*);
 inline AddCircuit originalCircuit=nullptr;
 inline AddLine originalLine=nullptr;
 inline CompileRun originalCompile=nullptr;
+using JitRun=void(*)(void*,int64_t);
+inline JitRun originalJit=nullptr;
 struct Emission {
     // One entry per node that will be replaced, keyed by its node index.
-    struct Role {uint64_t token=0;uint32_t index=0;bool first=false;bool collector=false;};
+    struct Role {
+        uint64_t token=0;
+        uint32_t index=0;
+        bool first=false;
+        bool collector=false;
+        bool triState=false;
+        bool clockedTick=false;
+    };
     // Per compiled instance: the shape the definition declares.
     struct Instance {
         uint64_t custom=0;                 /* the prototype this instance refers to */
@@ -1347,7 +1933,21 @@ struct Emission {
         std::array<uint32_t,kMaxBridgeInputs> widths{};
         std::array<uint32_t,kMaxBridgeOutputs> outWidths{};
         std::vector<std::string> operands;
+        /* One scalar per input: 1 means the whole pin is driven, 0 means Z.
+           The pinned game exposes one Z flag for a word net, not one per bit. */
+        std::vector<std::string> drives;
+        bool v3=false;
         bool generated=false;
+        bool preciseDependencies=false;
+        bool clockedTick=false;
+        std::vector<uint32_t> outputDependencies;
+        std::vector<std::string> inlinePrefixes;
+        std::vector<std::string> inlineExpressions;
+        /* One shared SSA prefix per dependency group and host phase.  Canonical
+           declarations can also occur in several different groups; keep their
+           names so the first actual schedule point becomes the sole definition. */
+        std::set<uint64_t> inlineGroups;
+        std::set<std::string> inlineDeclarations;
         bool ready=false,failed=false;
         std::set<uint64_t> warned;
     };
@@ -1355,8 +1955,19 @@ struct Emission {
     std::unordered_map<uint64_t,Role> nodes;
     std::map<uint64_t,Instance> instances;
     std::unordered_map<uint64_t,DynamicConstant> constants;
+    std::set<uint64_t> drivenNets;
+    std::set<uint64_t> refreshDrivenNets;
+    std::set<uint64_t> refreshNetCandidates;
     Role current{};
     bool currentValid=false;
+    Role triRole{};
+    bool triRewriteValid=false;
+    bool triEnableDone=false;
+    uint32_t triValueWrites=0;
+    uint32_t triSkipDepth=0;
+    std::string triNet;
+    bool triRefresh=false;
+    bool triPendingRefresh=false;
     DynamicConstant currentConstant{};
     bool currentConstantValid=false;
     uint32_t mode=0;
@@ -1372,7 +1983,7 @@ inline std::set<uint64_t> reportedMissing;
 // points at the owning custom instance, while an instance's pin helpers use
 // kind 0x50.
 inline bool logicGateKind(uint8_t kind) {
-    return (kind>=0x03&&kind<=0x0b)||(kind>=0x12&&kind<=0x1e)||kind==0x2a;
+    return (kind>=0x03&&kind<=0x0c)||(kind>=0x12&&kind<=0x1e)||kind==0x2a;
 }
 inline size_t matchParen(const std::string& text,size_t open) {
     int depth=0;
@@ -1412,6 +2023,64 @@ inline std::vector<std::string> operandTuple(const std::string& text,size_t begi
     }
     return operands;
 }
+inline void observeDriveNets(Emission& context,const std::string& text) {
+    for(const char* marker:{"let zid","var zid"}) {
+        for(size_t pos=0;(pos=text.find(marker,pos))!=std::string::npos;++pos) {
+            size_t first=pos+std::strlen(marker),end=first;
+            while(end<text.size()&&text[end]>='0'&&text[end]<='9')++end;
+            if(end>first)context.drivenNets.insert(std::strtoull(text.substr(first,end-first).c_str(),nullptr,10));
+            pos=end;
+        }
+    }
+    /* In refresh code a resolved tri-state net is persisted as value slot N
+       and drive slot N-1.  `var vidN` and its AND accumulator may arrive in
+       separate add_line calls, so remember candidates until both are seen. */
+    for(size_t pos=0;(pos=text.find("var vid",pos))!=std::string::npos;++pos) {
+        size_t first=pos+7,end=first;
+        while(end<text.size()&&text[end]>='0'&&text[end]<='9')++end;
+        if(end==first){pos=end;continue;}
+        const uint64_t id=std::strtoull(text.substr(first,end-first).c_str(),nullptr,10);
+        context.refreshNetCandidates.insert(id);
+        pos=end;
+    }
+    for(size_t pos=0;(pos=text.find("and_field_id",pos))!=std::string::npos;++pos) {
+        size_t first=pos+12,end=first;
+        while(end<text.size()&&text[end]>='0'&&text[end]<='9')++end;
+        if(end>first) {
+            const uint64_t id=std::strtoull(text.substr(first,end-first).c_str(),nullptr,10);
+            if(context.refreshNetCandidates.count(id))context.refreshDrivenNets.insert(id);
+        }
+        pos=end;
+    }
+}
+inline std::string driveOperand(const Emission& context,const std::string& operand,bool refresh) {
+    if(refresh) {
+        const std::string marker="#SIMULATION_STATE + ";
+        const size_t pos=operand.find(marker);
+        if(pos!=std::string::npos) {
+            size_t first=pos+marker.size(),end=first;
+            while(end<operand.size()&&operand[end]>='0'&&operand[end]<='9')++end;
+            if(end>first) {
+                const uint64_t id=std::strtoull(operand.substr(first,end-first).c_str(),nullptr,10);
+                if(context.refreshDrivenNets.count(id)&&id)
+                    return "load(<U1>, #SIMULATION_STATE + "+std::to_string(id-1)+")";
+            }
+        }
+        return "1";
+    }
+    if(operand.rfind("vid",0)==0) {
+        const uint64_t id=std::strtoull(operand.c_str()+3,nullptr,10);
+        if(context.drivenNets.count(id))return "zid"+std::to_string(id);
+    }
+    return "1";
+}
+
+inline bool outputGroupLeader(const std::vector<uint32_t>& dependencies,uint32_t output) {
+    if(output>=dependencies.size())return true;
+    for(uint32_t prior=0;prior<output;++prior)
+        if(dependencies[prior]==dependencies[output])return false;
+    return true;
+}
 
 inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
     Emission context;
@@ -1423,12 +2092,29 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
        a lifecycle callback is plugin code and may call back into a service that
        takes the same lock. */
     std::vector<std::shared_ptr<Binding>> createdBindings;
+    /* Every instance that is part of this compile (new or already bound): the
+       TC_LOGIC_COMPILE notification goes to all of them once the generator has
+       produced the code below. */
+    std::vector<std::shared_ptr<Binding>> compiledBindings;
     // The code generator receives the flattened component sequence as arg 2.
     const auto count=read64(b,0),data=read64(b,8);
     if(count<=1000000 && data) {
         auto node=[&](size_t i){return reinterpret_cast<const unsigned char*>(data+8+i*0x238);};
         std::unordered_map<uint64_t,size_t> parents;
-        for(size_t i=0;i<count;++i)if(node(i)[0]==0x4e)parents.emplace(read64(node(i),8),i);
+        /* The compile walk also learns which component each custom instance
+           belongs to: record +0x18 is the id the game addresses when it is
+           selected or walked from the top, and every component placed directly
+           on the board carries its own id there.  This map is what
+           tc.component.instances V2 answers from (and what the diagnostic file
+           below prints). */
+        std::vector<ComponentNode> customs;
+        for(size_t i=0;i<count;++i)
+            if(node(i)[0]==0x4e) {
+                const uint64_t id=read64(node(i),8);
+                parents.emplace(id,i);
+                customs.push_back(ComponentNode{0x4e,id,read64(node(i),0x18)});
+            }
+        const auto containers=containerMap(customs);
         for(size_t i=0;i<count;++i) {
             const auto* component=node(i);
             if(component[0]!=0x2e)continue;
@@ -1461,9 +2147,13 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
         {
             std::ofstream mapping("interactive-map.txt", std::ios::trunc);
             if(mapping){
+                /* Node order, like before: the file is a diagnostic a human
+                   reads, and a stable order keeps two runs diffable. */
                 for(size_t i=0;i<count;++i){
                     if(node(i)[0]!=0x4e)continue;
-                    mapping<<std::hex<<read64(node(i),8)<<" "<<read64(node(i),0x18)<<"\n";
+                    const uint64_t id=read64(node(i),8);
+                    const auto found=containers.find(id);
+                    mapping<<std::hex<<id<<" "<<(found==containers.end()?id:found->second)<<"\n";
                 }
             }
         }
@@ -1487,14 +2177,24 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
             auto instance=read64(node(parentIndex),8);
             // Every output pin of the component needs one gate driving it, and
             // those gates are emitted before their consumers.
-            const bool generated=def->second->api.version==3;
-            // The generated scaffold is: n input collectors, n-1 dependency
-            // gates, then one driver per output.  A source (no inputs) has no
-            // collectors and no chain, so its prefix is 0 rather than 2n-1.  A
-            // sink (no outputs) has one extra driver node with an unconnected
-            // output: that node is what runs the callback.
-            const size_t prefix=generated?(def->second->inputs?2*def->second->inputs-1:0):0;
+            const bool generated=def->second->api.version>=3;
+            // The legacy generated scaffold has one all-input chain.  A precise
+            // scaffold has one collector per input followed by the private
+            // dependency gates of every output cone, then independent drivers.
+            const bool precise=generated&&!def->second->outputDependencies.empty();
+            size_t dependencyGates=0;
+            if(precise)for(uint32_t mask:def->second->outputDependencies) {
+                unsigned count=0;
+                while(mask){mask&=mask-1;++count;}
+                if(count>1)dependencyGates+=count-1;
+            }
+            if(precise&&def->second->clockedTick&&def->second->inputs>1)
+                dependencyGates+=def->second->inputs-1;
+            const size_t prefix=generated?
+                (precise?def->second->inputs+dependencyGates:
+                         (def->second->inputs?2*def->second->inputs-1:0)):0;
             const size_t expected=prefix+def->second->outputs+
+                                  ((precise&&def->second->clockedTick)?1:0)+
                                   ((generated&&def->second->outputs==0)?1:0);
             if(nodesOfInstance.size()!=expected) {
                 note("instance "+hex64(instance)+" of custom "+hex64(custom)+" has "+
@@ -1504,12 +2204,24 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
             }
             auto key=std::make_pair(custom,instance);
             auto found=bindingKeys.find(key);
+            /* The game's own top-level id for this instance, learned by this
+               compile's walk: `tc.component.instances` V2 hands it back so a
+               Mod never has to parse the diagnostic file. */
+            const auto container=containers.find(instance);
+            const uint64_t topLevel=container==containers.end()?instance:container->second;
             uint64_t token;
-            if(found!=bindingKeys.end())token=found->second;
+            if(found!=bindingKeys.end()){
+                token=found->second;
+                const size_t existing=static_cast<size_t>(token-1);
+                if(existing<bindings.size()&&bindings[existing])
+                    bindings[existing]->topLevel=topLevel;
+            }
             else {auto binding=std::make_shared<Binding>();binding->definition=def->second;binding->instance=instance;
+                binding->topLevel=topLevel;
                 /* V1 definitions keep the historical eight state words; a V2
                    definition says how many it wants (0 = stateless). */
-                binding->state.assign(def->second->useV2?def->second->stateWords:8,0);
+                binding->state.assign((def->second->useV2||def->second->useV3)?def->second->stateWords:8,0);
+                binding->refreshState.assign(binding->state.size(),0);
                 binding->config=def->second->defaultConfig;
                 /* A duplicated instance starts from the source's configuration
                    (the copy is already in its record) and says so on this bind. */
@@ -1540,14 +2252,32 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
             std::sort(nodesOfInstance.begin(),nodesOfInstance.end());
             for(size_t k=0;k<nodesOfInstance.size();++k) {
                 if(generated && k<def->second->inputs)
-                    context.nodes.emplace(nodesOfInstance[k],Emission::Role{token,static_cast<uint32_t>(k),false,true});
-                else if(k>=prefix)
-                    context.nodes.emplace(nodesOfInstance[k],Emission::Role{token,static_cast<uint32_t>(k-prefix),k==prefix,false});
+                    context.nodes.emplace(nodesOfInstance[k],Emission::Role{
+                        token,static_cast<uint32_t>(k),false,true,false,false});
+                else if(k>=prefix&&k<prefix+def->second->outputs) {
+                    const uint32_t output=static_cast<uint32_t>(k-prefix);
+                    context.nodes.emplace(nodesOfInstance[k],Emission::Role{
+                        token,output,precise?
+                            (def->second->groupedOutputs?
+                                outputGroupLeader(def->second->outputDependencies,output):true):
+                            k==prefix,false,
+                        def->second->useV3,false});
+                }
+                else if(precise&&def->second->clockedTick&&
+                        k==prefix+def->second->outputs)
+                    context.nodes.emplace(nodesOfInstance[k],Emission::Role{
+                        token,0,true,false,false,true});
             }
     auto& state=context.instances[token];
     state.generated=generated;
     state.custom=custom;
-            if(generated)state.operands.resize(def->second->inputs);
+            if(generated){state.operands.resize(def->second->inputs);state.drives.resize(def->second->inputs);}
+            state.v3=def->second->useV3;
+            state.preciseDependencies=precise;
+            state.clockedTick=def->second->clockedTick;
+            state.outputDependencies=def->second->outputDependencies;
+            state.inlinePrefixes=def->second->inlinePrefixes;
+            state.inlineExpressions=def->second->inlineExpressions;
             state.inputs=def->second->inputs;state.outputs=def->second->outputs;
             state.widths=def->second->inputWidths;
             state.outWidths=def->second->outputWidths;
@@ -1571,6 +2301,18 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
     program compiles too, and it contains none of them - releasing on that
     would tear down live instances on every level load). */
  if(!survivingKeys.empty()) releaseInstances(&survivingKeys,"board recompiled");
+    {
+        /* The instances this compile carries, looked up after the release above
+           so a key that did not survive cannot be announced. */
+        std::lock_guard<std::mutex> lock(registryMutex);
+        for(const auto& key:survivingKeys) {
+            const auto found=bindingKeys.find(key);
+            if(found==bindingKeys.end())continue;
+            const size_t slot=static_cast<size_t>(found->second);
+            if(slot==0||slot>bindings.size()||!bindings[slot-1]||!bindings[slot-1]->active)continue;
+            compiledBindings.push_back(bindings[slot-1]);
+        }
+    }
     for(auto& binding:createdBindings) {
         std::lock_guard<std::mutex> lock(binding->mutex);
         notifyCreate(*binding);
@@ -1586,14 +2328,21 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
     auto* previous=emission;emission=&context;
     originalCircuit(a,b,c,d,e,f);
     emission=previous;
+    /* The generator has produced this compile's code, so every instance that was
+       part of it hears TC_LOGIC_COMPILE - after its create/clone/load, so a
+       callback can rely on the instance being fully bound. */
+    for(auto& binding:compiledBindings) {
+        std::lock_guard<std::mutex> lock(binding->mutex);
+        notifyCompile(*binding);
+    }
     if(context.rewritten && logger)logger("Native logic: emitted "+std::to_string(context.rewritten)+" callback(s), mode="+std::to_string(c));
 }
 // Word-width result of an output pin.  Foreign call results survive the JIT only
 // as single bits, so the callback publishes its output bits into reserved
 // simulation-state slots and the generated program loads and assembles them,
 // mirroring the way the game's own word components read their inputs.
-inline std::string wordAssembly(const std::string& type,uint64_t token,uint32_t pin,
-                               uint32_t width,const std::string& prefix) {
+inline std::string wordValueExpression(const std::string& type,uint64_t token,uint32_t pin,
+                                       uint32_t width) {
     std::string bits;
     for(uint32_t bit=0;bit<width&&bit<64;++bit) {
         std::string term="((("+type+" (load(<U1>, #SIMULATION_STATE + "+
@@ -1602,18 +2351,336 @@ inline std::string wordAssembly(const std::string& type,uint64_t token,uint32_t 
         if(bit)bits+=" | ";
         bits+=term;
     }
-    return prefix+type+" ("+bits+")";
+    return type+" ("+bits+")";
+}
+inline std::string wordAssembly(const std::string& type,uint64_t token,uint32_t pin,
+                               uint32_t width,const std::string& prefix) {
+    return prefix+wordValueExpression(type,token,pin,width);
+}
+inline void replaceAll(std::string& text,const std::string& marker,
+                       const std::string& replacement) {
+    size_t at=0;
+    while((at=text.find(marker,at))!=std::string::npos) {
+        text.replace(at,marker.size(),replacement);
+        at+=replacement.size();
+    }
+}
+inline std::string instantiateInline(const Emission::Instance& instance,uint64_t token,
+                                     uint32_t output,bool prefix) {
+    const auto& programs=prefix?instance.inlinePrefixes:instance.inlineExpressions;
+    if(output>=programs.size())return {};
+    std::string result=programs[output];
+    replaceAll(result,"@T@",std::to_string(token));
+    for(uint32_t input=0;input<instance.inputs;++input)
+        replaceAll(result,"@"+std::to_string(input)+"@",
+                   input<instance.operands.size()&&!instance.operands[input].empty()?
+                       instance.operands[input]:"U64 0");
+    return result;
+}
+inline std::string instantiateInlinePrefixOnce(Emission::Instance& instance,uint64_t token,
+                                                uint32_t output,bool refresh) {
+    const uint32_t mask=output<instance.outputDependencies.size()?
+        instance.outputDependencies[output]:~uint32_t(0);
+    const uint64_t key=uint64_t(mask)|(uint64_t(refresh?1u:0u)<<32);
+    if(!instance.inlineGroups.insert(key).second)return {};
+    const std::string prefix=instantiateInline(instance,token,output,true);
+    std::string result;
+    size_t begin=0;
+    while(begin<prefix.size()) {
+        size_t end=prefix.find("\nvar ",begin);
+        if(end==std::string::npos)end=prefix.size();
+        else ++end; /* The newline belongs to the previous declaration block. */
+        const std::string block=prefix.substr(begin,end-begin);
+        const size_t firstEnd=block.find('\n');
+        const std::string line=block.substr(0,firstEnd);
+        bool emit=true;
+        if(line.rfind("var ",0)==0) {
+            const size_t nameEnd=line.find(' ',4);
+            if(nameEnd!=std::string::npos) {
+                const std::string declaration=(refresh?"r:":"c:")+line.substr(4,nameEnd-4);
+                emit=instance.inlineDeclarations.insert(declaration).second;
+            }
+        }
+        if(emit&&!block.empty()) {
+            result+=block;
+            if(result.back()!='\n')result+='\n';
+        }
+        begin=end;
+    }
+    return result;
+}
+using PayloadExpressions = std::array<std::string,kMaxInputWords>;
+inline PayloadExpressions packedExpressions(const Emission::Instance& instance,
+                                             bool drivePlane,
+                                             uint32_t dependencyMask=~uint32_t(0)) {
+    PayloadExpressions payload;
+    std::array<uint32_t,kMaxBridgeInputs> word{},shift{};
+    placeInputs(instance.widths,static_cast<uint32_t>(instance.operands.size()),word,shift);
+    for(size_t i=0;i<instance.operands.size();++i) {
+        if(i<32&&(dependencyMask&(uint32_t(1)<<static_cast<uint32_t>(i)))==0)continue;
+        std::string source=instance.operands[i];
+        if(drivePlane) {
+            source=i<instance.drives.size()&&!instance.drives[i].empty()?instance.drives[i]:"1";
+            const uint32_t bits=instance.widths[i];
+            const uint64_t mask=bits>=64?~uint64_t(0):((uint64_t(1)<<bits)-1);
+            source="(U64 ("+source+") * U64 "+hex64(mask)+")";
+        }
+        std::string term="U64 ("+source+")";
+        if(shift[i])term="("+term+" << "+std::to_string(shift[i])+")";
+        payload[word[i]]+=(payload[word[i]].empty()?"":" | ")+term;
+        if(shift[i]+instance.widths[i]>64) {
+            const std::string high="(U64 ("+source+") >> "+std::to_string(64-shift[i])+")";
+            payload[word[i]+1]+=(payload[word[i]+1].empty()?"":" | ")+high;
+        }
+    }
+    return payload;
+}
+inline uint32_t payloadWordCount(const Emission::Instance& instance,
+                                 uint32_t dependencyMask=~uint32_t(0)) {
+    uint32_t bit=0,highest=0;
+    for(uint32_t i=0;i<instance.inputs;++i) {
+        const uint32_t end=bit+instance.widths[i];
+        if(i<32&&(dependencyMask&(uint32_t(1)<<i))!=0)highest=end;
+        bit=end;
+    }
+    return (highest+kInputWordBits-1)/kInputWordBits;
+}
+inline std::string invokeExpression(uint64_t token,bool refresh,
+                                    const PayloadExpressions& payload,bool tickOnly=false) {
+    const std::string cycleArg="cycle"+std::string(refresh?"":" + 1");
+    std::ostringstream call;
+    call<<"game_engine.'"<<(refresh?"tc_logic_peek":
+                             (tickOnly?"tc_logic_tick":"tc_logic_invoke"))
+        <<"'(U64 "<<token<<", U64 ("<<cycleArg<<"), "
+        <<(payload[0].empty()?"U64 0":payload[0])<<", "
+        <<(payload[1].empty()?"U64 0":payload[1])<<")";
+    return call.str();
+}
+inline std::string invokeOutputExpression(uint64_t token,bool refresh,uint32_t output,
+                                          const PayloadExpressions& payload) {
+    const std::string cycleArg="cycle"+std::string(refresh?"":" + 1");
+    std::ostringstream call;
+    call<<"game_engine.'tc_logic_output'(U64 "<<token
+        <<", U64 ((("<<cycleArg<<") + 1) * 32 + "<<output<<"), "
+        <<(payload[0].empty()?"U64 0":payload[0])<<", "
+        <<(payload[1].empty()?"U64 0":payload[1])<<")";
+    return call.str();
+}
+inline std::string latchDriveStatement(uint64_t token,
+                                       const PayloadExpressions& drivePayload,
+                                       const std::string& suffix={}) {
+    return "var tc_zin"+std::to_string(token)+suffix+
+           " = U1 game_engine.'tc_logic_drive_in'(U64 "+
+           std::to_string(token)+", "+(drivePayload[0].empty()?"U64 0":drivePayload[0])+", "+
+           (drivePayload[1].empty()?"U64 0":drivePayload[1])+")\n";
+}
+inline std::string stageStatements(uint64_t token,bool refresh,
+                                   const PayloadExpressions& payload,uint32_t words,
+                                   bool drivePlane,const std::string& suffix={}) {
+    const uint32_t chunks=(words+kInputWordsPerCall-1)/kInputWordsPerCall;
+    const std::string cycleArg="cycle"+std::string(refresh?"":" + 1");
+    const char* function=drivePlane?"tc_logic_drive_stage":"tc_logic_stage";
+    const char plane=drivePlane?'d':'v';
+    std::string result;
+    for(uint32_t chunk=0;chunk<chunks;++chunk) {
+        const uint32_t lo=chunk*kInputWordsPerCall,hi=lo+1;
+        result+="var tc_is"+std::to_string(token)+suffix+plane+(refresh?'r':'c')+
+                std::to_string(chunk)+" = U1 game_engine.'"+function+"'(U64 "+
+                std::to_string(token)+", U64 ((("+cycleArg+") + 1) * 32 + "+
+                std::to_string((refresh?16u:0u)+chunk)+"), "+
+                (payload[lo].empty()?"U64 0":payload[lo])+", "+
+                (payload[hi].empty()?"U64 0":payload[hi])+")\n";
+    }
+    return result;
+}
+struct InvocationText {std::string prefix,expression;};
+inline bool dependencyOperandsReady(const Emission::Instance& instance,uint32_t output,
+                                    bool requireDrive,bool wholeComponent=false) {
+    const uint32_t mask=instance.preciseDependencies&&!wholeComponent&&
+                        output<instance.outputDependencies.size()?
+        instance.outputDependencies[output]:~uint32_t(0);
+    if(instance.operands.size()!=instance.inputs)return false;
+    if(requireDrive&&instance.drives.size()!=instance.inputs)return false;
+    for(uint32_t input=0;input<instance.inputs;++input) {
+        if(input<32&&(mask&(uint32_t(1)<<input))==0)continue;
+        if(instance.operands[input].empty())return false;
+        if(requireDrive&&instance.drives[input].empty())return false;
+    }
+    return true;
+}
+inline InvocationText invocationText(const Emission::Instance& instance,uint64_t token,
+                                     bool refresh,uint32_t output=0,
+                                     bool wholeComponent=false) {
+    const bool independent=instance.preciseDependencies&&!wholeComponent;
+    const uint32_t mask=independent&&output<instance.outputDependencies.size()?
+        instance.outputDependencies[output]:~uint32_t(0);
+    const auto values=packedExpressions(instance,false,mask);
+    const uint32_t words=payloadWordCount(instance,mask);
+    const std::string suffix=independent?"o"+std::to_string(output):
+                             (wholeComponent?"t":std::string());
+    if(words<=kInputWordsPerCall) {
+        const std::string prefix=instance.v3?
+            latchDriveStatement(token,packedExpressions(instance,true,mask),suffix):std::string();
+        return {prefix,independent?
+            invokeOutputExpression(token,refresh,output,values):
+            invokeExpression(token,refresh,values,wholeComponent&&!refresh)};
+    }
+    const uint32_t chunks=(words+kInputWordsPerCall-1)/kInputWordsPerCall;
+    std::string prefix=stageStatements(token,refresh,values,words,false,suffix);
+    if(instance.v3)
+        prefix+=stageStatements(token,refresh,packedExpressions(instance,true,mask),words,true,suffix);
+    const std::string cycleArg="cycle"+std::string(refresh?"":" + 1");
+    std::ostringstream call;
+    if(independent)
+        call<<"game_engine.'"<<(refresh?"tc_logic_output_peek_staged":"tc_logic_output_staged")
+            <<"'(U64 "<<token<<", U64 ("<<cycleArg<<"), U64 "<<chunks<<", U64 "
+            <<output<<")";
+    else
+        call<<"game_engine.'"<<(refresh?"tc_logic_peek_staged":
+                                 (wholeComponent?"tc_logic_tick_staged":
+                                                  "tc_logic_invoke_staged"))
+            <<"'(U64 "<<token<<", U64 ("<<cycleArg<<"), U64 "<<chunks<<", U64 0)";
+    return {prefix,call.str()};
+}
+inline void eraseGeneratedLine(std::string& text,size_t at) {
+    if(at==std::string::npos)return;
+    const size_t begin=at==0?0:text.rfind('\n',at-1)+1;
+    const size_t newline=text.find('\n',at);
+    const size_t end=newline==std::string::npos?text.size():newline+1;
+    text.erase(begin,end-begin);
+}
+inline bool erasePendingTriStateBlock(Emission& context,std::string& text) {
+    if(context.triSkipDepth==0)return false;
+    for(size_t i=0;i<text.size();++i) {
+        if(text[i]=='{')++context.triSkipDepth;
+        else if(text[i]=='}'&&--context.triSkipDepth==0) {
+            const size_t newline=text.find('\n',i);
+            text.erase(0,newline==std::string::npos?text.size():newline+1);
+            return false;
+        }
+    }
+    text.clear();
+    return true;
+}
+inline void rewriteTriStateContinuation(Emission& context,std::string& text) {
+    if(!context.triRewriteValid)return;
+    if(erasePendingTriStateBlock(context,text)||text.empty())return;
+    auto found=context.instances.find(context.triRole.token);
+    if(found==context.instances.end())return;
+    const auto& instance=found->second;
+    const auto& role=context.triRole;
+    const uint32_t width=role.index<instance.outWidths.size()?instance.outWidths[role.index]:1;
+    const std::string type="U"+std::to_string(width<=1?1:width<=8?8:width<=16?16:width<=32?32:64);
+    const bool inlineOutput=role.index<instance.inlineExpressions.size();
+    const std::string outputValue=inlineOutput?
+        type+" ("+instantiateInline(instance,role.token,role.index,false)+")":
+        (width<=1?
+            "U1 game_engine.'tc_logic_out'(U64 "+std::to_string(role.token)+", U64 "+
+                std::to_string(role.index)+")":
+            wordValueExpression(type,role.token,role.index,width));
+    const std::string vid="vid"+context.triNet;
+    const std::string andField="and_field_id"+context.triNet;
+    /* Inline expressions are a single, permanently driven source.  The stock
+       Switch wrapper still emits the generic tri-state merge (OR, AND,
+       contention check and Z comparison) around it.  In CYCLE mode publish the
+       value directly and make that generic path statically unreachable. */
+    if(inlineOutput&&!context.triRefresh) {
+        const std::string declaration="var "+vid;
+        const size_t declared=text.find(declaration);
+        if(declared!=std::string::npos) {
+            const size_t equal=text.find('=',declared+declaration.size());
+            const size_t end=equal==std::string::npos?std::string::npos:text.find('\n',equal);
+            if(equal!=std::string::npos)
+                text.replace(equal+1,(end==std::string::npos?text.size():end)-(equal+1),
+                             " "+outputValue);
+        }
+        const std::string andDeclaration="var "+andField;
+        const size_t andAt=text.find(andDeclaration);
+        if(andAt!=std::string::npos) {
+            const size_t equal=text.find('=',andAt+andDeclaration.size());
+            const size_t end=equal==std::string::npos?std::string::npos:text.find('\n',equal);
+            if(equal!=std::string::npos)
+                text.replace(equal+1,(end==std::string::npos?text.size():end)-(equal+1)," "+vid);
+        }
+        if(!context.triEnableDone) {
+            const size_t search=declared==std::string::npos?0:declared+declaration.size();
+            const size_t condition=text.find("if ",search);
+            const size_t brace=condition==std::string::npos?std::string::npos:
+                               text.find('{',condition);
+            if(condition!=std::string::npos&&brace!=std::string::npos) {
+                context.triEnableDone=true;
+                context.triSkipDepth=1;
+                eraseGeneratedLine(text,condition);
+                if(erasePendingTriStateBlock(context,text)||text.empty())return;
+            }
+        }
+        const std::string conflict="if "+vid+" > "+andField;
+        const size_t conflictAt=text.find(conflict);
+        if(conflictAt!=std::string::npos) {
+            context.triSkipDepth=1;
+            eraseGeneratedLine(text,conflictAt);
+            if(erasePendingTriStateBlock(context,text)||text.empty())return;
+        }
+        const std::string driven="let zid"+context.triNet+" = ";
+        const size_t drivenAt=text.find(driven);
+        if(drivenAt!=std::string::npos) {
+            const size_t begin=drivenAt+driven.size(),end=text.find('\n',begin);
+            text.replace(begin,(end==std::string::npos?text.size():end)-begin,"true");
+        }
+        eraseGeneratedLine(text,text.find(andDeclaration));
+        context.triValueWrites=2;
+        return;
+    }
+    if(!context.triEnableDone) {
+        const std::string declaration="var vid"+context.triNet;
+        const size_t declared=text.find(declaration);
+        const size_t search=declared==std::string::npos?0:declared+declaration.size();
+        const size_t condition=text.find("if ",search);
+        const size_t brace=condition==std::string::npos?std::string::npos:text.find('{',condition);
+        if(condition!=std::string::npos&&brace!=std::string::npos) {
+            text.replace(condition+3,brace-(condition+3),inlineOutput?"U1 1 != 0 ":
+                "(U1 game_engine.'tc_logic_drive_out'(U64 "+std::to_string(role.token)+
+                ", U64 "+std::to_string(role.index)+")) != 0 ");
+            context.triEnableDone=true;
+        }
+    }
+    if(context.triRefresh) {
+        if(context.triValueWrites==0) {
+            const size_t value=text.find("let value = ");
+            if(value!=std::string::npos) {
+                const size_t end=text.find('\n',value);
+                text.replace(value+12,(end==std::string::npos?text.size():end)-(value+12),outputValue);
+                context.triValueWrites=1;
+            }
+        }
+    } else {
+        for(const std::string& marker:{"vid"+context.triNet+" |= ",
+                                      "and_field_id"+context.triNet+" &= "}) {
+            if(context.triValueWrites>=2)break;
+            const size_t value=text.find(marker);
+            if(value==std::string::npos)continue;
+            const size_t begin=value+marker.size(),end=text.find('\n',begin);
+            text.replace(begin,(end==std::string::npos?text.size():end)-begin,outputValue);
+            ++context.triValueWrites;
+        }
+    }
 }
 
 // Borrowed Nim string payload: the callee only reads/copies this line.
 inline void line(const TCNimString* value,void* context) {
     if(!emission || !value || !value->data || value->length>1000000){originalLine(value,context);return;}
     std::string text(static_cast<const char*>(value->data)+8,value->length);
+    observeDriveNets(*emission,text);
     auto comment=text.find("// ");
+    if(comment!=std::string::npos&&emission->triRewriteValid) {
+        emission->triRewriteValid=false;
+        emission->triSkipDepth=0;
+    }
     if(comment!=std::string::npos) {
         std::istringstream in(text.substr(comment+3));uint64_t index;
         emission->currentValid=false;
         emission->currentConstantValid=false;
+        emission->triPendingRefresh=false;
         if(in>>index){
             auto it=emission->nodes.find(index);
             if(it!=emission->nodes.end()){emission->current=it->second;emission->currentValid=true;}
@@ -1624,6 +2691,17 @@ inline void line(const TCNimString* value,void* context) {
             }
         }
     }
+    if(emission->currentValid&&emission->current.triState&&
+       text.find("store(#SIMULATION_STATE")!=std::string::npos)
+        emission->triPendingRefresh=true;
+    if(emission->triRewriteValid) {
+        rewriteTriStateContinuation(*emission,text);
+        std::vector<char> payload(8+text.size()+1);
+        const uint64_t capacity=uint64_t(text.size())|(uint64_t(1)<<62);
+        memcpy(payload.data(),&capacity,8);memcpy(payload.data()+8,text.data(),text.size());
+        TCNimString rewritten{uint64_t(text.size()),payload.data()};originalLine(&rewritten,context);
+        return;
+    }
     if(emission->currentConstantValid) {
         const auto eq=text.find(" = ");
         const bool refresh=text.find("let value_id")!=std::string::npos;
@@ -1632,10 +2710,15 @@ inline void line(const TCNimString* value,void* context) {
             const auto constant=emission->currentConstant;
             const std::string type=constant.width<=8?"U8":constant.width<=16?"U16":
                                    constant.width<=32?"U32":"U64";
-            std::ostringstream call;
-            call<<type<<" game_engine.'tc_dynamic_constant'(U64 "<<constant.component
-                <<", U64 "<<constant.value<<")";
-            text=text.substr(0,eq+3)+call.str();
+            /* The pinned Windows x64 JIT's aligned load is the native relaxed
+               atomic read.  Resolve and allocate only during compilation;
+               edits publish to this same permanent slot without recompiling. */
+            static_assert(std::atomic<uint64_t>::is_always_lock_free);
+            static_assert(sizeof(std::atomic<uint64_t>)==sizeof(uint64_t));
+            const auto slot=reinterpret_cast<uintptr_t>(
+                dynamicConstantSlot(constant.component,constant.value));
+            text=text.substr(0,eq+3)+type+" load(<U64>, Ptr "+std::to_string(slot)+
+                ") // runtime constant "+std::to_string(constant.component);
             std::vector<char> payload(8+text.size()+1);
             const uint64_t capacity=uint64_t(text.size())|(uint64_t(1)<<62);
             memcpy(payload.data(),&capacity,8);
@@ -1662,7 +2745,11 @@ inline void line(const TCNimString* value,void* context) {
                 const auto operands=operandTuple(text,begin,refresh);
                 if(operands.size()!=1 || role.index>=instance.operands.size()) {
                     instance.failed=true;note("generated input collector has an invalid operand tuple: "+text);
-                } else instance.operands[role.index]=operands[0];
+                } else {
+                    instance.operands[role.index]=operands[0];
+                    if(instance.v3&&role.index<instance.drives.size())
+                        instance.drives[role.index]=driveOperand(*emission,operands[0],refresh);
+                }
                 emission->currentValid=false;
                 originalLine(value,context);return;
             }
@@ -1681,11 +2768,101 @@ inline void line(const TCNimString* value,void* context) {
             // not carry a type token of its own.
             std::string pinType=type;
             if(outWidth>1)pinType="U"+std::to_string(outWidth<=8?8:outWidth<=16?16:outWidth<=32?32:64);
-                if(role.first) {
+            if(role.clockedTick) {
+                /* The hidden sink exists only to commit sequential state.  Its
+                   REFRESH form is a no-op; in CYCLE it receives the complete
+                   input tuple and invokes the callback once, independently of
+                   every visible output driver. */
+                if(refresh) {
+                    replacement=text.substr(0,begin)+type+" 0";
+                } else {
+                    if(!dependencyOperandsReady(instance,0,instance.v3,true)) {
+                        if(instance.warned.insert(role.token).second)
+                            note("instance token "+std::to_string(role.token)+
+                                 " does not expose the complete clocked-tick input tuple; internal circuit kept: "+text);
+                        instance.failed=true;
+                        originalLine(value,context);
+                        return;
+                    }
+                    const auto invocation=invocationText(instance,role.token,false,0,true);
+                    replacement=invocation.prefix+text.substr(0,begin)+type+" "+
+                                invocation.expression;
+                }
+                text=replacement;
+                std::vector<char> payload(8+text.size()+1);
+                const uint64_t capacity=uint64_t(text.size())|(uint64_t(1)<<62);
+                memcpy(payload.data(),&capacity,8);memcpy(payload.data()+8,text.data(),text.size());
+                TCNimString rewritten{uint64_t(text.size()),payload.data()};
+                originalLine(&rewritten,context);
+                ++emission->rewritten;emission->currentValid=false;return;
+            }
+            if(role.triState&&text.find("var vid")!=std::string::npos) {
+                const bool triRefresh=emission->triPendingRefresh;
+                std::string trigger;
+                if(role.index<instance.inlineExpressions.size()) {
+                    if(!dependencyOperandsReady(instance,role.index,false)) {
+                        instance.failed=true;
+                        note("inline output is missing one of its declared operands: "+text);
+                        originalLine(value,context);
+                        return;
+                    }
+                    trigger=instantiateInlinePrefixOnce(instance,role.token,role.index,
+                                                        triRefresh);
+                } else if(role.first) {
+                    if(!dependencyOperandsReady(instance,role.index,true)) {
+                        if(instance.warned.insert(role.token).second)
+                            note("instance token "+std::to_string(role.token)+
+                                 " does not expose the complete V3 value/drive input tuple; internal circuit kept: "+text);
+                        instance.failed=true;
+                        originalLine(value,context);
+                        return;
+                    }
+                    const auto invocation=invocationText(instance,role.token,triRefresh,
+                                                         role.index);
+                    trigger=invocation.prefix+
+                            "var tc_io"+std::to_string(role.token)+"o"+
+                            std::to_string(role.index)+" = U1 "+
+                            invocation.expression+"\n";
+                }
+                const size_t declaration=text.find("var vid");
+                size_t firstDigit=declaration+7,endDigit=firstDigit;
+                while(endDigit<text.size()&&text[endDigit]>='0'&&text[endDigit]<='9')++endDigit;
+                if(endDigit==firstDigit) {
+                    instance.failed=true;
+                    note("V3 output Switch has an unknown generated shape: "+text);
+                    originalLine(value,context);
+                    return;
+                }
+                const std::string triNet=text.substr(firstDigit,endDigit-firstDigit);
+                text.insert(declaration,trigger);
+                emission->triRole=role;
+                emission->triRewriteValid=true;
+                emission->triEnableDone=false;
+                emission->triValueWrites=0;
+                emission->triSkipDepth=0;
+                emission->triNet=triNet;
+                emission->triRefresh=triRefresh;
+                rewriteTriStateContinuation(*emission,text);
+                std::vector<char> payload(8+text.size()+1);
+                const uint64_t capacity=uint64_t(text.size())|(uint64_t(1)<<62);
+                memcpy(payload.data(),&capacity,8);memcpy(payload.data()+8,text.data(),text.size());
+                TCNimString rewritten{uint64_t(text.size()),payload.data()};originalLine(&rewritten,context);
+                ++emission->rewritten;emission->currentValid=false;return;
+            }
+                if(role.index<instance.inlineExpressions.size()) {
+                    if(!dependencyOperandsReady(instance,role.index,false)) {
+                        instance.failed=true;
+                        note("inline output is missing one of its declared operands: "+text);
+                        originalLine(value,context);
+                        return;
+                    }
+                    replacement=instantiateInlinePrefixOnce(instance,role.token,role.index,
+                                                             refresh)+
+                                text.substr(0,begin)+pinType+" ("+
+                                instantiateInline(instance,role.token,role.index,false)+")";
+                } else if(role.first) {
                     if(!instance.generated)instance.operands=operandTuple(text,begin,refresh);
-                std::ostringstream call;
-                if(instance.operands.size()!=instance.inputs ||
-                   std::any_of(instance.operands.begin(),instance.operands.end(),[](const auto& v){return v.empty();})) {
+                if(!dependencyOperandsReady(instance,role.index,false)) {
                     if(instance.warned.insert(role.token).second)
                         note("instance token "+std::to_string(role.token)+" exposes "+
                              std::to_string(instance.operands.size())+" operand(s) but the definition declares "+
@@ -1694,41 +2871,16 @@ inline void line(const TCNimString* value,void* context) {
                     originalLine(value,context);
                     return;
                 }
-                // Pack the operands into two payload words: token, cycle,
-                // payload lo, payload hi.  Four arguments are the widest call
-                // shape the JIT register allocator handles for a foreign
-                // function; each operand is shifted into its assigned word.
-                std::array<std::string,2> payload;
-                std::array<uint32_t,kMaxBridgeInputs> word{},shift{};
-                placeInputs(instance.widths,static_cast<uint32_t>(instance.operands.size()),word,shift);
-                for(size_t i=0;i<instance.operands.size();++i) {
-                    std::string term="U64 ("+instance.operands[i]+")";
-                    if(shift[i])term+=" << "+std::to_string(shift[i]);
-                    if(shift[i])term="("+term+")";
-                    payload[word[i]]+= (payload[word[i]].empty()?"":" | ")+term;
-                    if(shift[i]+instance.widths[i]>64) {
-                        const std::string high="(U64 ("+instance.operands[i]+") >> "+std::to_string(64-shift[i])+")";
-                        payload[word[i]+1]+=(payload[word[i]+1].empty()?"":" | ")+high;
-                    }
-                }
-                const bool wide=wideCallEnabled();
-                const std::string cycleArg="cycle"+std::string(refresh?"":" + 1");
-                call<<"game_engine.'"<<(wide?(refresh?"tc_logic_peek6":"tc_logic_invoke6")
-                                             :(refresh?"tc_logic_peek":"tc_logic_invoke"))
-                    <<"'(U64 "<<role.token<<", U64 ("<<cycleArg<<"), ";
-                call<<(payload[0].empty()?"U64 0":payload[0])
-                    <<", "<<(payload[1].empty()?"U64 0":payload[1]);
-                if(wide)
-                    call<<", U64 (("<<cycleArg<<") * 0x9E3779B1)"
-                        <<", U64 (("<<cycleArg<<") * 0x85EBCA6B + 0x165667B1)";
-                call<<")";
+                const auto invocation=invocationText(instance,role.token,refresh,role.index);
                 if(outWidth<=1) {
                     // Verified shape for one-bit pins.
-                    replacement=text.substr(0,begin)+type+" "+call.str();
+                    replacement=invocation.prefix+text.substr(0,begin)+type+" "+invocation.expression;
                 } else {
                     // Word pins: the call runs the callback as a discarded U1
                     // statement, then the value is assembled from its bits.
-                    replacement="var tc_io"+std::to_string(role.token)+" = U1 "+call.str()+"\n"+
+                    replacement=invocation.prefix+"var tc_io"+std::to_string(role.token)+
+                                (instance.preciseDependencies?"o"+std::to_string(role.index):std::string())+
+                                " = U1 "+invocation.expression+"\n"+
                                 wordAssembly(pinType,role.token,role.index,outWidth,text.substr(0,begin));
                 }
             } else {
@@ -1751,11 +2903,15 @@ inline void line(const TCNimString* value,void* context) {
 }
 inline uint64_t bridgeCycle(uint64_t token,uint64_t cycle,uint64_t packedLo,uint64_t packedHi){
     return invoke(token,int64_t(cycle),packedLo,packedHi,TC_LOGIC_CYCLE);}
+inline uint64_t bridgeTick(uint64_t token,uint64_t cycle,uint64_t packedLo,uint64_t packedHi){
+    return invokeTick(token,int64_t(cycle),packedLo,packedHi);}
 inline uint64_t bridgePeek(uint64_t token,uint64_t cycle,uint64_t packedLo,uint64_t packedHi){
     return invoke(token,int64_t(cycle),packedLo,packedHi,TC_LOGIC_REFRESH);}
-/* The six-argument entry points behind TC_MODLOADER_BRIDGE_WIDE: same work as
-   the four-argument pair, plus a check that the two extra arguments arrived
-   intact (each is recomputed from the cycle the call itself carries). */
+inline uint64_t bridgeOutput(uint64_t token,uint64_t selector,uint64_t packedLo,uint64_t packedHi){
+    return invokeOutput(token,selector,packedLo,packedHi);}
+/* Historical six-argument diagnostics: same work as the direct pair, plus a
+   check that the two extra arguments arrived intact.  New code never emits
+   these calls; wide payloads use bridgeInputStage/bridgeDriveStage below. */
 inline uint64_t wideMixLo(uint64_t cycle) { return cycle*0x9E3779B1ULL; }
 inline uint64_t wideMixHi(uint64_t cycle) { return cycle*0x85EBCA6BULL+0x165667B1ULL; }
 inline void checkWideCall(uint64_t cycle,uint64_t mixLo,uint64_t mixHi) {
@@ -1783,8 +2939,83 @@ inline uint64_t bridgePeek6(uint64_t token,uint64_t cycle,uint64_t packedLo,uint
 }
 inline uint64_t bridgeOut(uint64_t token,uint64_t index){return readOutput(token,index);}
 inline uint64_t bridgeBit(uint64_t token,uint64_t index){return readOutputBit(token,index);}
+inline uint64_t bridgeInputDrive(uint64_t token,uint64_t packedLo,uint64_t packedHi){
+    return latchInputDrive(token,packedLo,packedHi);
+}
+inline uint64_t bridgeInputStage(uint64_t token,uint64_t selector,uint64_t packedLo,uint64_t packedHi){
+    return stageInput(token,selector,packedLo,packedHi,false);
+}
+inline uint64_t bridgeDriveStage(uint64_t token,uint64_t selector,uint64_t packedLo,uint64_t packedHi){
+    return stageInput(token,selector,packedLo,packedHi,true);
+}
+inline uint64_t bridgeCycleStaged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t){
+    return invokeStaged(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_CYCLE);
+}
+inline uint64_t bridgeTickStaged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t){
+    return invokeStaged(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_CYCLE,
+                        kTickOnlySelector);
+}
+inline uint64_t bridgePeekStaged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t){
+    return invokeStaged(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_REFRESH);
+}
+inline uint64_t bridgeOutputStaged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t output){
+    return invokeStagedOutput(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_CYCLE,
+                              static_cast<uint32_t>(output));
+}
+inline uint64_t bridgeOutputPeekStaged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t output){
+    return invokeStagedOutput(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_REFRESH,
+                              static_cast<uint32_t>(output));
+}
+inline uint64_t bridgeOutputDrive(uint64_t token,uint64_t index){
+    return readOutputDrive(token,index);
+}
 inline uint64_t bridgeDynamicConstant(uint64_t component,uint64_t fallback){
     return getDynamicConstant(component,fallback);
+}
+/* Fused RV32I integer ALU used by TC-Verilog's exact rv32i_flat fast path.
+   Returning uint32_t before widening reproduces the Verilog 32-bit truncation. */
+inline uint64_t bridgeVerilogAlu32(uint64_t operation,uint64_t a,uint64_t b){
+    const uint32_t left=static_cast<uint32_t>(a);
+    const uint32_t right=static_cast<uint32_t>(b);
+    const uint32_t shift=right&31u;
+    switch(operation&15u){
+    case 0:return static_cast<uint32_t>(left+right);
+    case 1:return static_cast<uint32_t>(left-right);
+    case 2:return static_cast<uint32_t>(left<<shift);
+    case 3:return static_cast<uint32_t>(static_cast<int32_t>(left)<static_cast<int32_t>(right));
+    case 4:return static_cast<uint32_t>(left<right);
+    case 5:return left^right;
+    case 6:return left>>shift;
+    case 7:return static_cast<uint32_t>(static_cast<int32_t>(left)>>shift);
+    case 8:return left|right;
+    case 9:return left&right;
+    default:return 0;
+    }
+}
+inline uint64_t bridgeVerilogRv32(uint64_t selector,uint64_t pc,uint64_t instr,
+                                 uint64_t rs1,uint64_t rs2,uint64_t memory){
+    struct Cache {
+        uint32_t pc=0,instr=0,rs1=0,rs2=0,memory=0;
+        bool bigEndian=false,valid=false;
+        tc::rv32_intrinsic::Outputs outputs{};
+    };
+    static thread_local Cache cache;
+    const bool bigEndian=(selector&8u)!=0;
+    const uint32_t p=static_cast<uint32_t>(pc),i=static_cast<uint32_t>(instr),
+                   a=static_cast<uint32_t>(rs1),b=static_cast<uint32_t>(rs2),
+                   m=static_cast<uint32_t>(memory);
+    if(!cache.valid||cache.bigEndian!=bigEndian||cache.pc!=p||cache.instr!=i||
+       cache.rs1!=a||cache.rs2!=b||cache.memory!=m){
+        cache={p,i,a,b,m,bigEndian,true,tc::rv32_intrinsic::evaluate(bigEndian,p,i,a,b,m)};
+    }
+    switch(selector&7u){
+    case 0:return tc::rv32_intrinsic::packedInstructionOutputs(cache.outputs);
+    case 1:return uint64_t(cache.outputs.pcNext)|(uint64_t(cache.outputs.memoryByteEnable)<<32);
+    case 2:return cache.outputs.memoryAddress;
+    case 3:return cache.outputs.regWriteData;
+    case 4:return cache.outputs.memoryWriteData;
+    default:return 0;
+    }
 }
 inline void bridgeReset(){reset();}
 inline void* compilerTable=nullptr;
@@ -1803,13 +3034,23 @@ extern "C" __declspec(dllexport) inline void tc_scope_tick(uint64_t cycle) {
 inline void prepareCompiler() {
     if(compilerReady)return;
     if(!read64(compilerTable,0x10))compilerInit(compilerTable);
-    const char* names[]={"tc_logic_invoke","tc_logic_peek","tc_logic_out","tc_logic_bit","tc_logic_reset",
-                         "tc_dynamic_constant","tc_scope_tick","tc_logic_invoke6","tc_logic_peek6"};
-    void* pointers[]={reinterpret_cast<void*>(&bridgeCycle),reinterpret_cast<void*>(&bridgePeek),
+    const char* names[]={"tc_logic_invoke","tc_logic_tick","tc_logic_peek","tc_logic_out","tc_logic_bit","tc_logic_reset",
+                         "tc_dynamic_constant","tc_scope_tick","tc_verilog_alu32","tc_verilog_rv32","tc_logic_invoke6","tc_logic_peek6",
+                         "tc_logic_drive_in","tc_logic_drive_out","tc_logic_stage",
+                         "tc_logic_drive_stage","tc_logic_invoke_staged","tc_logic_tick_staged","tc_logic_peek_staged",
+                         "tc_logic_output","tc_logic_output_staged","tc_logic_output_peek_staged"};
+    void* pointers[]={reinterpret_cast<void*>(&bridgeCycle),reinterpret_cast<void*>(&bridgeTick),reinterpret_cast<void*>(&bridgePeek),
         reinterpret_cast<void*>(&bridgeOut),reinterpret_cast<void*>(&bridgeBit),reinterpret_cast<void*>(&bridgeReset),
         reinterpret_cast<void*>(&bridgeDynamicConstant),reinterpret_cast<void*>(&tc_scope_tick),
-        reinterpret_cast<void*>(&bridgeCycle6),reinterpret_cast<void*>(&bridgePeek6)};
-      for(size_t i=0;i<9;++i){TCNimString key{};size_t n=strlen(names[i]);compilerString(&key,n);key.length=n;
+        reinterpret_cast<void*>(&bridgeVerilogAlu32),
+        reinterpret_cast<void*>(&bridgeVerilogRv32),
+        reinterpret_cast<void*>(&bridgeCycle6),reinterpret_cast<void*>(&bridgePeek6),
+        reinterpret_cast<void*>(&bridgeInputDrive),reinterpret_cast<void*>(&bridgeOutputDrive),
+        reinterpret_cast<void*>(&bridgeInputStage),reinterpret_cast<void*>(&bridgeDriveStage),
+        reinterpret_cast<void*>(&bridgeCycleStaged),reinterpret_cast<void*>(&bridgeTickStaged),reinterpret_cast<void*>(&bridgePeekStaged),
+        reinterpret_cast<void*>(&bridgeOutput),reinterpret_cast<void*>(&bridgeOutputStaged),
+        reinterpret_cast<void*>(&bridgeOutputPeekStaged)};
+      for(size_t i=0;i<sizeof(names)/sizeof(names[0]);++i){TCNimString key{};size_t n=strlen(names[i]);compilerString(&key,n);key.length=n;
         memcpy(static_cast<char*>(key.data)+8,names[i],n+1);compilerSet(compilerTable,&key,pointers[i]);}
     compilerReady=true;
 }
@@ -1817,6 +3058,13 @@ inline void compile(void* a,void* b,void* c) {
     auto* source=reinterpret_cast<TCNimString*>(static_cast<char*>(c)+8);
     if(!source->data || source->length>16000000){originalCompile(a,b,c);return;}
     std::string text(static_cast<const char*>(source->data)+8,source->length);
+    /* The built-in Keyboard's emitted behaviour is corrected here, before
+       anything reads the program (src/keyboard_fix.hpp).  The raw capture is
+       kept for the dumps and for the tests that assert on what the game itself
+       emitted; only the compiled text carries the fix. */
+    const std::string emitted=text;
+    const int keyboardFixed=tc::keyboard_fix::apply(text);
+    const bool bridge=text.find("game_engine.'tc_")!=std::string::npos;
     if(dumpSourceEnabled()) {
         // Development dumps, off unless TC_MODLOADER_DUMP_SOURCE=1: one numbered
         // file per compile (a level compiles its level-IO program and the
@@ -1826,18 +3074,27 @@ inline void compile(void* a,void* b,void* c) {
         // gated - and the playtests that assert on the generated source set the
         // variable themselves.
         static std::atomic<uint64_t> dumpCounter{0};
-        std::ofstream numbered("native-logic-source-"+std::to_string(dumpCounter.fetch_add(1))+".txt");
-        numbered<<text;
-        if(text.find("game_engine.'tc_")!=std::string::npos) {
+        const uint64_t number=dumpCounter.fetch_add(1);
+        std::ofstream numbered("native-logic-source-"+std::to_string(number)+".txt");
+        numbered<<emitted;
+        // A second file only when the Keyboard rewrite changed something: the
+        // numbered dump stays exactly what the game emitted, so existing
+        // assertions on emission forms keep their meaning, and this one is the
+        // program the JIT actually ran.
+        if(keyboardFixed>0) {
+            std::ofstream fixed("native-logic-source-keyboard-"+std::to_string(number)+".txt");
+            fixed<<text;
+        }
+        if(text.find("game_engine.'tc_")!=std::string::npos ||
+           text.find("// runtime constant ")!=std::string::npos) {
             std::ofstream debug("native-logic-source.txt");debug<<text;
         }
     }
-    const bool bridge=text.find("game_engine.'tc_")!=std::string::npos;
     /* The per-cycle tick for the scope capture: one call before every
        `cycle += 1`, which is the point where that cycle's state is complete.
        A program with no such step is left exactly as it was. */
     const int ticks=tc::scope_capture::store().inject(text);
-    if(!bridge&&ticks==0){originalCompile(a,b,c);return;}
+    if(!bridge&&ticks==0&&keyboardFixed==0){originalCompile(a,b,c);return;}
     prepareCompiler();
     if(text.rfind("extern windows_x64 game_engine",0)!=0)
         text="extern windows_x64 game_engine\n"+text;
@@ -1850,6 +3107,39 @@ inline void compile(void* a,void* b,void* c) {
     std::vector<char> payload(8+text.size()+1);const uint64_t capacity=uint64_t(text.size())|(uint64_t(1)<<62);memcpy(payload.data(),&capacity,8);memcpy(payload.data()+8,text.data(),text.size());
     const auto saved=*source;*source={uint64_t(text.size()),payload.data()};
     originalCompile(a,b,c);*source=saved;
+}
+inline void jit(void* sequence,int64_t entry) {
+    static const bool enabled=[] {const char* value=std::getenv("TC_MODLOADER_JIT_OPT");return !(value && value[0]=='0');}();
+    auto* source=static_cast<TCNimString*>(sequence);
+    if(!enabled || !source || !source->data || source->length>16000000) {originalJit(sequence,entry);return;}
+    tc::simulation_jit::Result result;
+    std::vector<char> payload;TCNimString rewritten{};
+    try {
+        result=tc::simulation_jit::optimize(static_cast<const uint8_t*>(source->data)+8,size_t(source->length),entry);
+        if(!result.code.empty()) {
+            payload.resize(8+result.code.size());
+            const uint64_t capacity=uint64_t(result.code.size())|(uint64_t(1)<<62);
+            memcpy(payload.data(),&capacity,8);memcpy(payload.data()+8,result.code.data(),result.code.size());
+            rewritten={uint64_t(result.code.size()),payload.data()};
+            if(logger)logger("Native simulation JIT: removed "+std::to_string(result.removed)+" redundant instructions, bytes "+
+                std::to_string(source->length)+" -> "+std::to_string(result.code.size())+", entry "+std::to_string(entry)+" -> "+std::to_string(result.entry)+
+                ", constant shifts "+std::to_string(result.specialized)+", narrow masks "+std::to_string(result.masked)+
+                ", dead constants "+std::to_string(result.deadConstants)+", dead copies "+std::to_string(result.deadCopies)+", redundant masks "+std::to_string(result.redundantMasks)+
+                ", fallthrough jumps "+std::to_string(result.fallthroughJumps)+", stack forwards "+std::to_string(result.stackForwards)+
+                ", equivalent copies "+std::to_string(result.equivalentCopies)+", signed extensions "+std::to_string(result.signedExtensions)+
+                ", unused extensions "+std::to_string(result.unusedExtensions)+", unused masks "+std::to_string(result.unusedMasks)+
+                ", flow copies "+std::to_string(result.flowCopies)+", redundant stores "+std::to_string(result.redundantStores));
+            if(dumpSourceEnabled()) {
+                static std::atomic<uint64_t> serial{0};const auto number=serial.fetch_add(1);
+                std::ofstream file("native-jit-optimized-"+std::to_string(number)+".bin",std::ios::binary);
+                file.write(reinterpret_cast<const char*>(result.code.data()),std::streamsize(result.code.size()));
+            }
+        }
+    } catch(...) {originalJit(sequence,entry);return;}
+    if(result.code.empty()) {originalJit(sequence,entry);return;}
+    // The game copies this byte sequence into executable memory before it
+    // runs it. Keep the private buffer alive until that execution returns.
+    originalJit(&rewritten,result.entry);
 }
 inline bool install(const std::map<std::string,void*>& symbols,const std::map<std::string,void*>& compiler,std::set<void*>& owned,std::function<void(const std::string&)> log) {
     auto get=[&](const char* name)->void*{auto it=symbols.find(name);return it==symbols.end()?nullptr:it->second;};
@@ -1871,15 +3161,54 @@ inline bool install(const std::map<std::string,void*>& symbols,const std::map<st
     bool ok=created==3;
     if(ok)for(auto target:targets)if(MH_EnableHook(target)!=MH_OK)ok=false;
     if(!ok){for(size_t i=0;i<created;++i){MH_DisableHook(targets[i]);MH_RemoveHook(targets[i]);}return false;}
-    for(auto target:targets)owned.insert(target);logger=std::move(log);installed=true;return true;
+    for(auto target:targets)owned.insert(target);logger=std::move(log);installed=true;
+    auto jitTarget=get("jit__modelZsimulationZjitZjit_u1807");
+    if(jitTarget && MH_CreateHook(jitTarget,reinterpret_cast<void*>(&jit),reinterpret_cast<void**>(&originalJit))==MH_OK) {
+        if(MH_EnableHook(jitTarget)==MH_OK)owned.insert(jitTarget);
+        else {MH_RemoveHook(jitTarget);if(logger)logger("Native simulation JIT: optimization hook unavailable");}
+    } else if(logger)logger("Native simulation JIT: optimization hook unavailable");
+    return true;
 }
 }
 
 extern "C" __declspec(dllexport) inline uint64_t tc_logic_invoke(uint64_t token,uint64_t cycle,uint64_t packedLo,uint64_t packedHi) {
     return tc::logic::invoke(token,static_cast<int64_t>(cycle),packedLo,packedHi,TC_LOGIC_CYCLE);
 }
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_tick(uint64_t token,uint64_t cycle,uint64_t packedLo,uint64_t packedHi) {
+    return tc::logic::invokeTick(token,static_cast<int64_t>(cycle),packedLo,packedHi);
+}
 extern "C" __declspec(dllexport) inline uint64_t tc_logic_peek(uint64_t token,uint64_t cycle,uint64_t packedLo,uint64_t packedHi) {
     return tc::logic::invoke(token,static_cast<int64_t>(cycle),packedLo,packedHi,TC_LOGIC_REFRESH);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_output(uint64_t token,uint64_t selector,uint64_t packedLo,uint64_t packedHi) {
+    return tc::logic::invokeOutput(token,selector,packedLo,packedHi);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_stage(uint64_t token,uint64_t selector,uint64_t packedLo,uint64_t packedHi) {
+    return tc::logic::stageInput(token,selector,packedLo,packedHi,false);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_drive_stage(uint64_t token,uint64_t selector,uint64_t packedLo,uint64_t packedHi) {
+    return tc::logic::stageInput(token,selector,packedLo,packedHi,true);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_invoke_staged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t reserved) {
+    (void)reserved;
+    return tc::logic::invokeStaged(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_CYCLE);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_tick_staged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t reserved) {
+    (void)reserved;
+    return tc::logic::invokeStaged(token,static_cast<int64_t>(cycle),chunks,
+                                   TC_LOGIC_CYCLE,tc::logic::kTickOnlySelector);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_peek_staged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t reserved) {
+    (void)reserved;
+    return tc::logic::invokeStaged(token,static_cast<int64_t>(cycle),chunks,TC_LOGIC_REFRESH);
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_output_staged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t output) {
+    return tc::logic::invokeStagedOutput(token,static_cast<int64_t>(cycle),chunks,
+                                         TC_LOGIC_CYCLE,static_cast<uint32_t>(output));
+}
+extern "C" __declspec(dllexport) inline uint64_t tc_logic_output_peek_staged(uint64_t token,uint64_t cycle,uint64_t chunks,uint64_t output) {
+    return tc::logic::invokeStagedOutput(token,static_cast<int64_t>(cycle),chunks,
+                                         TC_LOGIC_REFRESH,static_cast<uint32_t>(output));
 }
 extern "C" __declspec(dllexport) inline uint64_t tc_logic_out(uint64_t token,uint64_t index) {
     return tc::logic::readOutput(token,index);

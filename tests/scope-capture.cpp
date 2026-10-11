@@ -231,7 +231,20 @@ int main() {
         "}\n";
     const int sites = store().inject(source);
     check(sites == 1, "the cycle step was not instrumented");
-    check(source.find("game_engine.'tc_scope_tick'(U64 cycle)\n        cycle += 1") !=
+    const std::string gatePrefix = "if load(<U8>, Ptr ";
+    const auto gateAt = source.find(gatePrefix);
+    check(gateAt != std::string::npos,
+          "idle simulation still calls the capture DLL every cycle");
+    if (gateAt != std::string::npos) {
+        const auto address = std::stoull(source.substr(gateAt + gatePrefix.size()));
+        auto* gate = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<uintptr_t>(address));
+        check(gate->load() == 0, "the generated capture gate is active while stopped");
+        capture.start();
+        check(gate->load() == 1, "starting capture did not open the generated gate");
+        capture.stop();
+        check(gate->load() == 0, "stopping capture did not close the generated gate");
+    }
+    check(source.find("game_engine.'tc_scope_tick'(U64 cycle)\n        }\n        cycle += 1") !=
               std::string::npos,
           "the tick was not inserted before the cycle step");
     std::string other = "def other() None {\n    var x = 1\n}\n";

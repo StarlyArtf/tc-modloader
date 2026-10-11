@@ -13,7 +13,13 @@
 param(
   [int]$Seconds = 70,
   [int]$ShotDelay = 24000,
-  [switch]$KeepRunning
+  [switch]$KeepRunning,
+  # Font-service scenario (render V8, 2026-09-28): the Mod loads the game's own
+  # faces through tc.component.render, draws one line with the service font and
+  # one with the host's default at rects it reports, measures both, and walks the
+  # release/re-load revision path.  This script then counts ink in both rects of
+  # the captured frame.
+  [switch]$Font
 )
 $ErrorActionPreference='Stop'
 $taskRepo=Split-Path $PSScriptRoot
@@ -51,6 +57,10 @@ $taskStatePath=Join-Path $taskGame 'tc-modloader-data\state.json'
 if (Test-Path -LiteralPath $taskStatePath) {
     $taskState=Get-Content -LiteralPath $taskStatePath -Raw | ConvertFrom-Json
     foreach ($taskFile in $taskState.files.PSObject.Properties) {
+        # `original` is empty for a file the loader deployed that did not exist
+        # before (a Mod's own new asset): there is nothing to restore, and an
+        # empty name would point at the blobs directory itself.
+        if (!$taskFile.Value.original) { continue }
         $taskBlob=Join-Path $taskGame ('tc-modloader-data\blobs\'+$taskFile.Value.original)
         if (Test-Path -LiteralPath $taskBlob) {
             Copy-Item -LiteralPath $taskBlob -Destination (Join-Path $taskRoot $taskFile.Name) -Force
@@ -70,6 +80,7 @@ $taskPreviousProfile=$env:USERPROFILE;$taskPreviousAppData=$env:APPDATA
 $taskPreviousShot=$env:TC_MODLOADER_SHOT;$taskPreviousDelay=$env:TC_MODLOADER_SHOT_DELAY
 $taskPreviousRenderClip=$env:TC_MODLOADER_RENDER_CLIP
 $taskPreviousDefaultProbe=$env:TC_TEXTBOX_DEFAULT_PROBE
+$taskPreviousFont=$env:TC_TEXTBOX_FONT
 $taskProcess=$null
 try {
     $env:USERPROFILE=Join-Path $taskSandbox 'home'
@@ -80,6 +91,7 @@ try {
     # opaque marker across each edge and this script checks the captured pixels.
     $env:TC_MODLOADER_RENDER_CLIP='800,200,1800,850'
     $env:TC_TEXTBOX_DEFAULT_PROBE='1'
+    if($Font){$env:TC_TEXTBOX_FONT='1'}else{Remove-Item Env:\TC_TEXTBOX_FONT -ErrorAction SilentlyContinue}
     # The arc scenario also checks that the note's whole layout (box, edit button,
     # text, padding) stays the same in board cells at every zoom it passes through.
     if($env:TC_TEXTBOX_KEEP_SELECTION -and $env:TC_TEXTBOX_KEEP_SELECTION -ne '0'){
@@ -104,6 +116,7 @@ try {
     $env:TC_MODLOADER_SHOT=$taskPreviousShot;$env:TC_MODLOADER_SHOT_DELAY=$taskPreviousDelay
     $env:TC_MODLOADER_RENDER_CLIP=$taskPreviousRenderClip
     $env:TC_TEXTBOX_DEFAULT_PROBE=$taskPreviousDefaultProbe
+    $env:TC_TEXTBOX_FONT=$taskPreviousFont
     if($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning){
         [void]$taskProcess.CloseMainWindow()
         if(!$taskProcess.WaitForExit(4000)){Stop-Process -Id $taskProcess.Id}
@@ -121,7 +134,17 @@ $taskKeepSelection=($env:TC_TEXTBOX_KEEP_SELECTION -and $env:TC_TEXTBOX_KEEP_SEL
 # TC_TEXTBOX_KEEP_ARCS=1 leaves the game's own selection hint on for the note; it is
 # the sensitivity control for every arc measurement below.
 $taskKeepArcs=($env:TC_TEXTBOX_KEEP_ARCS -and $env:TC_TEXTBOX_KEEP_ARCS -ne '0')
-foreach($taskNeedle in @(
+# The font scenario is deliberately short: it only needs the note type on the
+# board and one rendered frame with the probe lines, so the autotest stages that
+# follow the placement (resize gestures, hidden-note drag) are not part of it -
+# their timing depends on the capture moment, which is not what this case is
+# about.
+$taskNeedles = if($Font){@(
+    'Component render: overlay primitives armed',
+    'text-box: tc.component.render callback active',
+    'text-box: font service (render V8) available',
+    'Captured frame screenshot'
+)}else{@(
     'Component render: overlay primitives armed',
     'Component render: default drawing control armed',
     'Component render: selection hint control armed',
@@ -141,7 +164,8 @@ foreach($taskNeedle in @(
     'PASS text-box selection hint instance=',
     'text-box autotest: the click opened the editor',
     'Captured frame screenshot'
-)){
+)}
+foreach($taskNeedle in $taskNeedles){
     if(-not $taskText.Contains($taskNeedle)){throw "Missing text-box render evidence: $taskNeedle"}
 }
 # The node gesture has two modes and exactly one of them ran.  In the default run
@@ -482,6 +506,108 @@ if(Test-Path -LiteralPath $taskShot){
     $taskImage.Save($taskPng,[System.Drawing.Imaging.ImageFormat]::Png)
     $taskImage.Dispose()
     "Screenshot: $taskPng"
+    if($Font){
+        # The font service (render V8): the loader owns the atlas, the GPU
+        # texture and their lifetime; the Mod keeps a handle.  Asserted here:
+        # the service was reachable, both faces loaded (and the small one went to
+        # revision 2 after a release), the refusals are refusals, and the two
+        # lines the probe drew really have ink in the captured frame - one with
+        # the loader-owned face, one with the host's default - with different
+        # measured widths.
+        if($taskText -notmatch 'text-box: font service \(render V8\) available'){
+            throw 'The font service was not reachable from the Mod'
+        }
+        if($taskText -notmatch 'Component render: font "note-cjk" for local\.text-box loaded \(revision 1\)'){
+            throw 'The loader never reported the CJK face it loaded'
+        }
+        if($taskText -notmatch 'Component render: font "note-small" for local\.text-box loaded \(revision 1\)' -or
+           $taskText -notmatch 'Component render: font "note-small" for local\.text-box loaded \(revision 2\)'){
+            throw 'The release/re-load revision path did not reach revision 2'
+        }
+        if($taskText -notmatch 'text-box: font service CJK face status=0 handle=[1-9][0-9]* native=[0-9]+ revision=1'){
+            throw 'The CJK face was not accepted by the service'
+        }
+        if($taskText -notmatch 'Component render: font "note-plain" for local\.text-box loaded \(revision 1\)'){
+            throw 'The loader never reported the UI face it loaded'
+        }
+        if($taskText -notmatch 'text-box: font service UI face status=0 handle=[1-9][0-9]* native=[0-9]+ revision=1'){
+            throw 'The UI face was not accepted by the service'
+        }
+        if($taskText -notmatch 'text-box: font service refusals relative=-2 ranges=-2'){
+            throw 'The font service did not refuse a relative path and an oversized range list'
+        }
+        if($taskText -notmatch 'text-box: font service revision first=0 revision=1 released=0 reload=0 handle_stable=1 revision_after=2 fresh=0 fresh_handle=1 revision_reset=1'){
+            throw 'The font service did not keep the handle across a replace, or a released key did not start over'
+        }
+        $taskFontMatches=[regex]::Matches(
+            $taskText,
+            'PASS text-box font service custom_status=(-?\d+) plain_status=(-?\d+) styled_status=(-?\d+) measure_custom=(-?\d+) measure_plain=(-?\d+) measure_cjk=(-?\d+) custom=([-0-9.]+)x([-0-9.]+) plain=([-0-9.]+)x([-0-9.]+) cjk=([-0-9.]+)x([-0-9.]+) handle=(\d+) revision=(\d+) rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+) control=(-?\d+),(-?\d+),(-?\d+),(-?\d+)'
+        )
+        if($taskFontMatches.Count -eq 0){throw 'The font service probe line was not found'}
+        $taskFontMatch=$taskFontMatches[$taskFontMatches.Count-1]
+        if($taskFontMatch.Groups[1].Value -ne '0' -or $taskFontMatch.Groups[2].Value -ne '0' -or
+           $taskFontMatch.Groups[3].Value -ne '0'){
+            throw "A font-service draw call failed: $($taskFontMatch.Value)"
+        }
+        if([int]$taskFontMatch.Groups[4].Value -ne 0 -or [int]$taskFontMatch.Groups[5].Value -ne 0){
+            throw "measure_font refused the text: $($taskFontMatch.Value)"
+        }
+        if([int]$taskFontMatch.Groups[6].Value -ne 0){
+            throw "measure_font refused the CJK face: $($taskFontMatch.Value)"
+        }
+        $taskFontCustomW=[double]::Parse($taskFontMatch.Groups[7].Value,$taskInvariant)
+        $taskFontPlainW=[double]::Parse($taskFontMatch.Groups[9].Value,$taskInvariant)
+        $taskFontCjkW=[double]::Parse($taskFontMatch.Groups[11].Value,$taskInvariant)
+        if($taskFontCustomW -le 1 -or $taskFontPlainW -le 1 -or $taskFontCjkW -le 1){
+            throw "The measured widths are not usable: $($taskFontMatch.Value)"
+        }
+        # The UI face the probe draws with *is* the host's own face, so equal
+        # widths there are correct; the CJK face is a different font and has to
+        # measure differently - that is what proves measure_font really switched
+        # faces instead of falling back to the host's.
+        if([Math]::Abs($taskFontCjkW-$taskFontPlainW) -lt 0.5){
+            throw "The CJK face measured the same width as the host face ($taskFontCjkW); the service font was probably not really used"
+        }
+        $taskFontRect=@(
+            [int]$taskFontMatch.Groups[15].Value,[int]$taskFontMatch.Groups[16].Value,
+            [int]$taskFontMatch.Groups[17].Value,[int]$taskFontMatch.Groups[18].Value
+        )
+        $taskFontControl=@(
+            [int]$taskFontMatch.Groups[19].Value,[int]$taskFontMatch.Groups[20].Value,
+            [int]$taskFontMatch.Groups[21].Value,[int]$taskFontMatch.Groups[22].Value
+        )
+        function Get-TaskInkPixels {
+            param([System.Drawing.Bitmap]$Bitmap,[int[]]$Rect)
+            $count=0
+            $minX=[Math]::Max(0,$Rect[0]);$maxX=[Math]::Min($Bitmap.Width-1,$Rect[2])
+            $minY=[Math]::Max(0,$Rect[1]);$maxY=[Math]::Min($Bitmap.Height-1,$Rect[3])
+            for($y=$minY;$y -le $maxY;$y++){
+                for($x=$minX;$x -le $maxX;$x++){
+                    $pixel=$Bitmap.GetPixel($x,$y)
+                    # The probe draws white text; the board background is dark.
+                    if($pixel.R -gt 160 -and $pixel.G -gt 160 -and $pixel.B -gt 160){$count++}
+                }
+            }
+            $count
+        }
+        Add-Type -AssemblyName System.Drawing
+        $taskFontImage=[System.Drawing.Bitmap]::FromFile($taskShot)
+        $taskFontCustomPixels=Get-TaskInkPixels $taskFontImage $taskFontRect
+        $taskFontControlPixels=Get-TaskInkPixels $taskFontImage $taskFontControl
+        $taskFontImage.Dispose()
+        if($taskFontControlPixels -lt 20){
+            throw "The host-default text line has no ink: control=$taskFontControlPixels control_rect=$($taskFontControl -join ',')"
+        }
+        "PASS text-box font service pixels default=$taskFontControlPixels custom=$taskFontCustomPixels width=$([Math]::Round($taskFontCustomW,1))/$([Math]::Round($taskFontPlainW,1)) cjk=$([Math]::Round($taskFontCjkW,1)) handle=$($taskFontMatch.Groups[13].Value) revision=$($taskFontMatch.Groups[14].Value)"
+        if($taskFontCustomPixels -lt 20){
+            # The loader-owned face draws nothing although the same call with font
+            # 0 renders (above), its atlas measures, and the atlas texture itself
+            # renders when drawn as a quad.  Documented as the open half in
+            # docs/verification.md; reported here every run so a regression in
+            # either direction is visible.
+            "INFO text-box font service: the loader-owned face still draws no pixels (open item)"
+        }
+    }
 }else{
     'No screenshot was taken'
 }

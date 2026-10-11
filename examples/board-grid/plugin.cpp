@@ -1,7 +1,7 @@
 /* Board grid: the board is laid out on an integer coordinate grid - pins sit
    one unit apart, wires turn on integers, components are placed on them - but
    the game never draws it.  This Mod draws it, and puts the switch where a
-   player looks for a setting: the game's own Options page, General tab.
+   player looks for it: the loader's unified Mod settings page.
 
    Drawing in board coordinates rather than screen coordinates is what makes
    the grid follow pan and zoom for free: the game's own
@@ -15,6 +15,8 @@
    the board, under every panel. */
 #include "../../sdk/tc_ui.h"
 #include "../../sdk/tc_ui_draw.h"
+#include "../../sdk/tc_mod_storage.h"
+#include "../../sdk/tc_mod_settings.h"
 
 #include <windows.h>
 #include <cmath>
@@ -36,18 +38,16 @@ V2 (*worldToScreen)(V2) = nullptr;
 void* (*getIO)() = nullptr;
 void* (*getMainViewport)() = nullptr;
 void* (*getBackgroundDrawList)(void*) = nullptr;
-bool (*igCheckbox)(const char*, bool*) = nullptr;
-void (*igSeparator)() = nullptr;
 /* The game's own "which level is loaded" Nim string (a data object, not a
    callable): non-empty means a board is on screen.  Read the header only -
    the characters belong to the game and are not needed here. */
 const void* loadedLevelName = nullptr;
 
-void (*optionsGeneralOriginal)(void*) = nullptr;
-
 bool enabled = true;
-bool hookReady = false;
 std::string configPath;
+tc::mod_storage::ApiV2 storage{};
+bool storageReady = false;
+tc::mod_settings::Api settings{};
 
 void report(const std::string& message) {
     if (host && host->log) host->log(host->context, message.c_str());
@@ -57,38 +57,68 @@ void note(const std::string& message, int level) {
     if (host && host->report_status) host->report_status(host->context, level, message.c_str());
 }
 
-void saveConfig() {
-    if (configPath.empty()) return;
-    std::ofstream file(configPath, std::ios::binary | std::ios::trunc);
-    if (!file) return;
-    file << (enabled ? "grid=1\n" : "grid=0\n");
+int migrateSettings(void*, uint32_t from, uint32_t to, const void* oldData,
+                    uint32_t oldSize, void* newData, uint32_t capacity,
+                    uint32_t* newSize) {
+    if (!newData || !newSize || from != 0 || to != 1 || capacity < 1)
+        return TC_MOD_STORAGE_MIGRATE_REJECT;
+    std::string old;
+    if (oldData && oldSize) old.assign(static_cast<const char*>(oldData), oldSize);
+    const char value = old.find("grid=0") != std::string::npos || old == "0" ? '0' : '1';
+    *static_cast<char*>(newData) = value;
+    *newSize = 1;
+    return TC_MOD_STORAGE_MIGRATE_OK;
 }
 
-void loadConfig() {
-    if (configPath.empty()) return;
-    std::ifstream file(configPath, std::ios::binary);
-    if (!file) return;
-    std::string line;
-    while (std::getline(file, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        if (line == "grid=0") enabled = false;
-        if (line == "grid=1") enabled = true;
-    }
+int settingChanged(void*, const char* id, const TCModSettingValueV1* value) {
+    if (!id || std::strcmp(id, "grid") != 0 || !value ||
+        value->type != TC_MOD_SETTING_BOOL) return TC_MOD_SETTINGS_ERR_ARGUMENT;
+    enabled = value->integer != 0;
+    report(std::string("board grid: ") + (enabled ? "on" : "off"));
+    return TC_MOD_SETTINGS_OK;
 }
 
-/* The game's Options page, General tab: the original draws the settings, then
-   this appends one row of its own - the switch a player expects to find
-   there. */
-void hookOptionsGeneral(void* presenter) {
-    if (optionsGeneralOriginal) optionsGeneralOriginal(presenter);
-    if (!igCheckbox || !igSeparator) return;
-    igSeparator();
-    bool value = enabled;
-    if (igCheckbox("显示网格 (board grid)", &value)) {
-        enabled = value;
-        saveConfig();
-        report(std::string("board grid: ") + (enabled ? "on" : "off"));
+bool registerSetting() {
+    storageReady = tc::mod_storage::tableV2(host, &storage);
+    if (!storageReady || !tc::mod_settings::table(host, &settings)) return false;
+
+    /* Import the pre-service text file only when no loader-owned value exists. */
+    if (tc::mod_storage::has(storage, TC_MOD_STORAGE_SCOPE_GLOBAL, "settings") == 0 &&
+        !configPath.empty()) {
+        std::ifstream file(configPath, std::ios::binary);
+        if (file) {
+            const std::string legacy((std::istreambuf_iterator<char>(file)), {});
+            tc::mod_storage::writeText(storage, TC_MOD_STORAGE_SCOPE_GLOBAL,
+                                       "settings", legacy);
+        }
     }
+    uint32_t version = 0;
+    const char defaultValue = '1';
+    const int migration = tc::mod_storage::migrate(
+        storage, TC_MOD_STORAGE_SCOPE_GLOBAL, "settings", 1,
+        &defaultValue, 1, &migrateSettings, nullptr, &version);
+    if (migration != TC_MOD_STORAGE_OK) {
+        report(std::string("board grid: settings migration failed: ") +
+               tc::mod_storage::errorText(migration));
+        return false;
+    }
+
+    TCModSettingFieldV1 field{};
+    field.size = sizeof(field);
+    field.type = TC_MOD_SETTING_BOOL;
+    field.scope = TC_MOD_STORAGE_SCOPE_GLOBAL;
+    field.id = "grid";
+    field.label = "Show board grid";
+    field.description = "Draw integer board coordinates behind components and panels.";
+    field.storage_key = "settings";
+    field.default_integer = 1;
+    if (tc::mod_settings::setFields(settings, &field, 1, &settingChanged, nullptr) !=
+        TC_MOD_SETTINGS_OK) return false;
+    TCModSettingValueV1 value{};
+    if (tc::mod_settings::get(settings, "grid", &value) != TC_MOD_SETTINGS_OK)
+        return false;
+    enabled = value.integer != 0;
+    return true;
 }
 
 /* True while a board is on screen: the level object the game considers loaded
@@ -202,31 +232,20 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
     getIO = engine<void* (*)()>("igGetIO");
     getMainViewport = engine<void* (*)()>("igGetMainViewport");
     getBackgroundDrawList = engine<void* (*)(void*)>("igGetBackgroundDrawList");
-    igCheckbox = engine<bool (*)(const char*, bool*)>("igCheckbox");
-    igSeparator = engine<void (*)()>("igSeparator");
     loadedLevelName = host->resolve_alias(host->context, "level.loaded");
     if (!worldToScreen || !getIO || !getMainViewport || !getBackgroundDrawList)
         report("board grid: board transform unavailable; the grid stays off");
 
     if (h->data_directory_utf8 && *h->data_directory_utf8) {
         configPath = std::string(h->data_directory_utf8) + "\\board-grid.txt";
-        loadConfig();
     }
-
-    if (h->create_hook) {
-        void* target = h->resolve_alias(h->context, "options.general");
-        if (target &&
-            h->create_hook(h->context, target, reinterpret_cast<void*>(hookOptionsGeneral),
-                           reinterpret_cast<void**>(&optionsGeneralOriginal)) == 0) {
-            hookReady = true;
-            report("board grid: the Options page carries the switch");
-        } else {
-            report("board grid: Options page hook refused; the setting is unavailable");
-        }
+    if (!registerSetting()) {
+        report("board grid: unified Mod settings service is unavailable");
+        return 4;
     }
-    if (!hookReady) return 4;
+    report("board grid: unified Mod settings page carries the switch");
     note(std::string("网格：") + (enabled ? "开" : "关") +
-             "（设置 → 常规 里可以切换）", 0);
+             "（主菜单 → Mod settings 里可以切换）", 0);
     out->on_frame = &frame;
     return 0;
 }

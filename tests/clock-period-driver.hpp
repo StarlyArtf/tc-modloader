@@ -33,6 +33,10 @@ struct Driver {
     bool done = false;
     int frames = 0;
     int stage = 0;
+    /* tc.component.render V7: 0 = not replaced yet, 1 = waiting for a frame with
+       the new image, 2 = the pixel was checked. */
+    int imageState = 0;
+    int imageFrame = 0;
     int stage_frame = 0;
     uint64_t target = 0;      /* the board component whose box was clicked */
     uint64_t binding = 0;     /* the instance the configuration write lands on */
@@ -171,6 +175,145 @@ struct Driver {
         return false;
     }
 
+    /* tc.component.instances V2: the id the game addresses this component by.
+       A clock placed on the board is its own top level, so the service has to
+       answer with the instance id itself - the real-machine assertion for the
+       call examples/clock now uses instead of parsing the loader's diagnostic
+       file. */
+    bool topLevelOfInstance(uint64_t instance, uint64_t* out) {
+        if (!out) return false;
+        tc::component_instances::ApiV2 apiV2{};
+        if (!tc::component_instances::tableV2(host, &apiV2)) return false;
+        std::vector<TCComponentInstanceHandle> handles(16);
+        uint32_t written = 0, total = 0;
+        int status = tc::component_instances::enumerate(
+            g_instancesApi, kClockId, handles.data(),
+            static_cast<uint32_t>(handles.size()), &written, &total);
+        if (status == TC_COMPONENT_INSTANCES_ERR_RANGE && total > handles.size()) {
+            handles.resize(total);
+            status = tc::component_instances::enumerate(
+                g_instancesApi, kClockId, handles.data(),
+                static_cast<uint32_t>(handles.size()), &written, &total);
+        }
+        if (status != TC_COMPONENT_INSTANCES_OK) return false;
+        for (uint32_t i = 0; i < written; ++i) {
+            if (handles[i].instance_id != instance) continue;
+            return tc::component_instances::topLevelId(apiV2, handles[i], out) ==
+                   TC_COMPONENT_INSTANCES_OK;
+        }
+        return false;
+    }
+
+    /* The other half of tc.component.render V7: replacing the image a Mod drew
+       with, and seeing the new pixels on the board.  The playtest writes a solid
+       PNG and points TC_CLOCK_IMAGE at it; with the clock's own "bit-sprite" key
+       replaced, the value mark has to turn that colour on the next drawn frame.
+       The GL back buffer is read in process - an outside capture of this
+       independent-flip window is black (see tests/icon-probe.cpp). */
+    bool readPixel(int x, int y, unsigned char* rgba) {
+        static void (*getIntegerv)(unsigned, int*) = nullptr;
+        static void (*readPixels)(int, int, int, int, unsigned, unsigned, void*) = nullptr;
+        static void (*pixelStore)(unsigned, int) = nullptr;
+        if (!getIntegerv) {
+            HMODULE module = LoadLibraryA("opengl32.dll");
+            if (!module) return false;
+            void* address = reinterpret_cast<void*>(GetProcAddress(module, "glGetIntegerv"));
+            std::memcpy(&getIntegerv, &address, sizeof(getIntegerv));
+            address = reinterpret_cast<void*>(GetProcAddress(module, "glReadPixels"));
+            std::memcpy(&readPixels, &address, sizeof(readPixels));
+            address = reinterpret_cast<void*>(GetProcAddress(module, "glPixelStorei"));
+            std::memcpy(&pixelStore, &address, sizeof(pixelStore));
+        }
+        if (!getIntegerv || !readPixels || !pixelStore || !rgba) return false;
+        int viewport[4] = {};
+        getIntegerv(0x0ba2 /* GL_VIEWPORT */, viewport);
+        const int width = viewport[2], height = viewport[3];
+        if (x < 0 || y < 0 || x >= width || y >= height) return false;
+        pixelStore(0x0d05 /* GL_PACK_ALIGNMENT */, 1);
+        /* GL rows come back bottom-up; the recorded centre is in client
+           coordinates, top-down. */
+        readPixels(x, height - 1 - y, 1, 1, 0x1908 /* GL_RGBA */,
+                   0x1401 /* GL_UNSIGNED_BYTE */, rgba);
+        return true;
+    }
+
+    /* Loads the replacement image once, then (a frame later) reads the pixel the
+       value mark painted.  Returns false only when the run has to stop. */
+    bool checkReplacedImage(int now) {
+        char buffer[512] = {};
+        const DWORD length = GetEnvironmentVariableA("TC_CLOCK_IMAGE", buffer, sizeof(buffer));
+        const std::string path =
+            length && length < sizeof(buffer) ? std::string(buffer, length) : std::string();
+        if (path.empty()) return true;
+        if (imageState == 0) {
+            tc::component_render::ApiV7 render{};
+            if (!tc::component_render::tableV7(host, &render)) {
+                fail("this loader has no tc.component.render V7 to replace an image with");
+                return false;
+            }
+            TCComponentRenderImageV1 image{};
+            const int status = tc::component_render::loadImage(render, "bit-sprite",
+                                                               path.c_str(), &image);
+            if (status != TC_COMPONENT_RENDER_OK || !image.image) {
+                fail(std::string("replacing the clock's image failed: ") +
+                     tc::component_render::errorText(status));
+                return false;
+            }
+            if (image.revision < 2) {
+                fail("replacing an image did not move its revision (still " +
+                     std::to_string(image.revision) + ")");
+                return false;
+            }
+            char line[224] = {};
+            snprintf(line, sizeof(line),
+                     "CLOCK-DRIVER: replaced the clock's own image through "
+                     "tc.component.render V7 (revision %u, %ux%u)",
+                     static_cast<unsigned>(image.revision),
+                     static_cast<unsigned>(image.width), static_cast<unsigned>(image.height));
+            say(line);
+            imageState = 1;
+            imageFrame = now;
+            return true;
+        }
+        if (imageState == 1) {
+            if (now < imageFrame + 3) return true;
+            float centreX = 0.f, centreY = 0.f;
+            {
+                std::lock_guard<std::mutex> lock(g_markMutex);
+                centreX = g_markCentreX;
+                centreY = g_markCentreY;
+            }
+            if (centreX < 0.f || centreY < 0.f) {
+                if (now > imageFrame + 120) {
+                    fail("the value mark was never drawn after the image was replaced");
+                    return false;
+                }
+                return true;
+            }
+            unsigned char rgba[4] = {};
+            if (!readPixel(static_cast<int>(centreX), static_cast<int>(centreY), rgba)) {
+                fail("the back buffer could not be read at the value mark");
+                return false;
+            }
+            char line[224] = {};
+            snprintf(line, sizeof(line),
+                     "CLOCK-DRIVER: the value mark's pixel is rgba(%u,%u,%u,%u) after the "
+                     "replacement image was loaded",
+                     static_cast<unsigned>(rgba[0]), static_cast<unsigned>(rgba[1]),
+                     static_cast<unsigned>(rgba[2]), static_cast<unsigned>(rgba[3]));
+            say(line);
+            /* The replacement PNG is solid magenta: red and blue high, green low.
+               Anything else means the loader's image did not reach the board. */
+            if (!(rgba[0] > 150 && rgba[2] > 150 && rgba[1] < 100)) {
+                fail("the value mark did not paint the replacement image");
+                return false;
+            }
+            imageState = 2;
+            return true;
+        }
+        return true;
+    }
+
     void tick(const TCFrame* frame) {
         if (done) return;
         ++frames;
@@ -205,6 +348,28 @@ struct Driver {
             }
             target = box;
             before = badge.period;
+            uint64_t topLevel = 0;
+            if (!topLevelOfInstance(target, &topLevel)) {
+                fail("the loader did not answer the top level id for the clock "
+                     "(tc.component.instances V2)");
+                return;
+            }
+            if (topLevel != target) {
+                fail("a clock placed on the board is not its own top level id");
+                return;
+            }
+            {
+                char note[192] = {};
+                snprintf(note, sizeof(note),
+                         "CLOCK-DRIVER: tc.component.instances V2 reports top level id "
+                         "0x%llx for the clicked clock",
+                         static_cast<unsigned long long>(topLevel));
+                say(note);
+            }
+            /* Replace the Mod's own image through the service and check that the
+               mark really paints it, before the click stages run. */
+            if (!checkReplacedImage(now)) return;
+            if (imageState != 2) return;
             const int x = static_cast<int>((badge.min_x + badge.max_x) * 0.5f);
             const int y = static_cast<int>((badge.min_y + badge.max_y) * 0.5f);
             char line[224] = {};

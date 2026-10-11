@@ -280,7 +280,8 @@ int wmain(int argc, wchar_t** argv) {
         const std::string mode = argc >= 3 ? tc::fs::path(argv[2]).string() : "chain";
         wchar_t own[32768];
         GetModuleFileNameW(nullptr, own, 32768);
-        tc::Core core(tc::fs::path(own).parent_path());
+        const tc::fs::path here = tc::fs::path(own).parent_path();
+        tc::Core core(here);
         core.scan();
         std::set<std::string> selected;
         for (auto& mod : core.mods) {
@@ -296,7 +297,13 @@ int wmain(int argc, wchar_t** argv) {
         /* Every loader line also lands in host.log: the crash scenario makes a
            plugin fault on purpose, and an abnormal exit must not hide the lines
            that say how far the loader got. */
-        tc::NativeRuntime runtime(core, engine, {}, [](const std::string& line) {
+        /* The runtime's Mod-storage member needs a real save root; the loader
+           always passes the game's own profile directory, and a harness has to
+           stand one up instead of passing an empty path. */
+        const tc::fs::path profile = here / L"profile";
+        std::error_code profileError;
+        tc::fs::create_directories(profile, profileError);
+        tc::NativeRuntime runtime(core, engine, profile, [](const std::string& line) {
             std::cout << line << "\n";
             std::ofstream log("host.log", std::ios::app);
             log << line << "\n";

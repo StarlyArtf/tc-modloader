@@ -6,7 +6,7 @@
 # `invert=1` the values it publishes are the opposite of the ones it computed, so
 # the report proves the bytes carry what *we* wrote rather than what the game's
 # own program wrote a moment earlier.
-param([switch]$Invert, [switch]$Disabled)
+param([switch]$Invert, [switch]$Disabled, [switch]$Viewer)
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
@@ -33,7 +33,7 @@ Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\dev.enter-board.mod') -Destina
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\dev.sandbox-sim.mod') -Destination (Join-Path $taskRoot 'mods\dev.sandbox-sim.mod')
 # The switch is a file (S2 keeps it out of the settings page until M3): with it
 # absent the Mod does nothing, which is the default this test also relies on.
-"enabled=$(if ($Disabled) { 0 } else { 1 })`ninvert=$(if ($Invert) { 1 } else { 0 })`ngate_delay=8`nfree_run=2`nown_cycle=1`n" | Set-Content -LiteralPath (Join-Path $taskSimData 'sandbox-sim.txt') -Encoding ascii
+"enabled=$(if ($Disabled) { 0 } else { 1 })`ninvert=$(if ($Invert) { 1 } else { 0 })`nview=$(if ($Viewer) { 1 } else { 0 })`ngate_delay=8`nfree_run=2`nown_cycle=1`n" | Set-Content -LiteralPath (Join-Path $taskSimData 'sandbox-sim.txt') -Encoding ascii
 $taskSolution = Join-Path $taskRepo 'build\and2_solution_builtin.data'
 if (!(Test-Path -LiteralPath $taskSolution)) { throw 'Missing build\and2_solution_builtin.data; run build.ps1 first' }
 Copy-Item -LiteralPath $taskSolution -Destination (Join-Path $taskSchema 'circuit.data')
@@ -75,6 +75,24 @@ if ($Disabled) {
 }
 if (!(Test-Path -LiteralPath $taskReport)) {
   throw "The sandbox simulator wrote no report; loader log tail:`n" + (Get-Content $taskLog -Tail 12 | Out-String)
+}
+$taskLogText = Get-Content -LiteralPath $taskLog -Raw
+if ($Viewer) {
+  if ($taskLogText -notmatch 'sandbox-sim: started the viewer: "([^"]*simcore-view\.exe)" --board .* --watch') {
+    throw "The packaged simcore viewer was not started: $taskLogText"
+  }
+  $taskViewerPath = $Matches[1]
+  if ($taskViewerPath -notlike "$taskRoot*") {
+    throw "The viewer did not come from this sandbox's extracted package: $taskViewerPath"
+  }
+  foreach ($taskViewerProcess in Get-Process -Name 'simcore-view' -ErrorAction SilentlyContinue) {
+    try {
+      if ($taskViewerProcess.Path -eq $taskViewerPath) {
+        Stop-Process -Id $taskViewerProcess.Id -ErrorAction SilentlyContinue
+      }
+    } catch {}
+  }
+  "The sandbox automatically opened its packaged simcore-view.exe with --watch"
 }
 $taskText = Get-Content -LiteralPath $taskReport -Raw
 Write-Output $taskText

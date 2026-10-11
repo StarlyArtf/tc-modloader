@@ -12,7 +12,7 @@
 | 游戏外观的按钮 | `tc::game_ui::menu_button()` | 颜色／布局取自已锁定构建，**未做像素级截图比对** |
 | 自定义图形／交互画布 | `tc::ui::Canvas`（`tc_ui_draw.h`） | 真实引擎连续 180 帧；图元、顶点坐标与颜色、移动／缩放、滚动、裁剪恢复回归 |
 | 键盘按键 | `tc::ui::keys::pressed()`（`Key_*`） | 真实按键消息实测：Tab/Enter/Escape/字母到达插件控件，枚举值与 ImGuiKey 一致 |
-| 文本输入／中文 | `tc::ui::inputText()` | 真实按键路径实测一个按键一个字符、不重不漏；UTF-8 中文码元（含 `WM_IME_CHAR`）可进入缓冲区；组合串与候选窗仍需人工验收 |
+| 文本输入／中文 | `tc::ui::inputText()` / `inputTextMultiline()` | 真实按键路径实测一个按键一个字符、不重不漏；UTF-8 中文码元（含 `WM_IME_CHAR`）可进入缓冲区；多行 ABI 已由 TC-Verilog 编辑页接入；组合串与候选窗仍需人工验收 |
 
 ## 电路板侧栏插槽（`tc::ui::registerBoardPanel`）
 
@@ -139,6 +139,10 @@ tc::ui::registerComponentPanel("editor", rows, nullptr, host);
 - 一个 Mod 只注册一个这样的插槽（面板一次只显示一个元件），按传进来的实例 id 决定画哪几行。
 - 老加载器没有这个插槽时返回 -1，Mod 应当退化成"没有编辑器"而不是失败；`local.float-ops` 的
   实现与截图见 [../verification.md](../verification.md) 的同名小节。
+- **只想要普通属性行，不用自己开窗口**：把字段表交给 `tc.component.editor`
+  （[services.md](services.md#tccomponenteditor声明式属性行)）即可——宿主会在游戏自己的抽屉上画
+  行、收鼠标键盘、按 storage 的同一条路提交，一次提交一步撤销。上面那套"自己开无背景窗口"的
+  写法留给需要自定义行绘制的 Mod。
 
 ---
 
@@ -485,6 +489,57 @@ DRIVER: CONFIRMED - a click reached a widget inside the page container
 
 剩下的只有视觉比对与"进关卡自动关页"两项待人工确认（见 `docs/verification.md`）。
 
+## 代码编辑器控件（`sdk/tc_code_editor.h`）
+
+源码页要的不是一个普通文本框，而是"像编辑器"的输入区：
+
+```cpp
+#include "tc_code_editor.h"
+// tc_mod_load 里，tc::ui::load(host) 之后调用一次：
+tc::ui::loadCodeEditor(host);
+...
+static tc::ui::CodeEditorState state;                    // 每个编辑器一份，随面板长期持有
+if (tc::ui::codeEditor("##source", buffer, capacity, {width, height}, &state))
+    capture(buffer);                                     // 本帧文本有改动
+```
+
+它是**增量**能力：`codeEditorAvailable()` 说明当前构建是否支持，缺任何一条导出都自动退回
+`inputTextMultiline`，插件不会因此失败（加载器日志里写一行原因）。它提供：
+
+- **行号装订区**：宽度取最长行号，数字右对齐，光标所在行用亮色；装订区有底色和分隔线。
+- **Verilog 着色**：关键字、`$系统任务`、`` `编译指令 ``、带位宽／基数的数字（`8'hFF`、`'d10`）、
+  字符串、`//` 与 `/* */` 注释，用控件自己的调色板，不读游戏样式表。
+- **回车缩进**：回车沿用上一行的缩进；上一行以 `begin`／`case`／`else`／`generate` 之类收尾时
+  多一级，新行以 `end`／`endcase`／`endmodule` 之类开头时少一级；Tab 插入真正的制表符
+  （用 Tab 缩进的文件不会被改写成空格）。
+- **编辑行为仍是引擎那一套**：光标、选区、鼠标拖选、双击选词、Home/End、撤销重做、IME 都由
+  `igInputTextMultiline` 负责，插件没有第二份编辑状态，也没有第二套键位。
+
+三处实现上的坑，都记在这里以免重复踩：
+
+1. **父窗口画的字会被输入框盖住。** 多行 `InputText` 会把文字画进它**自己创建的子窗口**，
+   而 ImGui 渲染子窗口晚于父窗口（`AddWindowToDrawData` 先父后子），所以叠加在父窗口绘制
+   列表上的着色文字会被输入框自己的文字覆盖——实测表现是"关键字只有一圈淡色描边"。控件的
+   做法是：一旦输入回调证明本构建的回调结构与预期一致，就把 `ImGuiCol_Text` 推成全透明并
+   **自己按行重画全部文本**。光标用的是 `ImGuiCol_InputTextCursor`、选区有 `ImGuiCol_TextSelectedBg`，
+   两者都不受透明文字影响，所以光标与选区还是引擎画的。验证之前保持普通文本可见、只叠加
+   关键字颜色，最坏情况是"颜色淡一点"，不会变成空白框。
+2. **回调结构只能靠这个构建自己。** `ImGuiInputTextCallbackData` 的字段偏移是从引擎导出的
+   `ImGuiInputTextCallbackData_InsertChars`／`_DeleteChars`／`_SelectAll` 机器码里读出来的
+   （与 ImGui 1.92.6 的头文件逐字段吻合），并用 `static_assert` 钉在编译期；回调只对本控件
+   请求过的两个事件（`CallbackAlways`／`CallbackEdit`）做任何事，且先过一遍范围检查和
+   `strlen(Buf) == BufTextLen`，任何一条不满足就整帧不再碰缓冲区并让控件退回普通文本。
+3. **子窗口会盖住装订区之外的一切。** 输入框的子窗口只覆盖输入框自己的矩形，所以装订区的
+   背景与行号画在它左边是安全的；如果需要更宽的装饰，得先看这一条。
+
+回归：
+
+- `tests/tc-code-editor.cpp`（`build\tc-code-editor-test.exe`，由 `build.ps1` 编译运行）用
+  自己的 `InsertChars` 桩驱动真实回调，断言 Enter 的四种缩进决定、Tab 缩进原样保留、多字符
+  编辑与非法事件不动缓冲区、短缓冲区被拒绝，以及没有引擎时报告不可用。
+- 真机侧 `tests/tc-verilog-project-playtest.ps1` 抓整页截图后按调色板数像素（关键字 ≥ 500、
+  数字 ≥ 60 个纯色像素），所以"截图里真的有高亮"是自动判定的。
+
 ## 游戏外观按钮（`sdk/tc_game_ui.h`）
 
 `menu_button()` 用菜单自己的文字颜色 + 透明底框复刻主菜单条目，`framed_button()`
@@ -595,7 +650,7 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
 | 窗口 | `panel`（定位 + 尺寸 + 字号 + Begin 一步到位）、`Window` 作用域 |
 | 布局 | `sameLine`、`newLine`、`spacing`、`separator`、`setCursorPos`、`setNextItemWidth`、`setNextWindowPos`、`setNextWindowSize`、`setNextWindowBgAlpha` |
 | 文本 | `text`（UTF-8，不做格式解释）、`textDisabled`、`TextWrap` 作用域 |
-| 控件 | `button`、`smallButton`、`checkbox`、`radioButton`、`sliderFloat`、`inputText`、`colorPicker3`、`colorButton`、`Disabled` 作用域 |
+| 控件 | `button`、`smallButton`、`checkbox`、`radioButton`、`sliderFloat`、`inputText`、`inputTextMultiline`、`colorPicker3`、`colorButton`、`Disabled` 作用域 |
 | 容器 | `Child` 作用域、`pushId`/`popId`、`openPopup`、`beginPopupModal`、`closeCurrentPopup` |
 | 状态 | `isItemHovered`、`isItemDeactivatedAfterEdit`、`isAnyItemActive`、`isMouseDown`、`isMouseClicked`、`mousePos` |
 | 视口 | `viewportSize`、`topRight`、`windowWidth`、`windowHeight` |

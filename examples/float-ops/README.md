@@ -10,9 +10,21 @@
   semantics on top.
 - **M3/M4** (sections 6.2 and 6.3) add the rest of the binary32 catalogue: the
   arithmetic and bit operations, the relations and classification, the integer
-  conversions and Split/Make Bits.  `components.cpp`'s `kCatalogue` table is the
-  single source of truth for all of them - pins, description, board name,
-  symbol, whether the type takes a rounding mode, and the drawer row it shows.
+  conversions and Split/Make Bits.
+- **M6** (section 6.4.1) widens the catalogue to binary16 and binary64.  One
+  format is one component type - a type's pin widths are frozen when it
+  registers, so there is no width-switching instance - which makes the catalogue
+  22 binary16 types, 22 binary32 types and 21 binary64 types (the binary64 FMA
+  is absent: three 64-bit inputs are 192 bits against the loader's 128-bit input
+  budget).
+
+`components.cpp`'s `kFamilies` table is the single source of truth for all of
+them: one row per family - identity, type id, folder, name, description, pins,
+callback, configuration layout and what the body prints - expanded over the
+formats the family exists in.  The concrete types are built once, at load
+(`catalogueStore()`), and every part of the Mod reads them from there: the
+registration loop, the render callback, the drawer rows (`editor.cpp`) and the
+component pictures (`icons.cpp`).
 
 ## M0 probes
 
@@ -44,8 +56,8 @@ pure sinks. Each probe also reports what it saw in the loader log:
 
 ## Board layout
 
-The three M2 components are drawn like the original word parts, because that is
-what a player compares them against: a 4.92 x 2.93 cell body, the name
+Every component is drawn like the original word parts, because that is what a
+player compares them against: a 4.92 x 2.93 cell body, the name
 right-aligned in the top right corner, the width badge in the top left, the
 value (or the operator) in the middle, and the pin on the 3.0 lane - *outside*
 that body, which is where the stock `Constant`/`Static Value` put theirs
@@ -72,42 +84,66 @@ height and the pin's distance from the body edge.
 ## Editing
 
 There is no window of the Mod's own: selecting one of these components opens the
-game's own component panel at the bottom of the screen, and the Mod's rows are
-drawn inside it, under the game's title, description and pin picture - the same
-place a built-in Constant's label and value fields live
-(`tc::ui::registerComponentPanel`, `components_ui.cpp`):
+game's own component panel at the bottom of the screen, and the rows inside it
+are the **loader's** (`tc.component.editor`): this Mod hands one field table per
+type to `setFields` during `tc_mod_load`, and the host draws, validates and
+commits them through the same configuration path the rest of the Mod uses (one
+commit = one undo step, and the type's `on_config_changed` fires).  That is what
+the rows look like in the panel (`editor.cpp`):
 
 ```text
 标签      [ ................ ]
-常量值    [ 1.5              ]
+值        [ 1.5              ]        (the constant; float over its binary32 bits)
+原始位    [ 0x3FC00000       ]        (the same four bytes as hex - the escape
+                                       hatch for NaN/Inf/denormal patterns)
 舍入模式  (RNE) RNA RTZ RDN RUP      (the adder)
 显示方式  (decimal + hex) ...        (the display)
 ```
 
-The catalogue follows the same shape.  Every type gets the label row; a type
-whose arithmetic rounds (subtract, multiply, divide, square root, fma, round to
-integral, and both directions of the integer conversions) gets the five-mode
-rounding row, and a type with no choice instead explains its pins: the bit order
-of Classify's `Class[10]`, the saturating policy of the conversions, the pin
-split of Split/Make Bits, the quiet relation of Compare, the fixed nearest-even
-quotient of Remainder, or the 2019 semantics of min/max.  On the board every one
-of them is drawn like the three M2 parts: the stock 4.92-cell face, the `32`
-badge, the name in the top right, the symbol in the middle and the pins on the
-3.0 lane outside the body.  Only a side with more than two pins (Compare has
-four outputs, Split Bits three) makes the face taller, centred on its pins.
+The catalogue follows the same shape.  Every type gets the label row, and a type
+whose arithmetic rounds (add, subtract, multiply, divide, square root, fma, round
+to integral, and both directions of the integer conversions) gets the five-mode
+rounding row.  A type with no choice used to show a read-only explanation row;
+that sentence now lives in the type's own `description`, which the game's panel
+already prints under the title, so there is one surface instead of two.  On the
+board every one of them is drawn like the three the vertical slice shipped with:
+the stock 4.92-cell face, the width badge of its own format (`16`, `32` or `64`),
+the name in the top right, the symbol in the middle and the pins on the 3.0 lane
+outside the body.  Only a side with more than two pins (Compare has four outputs,
+Split Bits three) makes the face taller, centred on its pins.
+
+All three widths edit their Constant the same way: a **值** row whose text is a
+decimal value and a **原始位** row with the same bytes in hexadecimal.  The
+decimal row is the loader's width-aware float field
+(`TC_COMPONENT_FIELD_FLOAT_WIDTH`, 2/4/8 bytes for binary16/32/64), which this
+Mod asked for: it shows the shortest decimal that parses back to the stored
+pattern, accepts `inf`/`nan`/`-0`, and rounds what the player types to the row's
+own width, so `0.1` typed into an FP16 constant stores `0x2E66` and reads back as
+`0.1`.  The hexadecimal row next to it stays the escape hatch for a NaN payload,
+a denormal or an exact test vector.  Everything else - the rounding row, the
+display-mode row, the label - is the same row in all three widths.
+
+The bottom panel's **"在元件工坊编辑"** button is switched off for these types
+(`tc.component.render` V4's `setFoundryButton(..., false)`): a Mod-owned type has
+no player-editable schematic behind it, so the button would only open an empty
+definition.  The panel's layout is unchanged - the host draws that one button
+transparent and inert.
 
 ## The 浮点 folder in the game's own component column
 
-The types live in a folder the **game itself** builds in its right-hand column:
+The types live in folders the **game itself** builds in its right-hand column:
 the pinned build's palette code splits a custom prototype's *name* on `/` and
 walks the parts as parent categories
 (`add_to_menu_tree__presenterZutilities_u12208`; the measurement and the tree's
 node layout are in `docs/research/palette-categories.md`).  So this Mod registers
-its types as `浮点/FP32 Add` and the game files them under a `浮点` category node
-it allocates, draws and destroys itself - the Mod draws no palette, no side
-panel and no popup, and nothing is written into the player's save.
-`TC_FLOATOPS_PALETTE` overrides the prefix (that is how the case compares the
-folded and flat menus with one binary).
+its types as `浮点/<format>/<kind>/<name>` - `浮点/FP32/计算/FP32 Add`,
+`浮点/FP16/转换/I32 To FP16`, `浮点/FP64/比较/FP64 Compare` - and the game files
+them under those nodes, which it allocates, draws and destroys itself.  The width
+comes first because sixty-five rows under one node is not a menu: `浮点` holds
+`FP16`, `FP32` and `FP64`, and each of those holds 计算, 比较, 转换, 位与拆分 and
+常量与显示.  The Mod draws no palette, no side panel and no popup, and nothing is
+written into the player's save.  `TC_FLOATOPS_PALETTE` overrides the prefix (that
+is how the case compares the folded and flat menus with one binary).
 
 ```text
 node=… byte1=2 tag=2 name="自定义"
@@ -115,21 +151,30 @@ node=… byte1=2 tag=2 name="自定义"
   node=… byte1=2 tag=2 name="浮点"
     node=… byte1=2 tag=2 name="M0"                 ← the five compatibility probes
       node=… byte1=1 tag=1 id=0x4633325041535331 name="浮点/M0/FP32 M0 Pass"
-    node=… byte1=1 tag=1 id=0x4633324144445f31 name="浮点/FP32 Add"
-    …22 usable types
+    node=… byte1=2 tag=2 name="FP16"
+      node=… byte1=2 tag=2 name="计算"
+        node=… byte1=1 tag=1 id=0x4631364144445f31 name="浮点/FP16/计算/FP16 Add"
+      …
+    node=… byte1=2 tag=2 name="FP32"
+      node=… byte1=2 tag=2 name="计算"
+        node=… byte1=1 tag=1 id=0x4633324144445f31 name="浮点/FP32/计算/FP32 Add"
+      … (22 types: the binary32 block is the one the earlier releases shipped)
+    node=… byte1=2 tag=2 name="FP64"
+      … (21 types: no FP64 Fused Multiply Add - three 64-bit inputs are 192 bits)
 ```
 
 `tests/float-palette-playtest.ps1` is the true-game case: the probe hooks the
 game's own `reload_component_menu` and dumps the tree the palette draws, and the
 case asserts that `自定义` holds a `浮点` category whose subtree is exactly this
-Mod's 27 component ids (22 types plus the five M0 probes) and that none of them is
-listed anywhere else.
+Mod's 70 component ids (65 types plus the five M0 probes), that the FP16/FP32/FP64
+folders exist inside `浮点` and the five kind folders inside them, and that none
+of the ids is listed anywhere else.
 
 Two things the pinned build does *not* offer, both recorded in
 `docs/research/palette-categories.md`: the folder lands *inside* `CUSTOM` (a
 custom prototype's menu path always starts at the game's own 自定义 node, so
 there is no supported way to be a sixth top-level page), and the prefix is part
-of the component's name, so a tooltip in the game reads `浮点/FP32 Add`.
+of the component's name, so a tooltip in the game reads `浮点/FP32/计算/FP32 Add`.
 
 The label is a configuration field (schema 3): empty means "show the type's
 name", which is the stock rule, and anything else is printed in the body's name
@@ -229,7 +274,10 @@ Supported operations: add, subtract, multiply, divide, square root, fused
 multiply-add, IEEE remainder, round-to-integral-exact, negate, absolute,
 copy-sign, compare, classify, minimumNumber and maximumNumber. Every one of them
 takes and returns raw bit patterns - there is no host `float` in the interface -
-and each arithmetic call reports its own five exception flags.
+and each arithmetic call reports its own five exception flags.  Each of them
+exists in binary16, binary32 and binary64 (the integer conversions keep their
+32-bit integer side), except the fused multiply-add, which stops at binary32:
+three 64-bit inputs are 192 bits against the loader's 128-bit input budget.
 
 The plugin runs a kernel self-check at load time and writes one line to the
 loader log, so the shipped DLL proves it links and computes under the loader:
@@ -247,13 +295,17 @@ From the repository root:
 & .\examples\float-ops\build.ps1
 ```
 
-The script compiles and runs the offline compatibility test
-(`tests/float-compat.cpp`), the offline kernel test
+The script compiles and runs four offline tests - the kernel
 (`tests/float-kernel.cpp` against the golden vectors generated by
-`tools/float-vectors.py`), builds `native/float-ops.dll` with the kernel linked
-in, stages a clean package tree (`mod.json` + `native/`) and calls
-`tools/Pack-Mod.ps1` to produce `dist/local.float-ops.mod`. The source directory
-itself is not a valid package root.
+`tools/float-vectors.py`), the binary32 text layer (`tests/float-decimal.cpp`
+against `tools/float-decimal-vectors.py`), the per-width text layer
+(`tests/float-text.cpp`: named spellings, every binary16 pattern and a binary64
+sample) and the registration/compatibility test (`tests/float-compat.cpp`, which
+walks all 65 catalogue types) - then builds `native/float-ops.dll` with the
+kernel linked in, generates the 65 component pictures, stages a clean package
+tree (`mod.json` + `native/` + `files/`) and calls `tools/Pack-Mod.ps1` to
+produce `dist/local.float-ops.mod`. The source directory itself is not a valid
+package root.
 
 `build-kernel.ps1` is the one place that knows how to compile the vendored
 SoftFloat subset plus `fp/fp32.cpp`; it leaves the object list in
@@ -283,6 +335,16 @@ what the package ships.
 # level entry again and then only *selects* the component.  The second visit has
 # to show the saved value with no click - on the board and in the drawer's field.
 & .\tests\float-reentry-playtest.ps1
+
+# True game, the width cut: one Constant -> Add -> Display chain per format on
+# one board.  The loader's own lines have to show 16-bit and 64-bit pins, and
+# the three displays have to print 1.0 + 1.0 as 2 0x4000, 2 0x40000000 and
+# 2 0x4000000000000000.
+& .\tests\float-width-playtest.ps1
+
+# The game's own component column: 浮点 ▸ FP16/FP32/FP64 ▸ the five kind
+# folders, with exactly this Mod's 70 ids inside them.
+& .\tests\float-palette-playtest.ps1
 ```
 
 Both true-game scripts build a test-only driver package (the real plugin object

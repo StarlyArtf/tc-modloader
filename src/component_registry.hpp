@@ -66,8 +66,14 @@ inline Type prepared(Type type) {
     if(type.inputs.size()>kMaxPinsPerDirection)type.inputs.resize(kMaxPinsPerDirection);
     if(type.outputs.size()>kMaxPinsPerDirection)type.outputs.resize(kMaxPinsPerDirection);
     type.capabilities=0;
-    if(type.active&&type.implementation==TC_COMPONENT_IMPL_NATIVE_CALLBACK)
+    /* Both implementations run real logic in the game: a bridged callback, or a
+       netlist the game compiles itself.  The flag that tells them apart is
+       `implementation`, and COMPOSITE additionally sets its own bit. */
+    if(type.active&&(type.implementation==TC_COMPONENT_IMPL_NATIVE_CALLBACK||
+                     type.implementation==TC_COMPONENT_IMPL_COMPOSITE))
         type.capabilities|=TC_COMPONENT_CAP_LOGIC;
+    if(type.active&&type.implementation==TC_COMPONENT_IMPL_COMPOSITE)
+        type.capabilities|=TC_COMPONENT_CAP_COMPOSITE;
     const auto wide=[](const std::vector<Pin>& pins){
         for(const auto& pin:pins)if(pin.bits>1)return true;
         return false;
@@ -174,6 +180,16 @@ inline void dropMod(const std::string& owner_mod) {
     entries.erase(std::remove_if(entries.begin(),entries.end(),
                                  [&](const Type& entry){return entry.owner_mod==owner_mod;}),
                   entries.end());
+}
+
+inline void dropType(uint64_t custom_id,const std::string& owner_mod) {
+    if(!custom_id)return;
+    std::lock_guard<std::mutex> lock(mutex);
+    entries.erase(std::remove_if(entries.begin(),entries.end(),
+                                 [&](const Type& entry){
+                                     return entry.custom_id==custom_id&&
+                                            (owner_mod.empty()||entry.owner_mod==owner_mod);
+                                 }),entries.end());
 }
 
 inline uint32_t count() {

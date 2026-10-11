@@ -41,6 +41,7 @@ namespace tc {
 namespace component_instances {
 
 using Api = TCComponentInstancesApiV1;
+using ApiV2 = TCComponentInstancesApiV2;
 using Handle = TCComponentInstanceHandle;
 using Info = TCComponentInstanceInfoV1;
 
@@ -58,6 +59,73 @@ inline bool table(const TCHost* host, Api* out) {
         return false;
     *out = queried;
     return true;
+}
+
+/* The same table plus `top_level_id`.  A Mod that wants the game's own
+   selection/top-level id must ask for V2: querying V1 still answers, it just
+   has no way to give the caller that pair.  The V1 calls stay callable on the
+   returned table (they are the same pointers), so a consumer keeps one ApiV2
+   value and passes it to the helpers below.
+
+   ```cpp
+   tc::component_instances::ApiV2 instances{};
+   if (tc::component_instances::tableV2(host, &instances)) {
+       uint64_t top = 0;
+       if (tc::component_instances::topLevelId(instances, handle, &top) ==
+           TC_COMPONENT_INSTANCES_OK) {
+           // `top` is what the game's selected-component set addresses; it
+           // equals handle.instance_id for a component placed on the board.
+       }
+   }
+   ```
+
+   Degrading: a loader that only knows V1 answers ERR_VERSION here, and the Mod
+   can keep its own fallback (examples/clock reads the older
+   `interactive-map.txt` diagnostic in that case) - it must not read the file
+   when the service is available, or the two sources can disagree mid-frame. */
+inline bool tableV2(const TCHost* host, ApiV2* out) {
+    if (!host || !out || !host->query_service) return false;
+    ApiV2 queried{};
+    if (host->query_service(host->context, TC_SERVICE_COMPONENT_INSTANCES,
+                            TC_COMPONENT_INSTANCES_API_VERSION_2, &queried,
+                            sizeof(queried)) != TC_SERVICE_OK)
+        return false;
+    if (queried.size < sizeof(queried) ||
+        queried.version != TC_COMPONENT_INSTANCES_API_VERSION_2 || !queried.context ||
+        !queried.enumerate || !queried.validate || !queried.info || !queried.state ||
+        !queried.reset || !queried.top_level_id)
+        return false;
+    *out = queried;
+    return true;
+}
+
+/* The V1 half of a V2 table, so a consumer that needs both reads like one API.
+   Built field by field rather than by casting: the two structs share a layout,
+   but they are different C++ types. */
+inline Api v1(const ApiV2& api) {
+    Api view{};
+    view.size = sizeof(view);
+    view.version = TC_COMPONENT_INSTANCES_API_VERSION_1;
+    view.context = api.context;
+    view.enumerate = api.enumerate;
+    view.validate = api.validate;
+    view.info = api.info;
+    view.state = api.state;
+    view.reset = api.reset;
+    return view;
+}
+
+/* The id the game's selection set and top-level lookups use for this instance.
+   For a component placed directly on the board this is its own instance id.
+   `out` is left at 0 unless the call answers OK, so a caller that ignores the
+   status still cannot act on a half-written answer. */
+inline int topLevelId(const ApiV2& api, const Handle& handle, uint64_t* out) {
+    if (!out) return TC_COMPONENT_INSTANCES_ERR_ARGUMENT;
+    if (!api.top_level_id) return TC_COMPONENT_INSTANCES_ERR_UNAVAILABLE;
+    *out = 0;
+    const int status = api.top_level_id(api.context, &handle, out);
+    if (status != TC_COMPONENT_INSTANCES_OK) *out = 0;
+    return status;
 }
 
 /* Handles of live instances; custom_id 0 asks for every type.  Returns the

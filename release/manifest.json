@@ -9,6 +9,8 @@
       ".gitattributes",
       ".gitignore",
       "build.ps1",
+      "build-text-box.ps1",
+      "build-wire-palette.ps1",
       "package.ps1",
       "README.md",
       "LICENSE",
@@ -16,11 +18,13 @@
     ],
     "trees": [
       "abi",
+      "assets",
       "compat",
       "docs",
       "examples",
       "release",
       "sdk",
+      "simcore",
       "src",
       "tests",
       "tools",
@@ -47,6 +51,7 @@
       { "source": "tools/abi.ps1", "target": "tools/abi.ps1" },
       { "source": "tools/abi-snapshot.cpp", "target": "tools/abi-snapshot.cpp" },
       { "source": "abi/windows-x64.json", "target": "abi/windows-x64.json" },
+      { "source": "vendor/json.hpp", "target": "vendor/json.hpp" },
       { "source": "release/manifest.json", "target": "release-manifest.json" }
     ],
     "trees": [
@@ -69,6 +74,7 @@
       { "source": "dist/example.custom-or.mod", "target": "example.custom-or.mod", "id": "example.custom-or" },
       { "source": "dist/example.cycle-guard.mod", "target": "example.cycle-guard.mod", "id": "example.cycle-guard" },
       { "source": "dist/example.drawing-demo.mod", "target": "example.drawing-demo.mod", "id": "example.drawing-demo" },
+      { "source": "dist/example.tc-verilog-ram.mod", "target": "example.tc-verilog-ram.mod", "id": "example.tc-verilog-ram" },
       { "source": "dist/dev.menu-demo.mod", "target": "dev.menu-demo.mod", "id": "dev.menu-demo" },
       { "source": "dist/example.waveform-demo.mod", "target": "example.waveform-demo.mod", "id": "example.waveform-demo" },
       { "source": "dist/tcmod.mod-inspector.mod", "target": "tcmod.mod-inspector.mod", "id": "tcmod.mod-inspector" },

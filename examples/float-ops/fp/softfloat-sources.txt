@@ -1,16 +1,40 @@
-# SoftFloat 3e sources the binary32 kernel needs.
+# SoftFloat 3e sources the float-ops kernel needs: binary16, binary32 and
+# binary64 arithmetic, the integer conversions in both directions and the
+# helpers they share.
 #
-# This is the transitive closure of the symbols fp/fp32.cpp calls: every file
-# below was picked by compiling the whole upstream source tree once, reading
-# each object's defined/undefined symbols and walking the reference graph from
-# those entry points.  Files not listed here (f16, f64, extF80, f128, their
-# helpers, and even f32_eq/lt/le, because the kernel implements the project's
-# compare and classify itself) are neither vendored nor compiled.  See
-# third_party/berkeley-softfloat-3/README.md for the upstream commit and the
-# exact procedure; the integer conversions joined the list with the M4
-# catalogue (f32_to_i32/f32_to_ui32/i32_to_f32/ui32_to_f32 and the two rounding
-# helpers they need).
+# This is the transitive closure of the symbols the kernel calls, not a
+# hand-picked list: the whole upstream source tree is compiled once, each
+# object's defined/undefined symbols are read with nm, and the reference
+# graph is walked from the kernel's entry points.  Files outside that
+# closure - the extF80/f128 families, their helpers, and f16/f32/f64_eq/lt/le
+# because the kernel implements comparison and classification itself - are
+# neither vendored nor compiled.  See third_party/berkeley-softfloat-3/README.md
+# for the upstream commit and the procedure; the integer conversions and the
+# binary16/binary64 families joined the list with the width cut.
 
+# binary16
+source/f16_add.c
+source/f16_div.c
+source/f16_mul.c
+source/f16_mulAdd.c
+source/f16_rem.c
+source/f16_roundToInt.c
+source/f16_sqrt.c
+source/f16_sub.c
+source/f16_to_f32.c
+source/f16_to_i32.c
+source/f16_to_ui32.c
+source/f32_to_f16.c
+source/i32_to_f16.c
+source/s_addMagsF16.c
+source/s_mulAddF16.c
+source/s_normRoundPackToF16.c
+source/s_normSubnormalF16Sig.c
+source/s_roundPackToF16.c
+source/s_subMagsF16.c
+source/ui32_to_f16.c
+
+# binary32
 source/f32_add.c
 source/f32_div.c
 source/f32_mul.c
@@ -23,16 +47,45 @@ source/f32_to_i32.c
 source/f32_to_ui32.c
 source/i32_to_f32.c
 source/s_addMagsF32.c
-source/s_approxRecipSqrt32_1.c
-source/s_approxRecipSqrt_1Ks.c
 source/s_mulAddF32.c
 source/s_normRoundPackToF32.c
 source/s_normSubnormalF32Sig.c
 source/s_roundPackToF32.c
+source/s_subMagsF32.c
+source/ui32_to_f32.c
+
+# binary64
+source/f32_to_f64.c
+source/f64_add.c
+source/f64_div.c
+source/f64_mul.c
+source/f64_mulAdd.c
+source/f64_rem.c
+source/f64_roundToInt.c
+source/f64_sqrt.c
+source/f64_sub.c
+source/f64_to_f32.c
+source/f64_to_i32.c
+source/f64_to_ui32.c
+source/i32_to_f64.c
+source/s_addMagsF64.c
+source/s_mulAddF64.c
+source/s_normRoundPackToF64.c
+source/s_normSubnormalF64Sig.c
+source/s_roundPackToF64.c
+source/s_shiftRightJam128.c
+source/s_subMagsF64.c
+source/ui32_to_f64.c
+
+# shared helpers and library state
+source/s_approxRecipSqrt_1Ks.c
+source/s_approxRecipSqrt32_1.c
 source/s_roundToI32.c
 source/s_roundToUI32.c
-source/s_subMagsF32.c
 source/softfloat_state.c
-source/ui32_to_f32.c
+
+# the one platform specialization (ARM-VFPv2 default NaN)
+source/ARM-VFPv2-defaultNaN/s_propagateNaNF16UI.c
 source/ARM-VFPv2-defaultNaN/s_propagateNaNF32UI.c
+source/ARM-VFPv2-defaultNaN/s_propagateNaNF64UI.c
 source/ARM-VFPv2-defaultNaN/softfloat_raiseFlags.c

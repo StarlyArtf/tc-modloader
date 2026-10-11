@@ -7,7 +7,7 @@
 # can answer:
 #
 #   * a real level with a wide constant produces source containing
-#     game_engine.'tc_dynamic_constant' in both the refresh and cycle phase;
+#     direct runtime loads in both the refresh and cycle phase;
 #   * the game's own compiler accepts that source and keeps running (the level's
 #     sim reaches a cycle, and no fault is recorded);
 #   * the punch tape is still drawn over the wide constant's drawer, captured as
@@ -30,6 +30,8 @@ param(
   # -NoDumpEvidence checks the other half: with the variable unset the game
   # directory stays clean while the tape still works.
   [switch]$NoDumpEvidence,
+  # Exercise setter -> JIT -> state without waiting for UI geometry or a frame.
+  [switch]$RuntimeOnly,
   # Which loader to install as game_engine.dll.  Pointing this at an older
   # loader is how the same case is run against the pre-change build.
   [string]$Loader = ''
@@ -96,6 +98,7 @@ $taskPreviousAppData = $env:APPDATA
 $taskPreviousShot = $env:TC_MODLOADER_SHOT
 $taskPreviousShotDelay = $env:TC_MODLOADER_SHOT_DELAY
 $taskPreviousDump = $env:TC_MODLOADER_DUMP_SOURCE
+$taskPreviousRuntimeOnly = $env:TC_TEST_PUNCH_RUNTIME_ONLY
 try {
   & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply @taskMods
   if($LASTEXITCODE){throw 'Punch tape sandbox apply failed'}
@@ -105,6 +108,7 @@ try {
   $env:TC_MODLOADER_SHOT = $taskShot
   $env:TC_MODLOADER_SHOT_DELAY = "$ShotDelay"
   $env:TC_MODLOADER_DUMP_SOURCE = if($NoDumpEvidence){ '0' } else { '1' }
+  $env:TC_TEST_PUNCH_RUNTIME_ONLY = if($RuntimeOnly){ '1' } else { '0' }
   $taskProcess = Start-Process -FilePath (Join-Path $taskRoot 'Turing Complete.exe') -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru
   $taskDeadline = [DateTime]::UtcNow.AddSeconds($Seconds)
   while([DateTime]::UtcNow -lt $taskDeadline) {
@@ -156,8 +160,8 @@ try {
   $taskCycle = @()
   if(!$NoDumpEvidence) {
     foreach($taskDump in $taskDumps) {
-      $taskRefresh += Select-String -LiteralPath $taskDump.FullName -Pattern "let value_id\d+ = \w+ game_engine\.'tc_dynamic_constant'" -AllMatches
-      $taskCycle += Select-String -LiteralPath $taskDump.FullName -Pattern "var vid\d+ = \w+ game_engine\.'tc_dynamic_constant'" -AllMatches
+      $taskRefresh += Select-String -LiteralPath $taskDump.FullName -Pattern "let value_id\d+ = \w+ (game_engine\.'tc_dynamic_constant'|load\(<U64>, Ptr \d+\) // runtime constant \d+)" -AllMatches
+      $taskCycle += Select-String -LiteralPath $taskDump.FullName -Pattern "var vid\d+ = \w+ (game_engine\.'tc_dynamic_constant'|load\(<U64>, Ptr \d+\) // runtime constant \d+)" -AllMatches
     }
     "runtime constant lines: refresh=$($taskRefresh.Count) cycle=$($taskCycle.Count)"
     if($taskDumps.Count -eq 0) { throw 'The game never compiled a schematic in the sandbox' }
@@ -239,10 +243,14 @@ try {
   }
   $taskStates | ForEach-Object { ($_ -replace '^.*PUNCHDRV: ','') }
   foreach($taskState in $taskStates) {
-    if($taskState -notmatch 'MATCH$') { throw "The circuit did not compute the value the tape set: $taskState" }
+    if($taskState -notmatch ' MATCH$') { throw "The circuit did not compute the value the tape set: $taskState" }
   }
   "the circuit computed the value the tape set"
 
+  if($RuntimeOnly) {
+    'PASS runtime constants: three setter updates, unchanged source count, matching simulation state'
+    return
+  }
   if(!(Test-Path -LiteralPath $taskShot)) { throw 'No frame was captured: the game stopped rendering' }
   if((Get-Item -LiteralPath $taskShot).Length -lt 1024) { throw 'The captured frame is empty' }
   Add-Type -AssemblyName System.Drawing
@@ -258,6 +266,7 @@ try {
   $env:TC_MODLOADER_SHOT = $taskPreviousShot
   $env:TC_MODLOADER_SHOT_DELAY = $taskPreviousShotDelay
   $env:TC_MODLOADER_DUMP_SOURCE = $taskPreviousDump
+  $env:TC_TEST_PUNCH_RUNTIME_ONLY = $taskPreviousRuntimeOnly
   if($taskProcess -and !$taskProcess.HasExited) {
     [void]$taskProcess.CloseMainWindow()
     if(!$taskProcess.WaitForExit(3000)) { Stop-Process -Id $taskProcess.Id -ErrorAction SilentlyContinue }

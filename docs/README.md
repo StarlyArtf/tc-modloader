@@ -18,8 +18,11 @@
 | 事务预检、原生撤销/重做与保存屏障 | [sdk/transactions.md](sdk/transactions.md) |
 | 宿主 API、Hook、线程与生命周期 | [sdk/host-api.md](sdk/host-api.md) |
 | 版本化游戏服务与 Board 句柄 | [sdk/services.md](sdk/services.md) |
+| Mod 自己的全局设置、随存档数据与 schema 迁移 | [sdk/mod-storage.md](sdk/mod-storage.md) |
+| 统一声明式 Mod 设置页 | [sdk/mod-settings.md](sdk/mod-settings.md) |
 | 元件原型、电路导入、内置表、代价与延迟 | [sdk/game-model.md](sdk/game-model.md) |
 | 原生逻辑回调（形状、位宽、相位） | [sdk/custom-logic.md](sdk/custom-logic.md) |
+| 用可综合 Verilog 编写元件逻辑（寄存器、RAM、三态） | [sdk/tc-verilog.md](sdk/tc-verilog.md) |
 | 插件界面（面板、控件、视口、热键） | [sdk/ui.md](sdk/ui.md) |
 | 仿真、board、导线、存档、游戏状态 | [sdk/simulation.md](sdk/simulation.md) |
 | 上限与约束速查 | [reference/limits.md](reference/limits.md) |
@@ -39,13 +42,17 @@
 | 接手：选中提示（白弧）跟随 footprint（2026-09-23 已收口：宿主按类型关掉游戏那圈） | [HANDOFF-selection-hint.md](HANDOFF-selection-hint.md) |
 | 接手：元件接口 V2（阶段 1 收口：脚数 >8 与值模型） | [HANDOFF-component-v2.md](HANDOFF-component-v2.md) |
 | 接手：元件接口 M2（实例、状态与生命周期） | [HANDOFF-component-m2.md](HANDOFF-component-m2.md) |
+| 接手：元件接口 M4（组合电路与原版复用；第一刀=原版类型目录 `tc.component.compose`） | [HANDOFF-component-m4.md](HANDOFF-component-m4.md) |
 | 接手：元件接口 M3 第一刀（配置/仿真状态与内存快照） | [HANDOFF-component-m3.md](HANDOFF-component-m3.md) |
 | 研究：0 脚元件（纯源/纯汇）的导入与调度实测 | [research/custom-component-pins.md](research/custom-component-pins.md) |
 | 研究：原版内存编辑界面（十六进制编辑器、打孔卡、重置数据与只读门） | [research/memory-editor.md](research/memory-editor.md) |
+| 研究：关卡接口——Mod 能不能创建新关卡（2026-09-28：换内容可以，新名字不行） | [research/level-interface.md](research/level-interface.md) |
+| 研究：自定义元件（kind 0x4E）在沙盒里怎么展平成网表 | [research/custom-components.md](research/custom-components.md) |
 | 计划表：已确认想要、等你下令才动手的项目 | [PLAN-backlog.md](PLAN-backlog.md) |
 | 目标计划：完整自定义元件、Keyboard 与 Screen 外设接口 | [PLAN-custom-components.md](PLAN-custom-components.md) |
 | 浮点元件族方案（M0 兼容性与 M1 数值内核已完成 2026-09-25，待做 M2 垂直切片） | [PLAN-float-components.md](PLAN-float-components.md) |
 | 计划：沙盒独立仿真器（对标真实数字电路仿真器，方案） | [PLAN-sandbox-simulator.md](PLAN-sandbox-simulator.md) |
+| 计划：安装器单窗口界面（第一刀～第三刀已完成 2026-09-27，见 verification.md） | [PLAN-installer-ui.md](PLAN-installer-ui.md) |
 | 归档：旧门级延迟源码改写（未使用） | [../unused/gate-delay/README.md](../unused/gate-delay/README.md) |
 | 下一步交接：按优先级排好的动手清单（从"能读"到"能改"） | [HANDOFF-next-steps.md](HANDOFF-next-steps.md) |
 
@@ -61,6 +68,7 @@ docs/
     README.md                总览与头文件地图
     host-api.md              宿主 API 与 Hook
     services.md              版本化服务发现与 Board API
+    mod-storage.md           每 Mod 隔离的全局设置与随存档数据
     game-model.md            元件/原型/代价
     custom-logic.md          自定义逻辑回调
     ui.md                    插件界面（ImGui 封装）
@@ -83,6 +91,7 @@ docs/
  PLAN-custom-components.md  完整自定义元件与外设接口目标计划
 PLAN-float-components.md   浮点元件族方案（M0/M1 已通过，见 §4.4 与 §5.2b；M2 待做）
   PLAN-sandbox-simulator.md  沙盒独立仿真器方案（网表化 + 事件驱动 + 四态 + 时序弧）
+  PLAN-installer-ui.md       安装器单窗口界面（拆分、状态矩阵、内联确认与提权；已落地）
   HANDOFF-next-steps.md      下一步交接（按优先级排好的动手清单）
   HANDOFF-selection-hint.md  选中提示（白弧）跟随 footprint 的交接（已收口；结论与修正见文首）
   research/                  内部研究日志（非发布文档）

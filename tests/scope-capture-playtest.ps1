@@ -24,7 +24,8 @@
 param(
   [string]$Sandbox = (Join-Path (Split-Path $PSScriptRoot) 'build\scope-sandbox'),
   [int]$Seconds = 90,
-  [switch]$KeepRunning
+  [switch]$KeepRunning,
+  [string]$Loader = ''
 )
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
@@ -37,7 +38,28 @@ $taskLog = Join-Path $taskRoot 'tc-modloader-data\loader.log'
 # previous build.
 & (Join-Path $PSScriptRoot 'make-ui-sandbox.ps1') -Sandbox $Sandbox `
   -Mods example.byte-adder,dev.scope-capture-driver
+if ($Loader) { Copy-Item -LiteralPath (Resolve-Path -LiteralPath $Loader).Path -Destination (Join-Path $taskRoot 'game_engine.dll') -Force }
 "Loader under test: $((Get-FileHash (Join-Path $taskRoot 'game_engine.dll') -Algorithm SHA256).Hash)"
+
+# Rebuild only the sandbox's navigation fixture. The distributed example and
+# its component callback remain untouched; the wrapper resolves the Board
+# model even when the drawer's invisible UI button is not drawn.
+$taskFixtureRoot = Join-Path $Sandbox 'scope-byte-adder-fixture'
+$taskFixtureNative = Join-Path $taskFixtureRoot 'native'
+New-Item -ItemType Directory -Force $taskFixtureNative | Out-Null
+$taskCompilerRoot = if ($env:TC_MINGW_BIN) { $env:TC_MINGW_BIN } else { 'C:\msys64\ucrt64\bin' }
+& (Join-Path $taskCompilerRoot 'g++.exe') -std=c++17 -O2 -static -shared `
+  (Join-Path $PSScriptRoot 'scope-byte-adder-driver.cpp') -o (Join-Path $taskFixtureNative 'byte-adder.dll')
+if ($LASTEXITCODE) { throw 'Scope navigation fixture compilation failed' }
+$taskFixtureManifest = Get-Content -LiteralPath (Join-Path $taskRepo 'examples\byte-adder\mod.json') -Raw | ConvertFrom-Json
+$taskFixtureManifest.capabilities = @('log','component','logic','symbol','hook','game_handles')
+$taskFixtureManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $taskFixtureRoot 'mod.json') -Encoding utf8
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$taskFixturePackage = Join-Path $taskRoot 'mods\example.byte-adder.mod'
+Remove-Item -LiteralPath $taskFixturePackage
+[System.IO.Compression.ZipFile]::CreateFromDirectory($taskFixtureRoot, $taskFixturePackage)
+& (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply example.byte-adder dev.scope-capture-driver | Out-Null
+if ($LASTEXITCODE) { throw 'Scope fixture package apply failed' }
 
 # The byte_adder level's test needs a circuit to test: a fresh sandbox has none,
 # so install the built-in 8-bit adder solution into the profile's byte_adder

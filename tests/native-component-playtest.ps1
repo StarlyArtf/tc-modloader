@@ -1,4 +1,4 @@
-param([switch]$Single)
+param([switch]$Single, [switch]$V3)
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskCompiler = if($env:TC_MINGW_BIN) { $env:TC_MINGW_BIN } else { 'C:\msys64\ucrt64\bin' }
@@ -8,6 +8,7 @@ try {
     New-Item -ItemType Directory -Force (Join-Path $taskPackage 'native') | Out-Null
     $taskFlags = @()
     if($Single) { $taskFlags += '-DTC_DECLARATIVE_SINGLE' }
+    if($V3) { $taskFlags += '-DTC_DECLARATIVE_V3' }
     & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared @taskFlags tests/native-component-probe.cpp -o (Join-Path $taskPackage 'native\byte-adder.dll')
     if($LASTEXITCODE) { throw 'Probe compilation failed' }
     Copy-Item examples/byte-adder/mod.json $taskPackage -Force
@@ -18,5 +19,5 @@ try {
     & ./build/native-component-board.exe
     if($LASTEXITCODE) { throw 'Board generation failed' }
     $taskBoard = if($Single) { 'build/nl_double8board.data' } else { 'build/declarative-8x8-board.data' }
-    & ./tests/byte-adder-smoke.ps1 -PackagePath $taskMod -SchematicPath (Join-Path $taskRepo $taskBoard) -Stress -Single:$Single
+    & ./tests/byte-adder-smoke.ps1 -PackagePath $taskMod -SchematicPath (Join-Path $taskRepo $taskBoard) -Stress -Single:$Single -V3:$V3
 } finally { Pop-Location }

@@ -9,19 +9,30 @@ License: see `COPYING.txt` (BSD 3-clause, retained verbatim).
 
 ## What is here
 
-Only the sources the float-ops binary32 kernel actually calls, plus the headers
-they include and one platform specialization:
+Only the sources the float-ops kernel actually calls, plus the headers they
+include and one platform specialization.  The kernel now covers three widths -
+binary16, binary32 and binary64 - so the list is the union of the three
+closures:
 
 ```text
 source/include/                       upstream headers (softfloat.h, internals.h,
                                       primitives.h, primitiveTypes.h,
                                       softfloat_types.h, opts-GCC.h)
-source/*.c                            the 17 binary32 files listed in
-                                      ../../fp/softfloat-sources.txt
-source/ARM-VFPv2-defaultNaN/          specialize.h + the two files reachable
-                                      from the kernel
+source/*.c                            the 64 arithmetic/conversion/helper files
+                                      listed in ../../fp/softfloat-sources.txt
+source/ARM-VFPv2-defaultNaN/          specialize.h + the four files reachable
+                                      from the three widths' NaN paths
 COPYING.txt                           upstream license
 ```
+
+The f16 and f64 families joined with the width cut (the Mod's per-instance
+format): the closure is recomputed by compiling the whole upstream tree once,
+reading each object's defined/undefined symbols with `nm` and walking the
+reference graph from the kernel's entry points, which is why
+`../../fp/softfloat-sources.txt` is a generated list rather than a hand-picked
+one.  Files outside the closure - extF80/f128 and their helpers, and
+f16/f32/f64 `_eq`/`_lt`/`_le` because the kernel implements comparison and
+classification itself - are still not vendored.
 
 Nothing in this tree is modified: the files are byte-identical to the upstream
 commit above. The build configuration (include paths, `SOFTFLOAT_*` option

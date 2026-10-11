@@ -180,4 +180,113 @@ function Read-TcModArchive {
   } finally { $taskStream.Dispose() }
 }
 
-Export-ModuleMember -Function Get-TcArchiveTimestamp, New-TcDeterministicZip, Read-TcModArchive, Test-TcChildPath
+# ---- the installer's own payload -------------------------------------------
+#
+# The installer is the one file a player runs: it carries the loader it deploys
+# as resource 101 (RCDATA) and the version as a Windows version resource, and
+# both come out of build.ps1 in order - the loader first, then the version
+# block, then the installer linked around that loader.  Nothing used to read the
+# pair back, so a release could stage an installer that deploys something else:
+# `-UseExistingBuild` skips the build entirely, and a dist/ whose
+# tc-loader.dll was replaced by a hand-built DLL (the trap
+# docs/HANDOFF-punch-tape-runtime-constants.md describes) leaves an installer
+# embedding the older one.  Both halves are cheap to read out of the PE file, so
+# a release (and the fast-tier release contract) refuses a mismatched pair.
+$script:TcEmbeddedResourceReaderReady = $false
+
+function Initialize-TcEmbeddedResourceReader {
+  if ($script:TcEmbeddedResourceReaderReady) { return }
+  if (-not ('TcReleaseInstallerReader' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class TcReleaseInstallerReader
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LoadResource(IntPtr module, IntPtr info);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SizeofResource(IntPtr module, IntPtr info);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LockResource(IntPtr data);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr module);
+
+    /* LOAD_LIBRARY_AS_DATAFILE: read the resources of a file that is not - and
+       must not become - a loaded module. */
+    public static byte[] Read(string path, int name, int type)
+    {
+        IntPtr module = LoadLibraryExW(path, IntPtr.Zero, 0x2);
+        if (module == IntPtr.Zero)
+            throw new Exception("could not open " + path + " (Win32 " + Marshal.GetLastWin32Error() + ")");
+        try
+        {
+            IntPtr info = FindResourceW(module, new IntPtr(name), new IntPtr(type));
+            if (info == IntPtr.Zero)
+                throw new Exception("resource " + name + " of type " + type + " is missing from " + path);
+            uint size = SizeofResource(module, info);
+            IntPtr data = LockResource(LoadResource(module, info));
+            if (data == IntPtr.Zero || size == 0)
+                throw new Exception("resource " + name + " of " + path + " is empty");
+            byte[] bytes = new byte[size];
+            Marshal.Copy(data, bytes, 0, (int)size);
+            return bytes;
+        }
+        finally { FreeLibrary(module); }
+    }
+}
+'@
+  }
+  $script:TcEmbeddedResourceReaderReady = $true
+}
+
+function Get-TcSha256 {
+  param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+  $taskSha = [Security.Cryptography.SHA256]::Create()
+  try { return (($taskSha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '') }
+  finally { $taskSha.Dispose() }
+}
+
+function Get-TcInstallerPayload {
+  param([Parameter(Mandatory = $true)][string]$Installer)
+  Initialize-TcEmbeddedResourceReader
+  # 101 RCDATA is the loader the installer deploys (src/setup_resources.rc).
+  return [TcReleaseInstallerReader]::Read($Installer, 101, 10)
+}
+
+function Assert-TcInstallerMatchesRelease {
+  param([Parameter(Mandatory = $true)][string]$Repo)
+  $taskVersion = (Get-Content -LiteralPath (Join-Path $Repo 'VERSION') -Raw).Trim()
+  $taskLoader = Join-Path $Repo 'dist\tc-loader.dll'
+  $taskInstaller = Join-Path $Repo 'dist\TCModLoader-Setup.exe'
+  foreach ($taskPath in @($taskLoader, $taskInstaller)) {
+    if (!(Test-Path -LiteralPath $taskPath)) { throw "Release artifact is missing: $taskPath" }
+  }
+  $taskExpected = Get-TcSha256 ([IO.File]::ReadAllBytes($taskLoader))
+  $taskEmbedded = Get-TcSha256 (Get-TcInstallerPayload -Installer $taskInstaller)
+  if ($taskEmbedded -cne $taskExpected) {
+    throw ("The installer does not deploy the loader this release ships: " +
+           "dist\TCModLoader-Setup.exe embeds $taskEmbedded, dist\tc-loader.dll is $taskExpected. " +
+           "Run build.ps1 - the installer is linked around the loader it embeds.")
+  }
+  $taskInfo = (Get-Item -LiteralPath $taskInstaller).VersionInfo
+  foreach ($taskField in @('FileVersion', 'ProductVersion')) {
+    $taskValue = [string]$taskInfo.$taskField
+    if ($taskValue -cne $taskVersion) {
+      throw ("The installer's $taskField is '$taskValue' but VERSION says '$taskVersion'. " +
+             "Run build.ps1: the version block comes from build\setup-version.rc.")
+    }
+  }
+  return [pscustomobject]@{
+    Version = $taskVersion
+    LoaderSha256 = $taskExpected
+    InstallerSha256 = (Get-FileHash -LiteralPath $taskInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+}
+
+Export-ModuleMember -Function Get-TcArchiveTimestamp, New-TcDeterministicZip, Read-TcModArchive,
+  Test-TcChildPath, Get-TcInstallerPayload, Assert-TcInstallerMatchesRelease

@@ -41,6 +41,21 @@ Copy-Item -LiteralPath $taskBoard -Destination (Join-Path $taskSchema 'circuit.d
 if ($LASTEXITCODE) { throw 'Package apply failed' }
 
 $taskLog = Join-Path $taskRoot 'tc-modloader-data\loader.log'
+
+# tc.component.render V7: a solid magenta PNG the driver loads over the clock's
+# own "bit-sprite" key.  If the loader's image path works, the value mark on the
+# board turns magenta and the driver reads that pixel back out of the frame.
+$taskImage = Join-Path $taskTest 'replacement-bit-sprite.png'
+Add-Type -AssemblyName System.Drawing
+$taskBitmap = New-Object System.Drawing.Bitmap 100,100
+$taskGraphics = [System.Drawing.Graphics]::FromImage($taskBitmap)
+$taskGraphics.Clear([System.Drawing.Color]::FromArgb(255,255,0,255))
+$taskGraphics.Dispose()
+$taskBitmap.Save($taskImage,[System.Drawing.Imaging.ImageFormat]::Png)
+$taskBitmap.Dispose()
+$taskPreviousImage = $env:TC_CLOCK_IMAGE
+$env:TC_CLOCK_IMAGE = $taskImage
+
 $taskPreviousProfile = $env:USERPROFILE
 $taskPreviousAppData = $env:APPDATA
 try {
@@ -63,6 +78,7 @@ try {
 } finally {
   $env:USERPROFILE = $taskPreviousProfile
   $env:APPDATA = $taskPreviousAppData
+  $env:TC_CLOCK_IMAGE = $taskPreviousImage
 }
 
 if (!(Test-Path -LiteralPath $taskLog)) {
@@ -70,8 +86,8 @@ if (!(Test-Path -LiteralPath $taskLog)) {
 }
 $taskText = Get-Content -LiteralPath $taskLog -Raw
 Write-Output '--- loader log (clock driver / value window) ---'
-Select-String -LiteralPath $taskLog -Pattern 'CLOCK-DRIVER|clock:|value window' |
-  Select-Object -Last 12 | ForEach-Object { $_.Line }
+Select-String -LiteralPath $taskLog -Pattern 'CLOCK-DRIVER|clock:|value window|interactive:|Component render: image' |
+  Select-Object -Last 14 | ForEach-Object { $_.Line }
 if ($taskText -match 'CLOCK-DRIVER: FAIL (.*)') {
   throw "clock value window: $($Matches[1])"
 }
@@ -79,5 +95,37 @@ if ($taskText -notmatch 'CLOCK-DRIVER: PASS') {
   throw "the driver never reported a verdict; loader log tail:`n" +
         (Get-Content -LiteralPath $taskLog -Tail 10 | Out-String)
 }
+# The interaction this case drives goes through the Mod's own "what is selected"
+# path, which asks tc.component.instances V2 for the id the game addresses the
+# component by.  Assert the service answered: a run that silently fell back to
+# the interactive-map.txt diagnostic would not be testing the interface.
+if ($taskText -notmatch 'interactive: [1-9]\d* top level id\(s\) from tc\.component\.instances V2') {
+  throw "the clock never got its top level ids from tc.component.instances V2; loader log tail:`n" +
+        (Get-Content -LiteralPath $taskLog -Tail 10 | Out-String)
+}
+if ($taskText -match 'this loader has no tc\.component\.instances V2') {
+  throw 'the clock fell back to the interactive-map.txt diagnostic instead of the service'
+}
+# tc.component.render V7: the Mod's own image went through the loader (one log
+# line when it loads, one when the driver replaces it), the driver read the
+# mark's pixel back and it painted the replacement image.
+if ($taskText -notmatch 'Component render: image "bit-sprite" for (local\.clock|dev\.clock-driver) is 200x1100') {
+  throw "the loader never reported the clock's image; loader log tail:`n" +
+        (Get-Content -LiteralPath $taskLog -Tail 10 | Out-String)
+}
+if ($taskText -notmatch 'clock: the game''s own bit sprite came from tc\.component\.render V7') {
+  throw "the clock did not take the V7 image path; loader log tail:`n" +
+        (Get-Content -LiteralPath $taskLog -Tail 10 | Out-String)
+}
+if ($taskText -notmatch 'replaced the clock''s own image through tc\.component\.render V7 \(revision 2') {
+  throw "the image replace did not report revision 2; loader log tail:`n" +
+        (Get-Content -LiteralPath $taskLog -Tail 10 | Out-String)
+}
+if ($taskText -notmatch 'the value mark''s pixel is rgba\(\d+,\d+,\d+,\d+\) after the replacement image was loaded') {
+  throw "the driver never read the mark's pixel back; loader log tail:`n" +
+        (Get-Content -LiteralPath $taskLog -Tail 10 | Out-String)
+}
 Write-Output 'clock corner box: the click opened the window and the typed number reached the configuration'
+Write-Output 'clock top level ids: answered by tc.component.instances V2 (no diagnostic file read)'
+Write-Output 'clock value mark: painted by a tc.component.render V7 image (replacement read back from the frame)'
 Write-Output "Sandbox: $taskTest"

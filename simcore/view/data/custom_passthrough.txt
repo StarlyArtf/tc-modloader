@@ -1,0 +1,20 @@
+# A custom component (kind 0x4e) and the definition behind it.
+#
+# The definition is one Input Pin wired straight to one Output Pin, so whatever
+# reaches the instance's input pin has to appear on its output pin.  The live
+# Mod writes this section into every board record it produces (`defcustom` /
+# `defcomponent` / `defwire`, each line ending in `def=0x<prototype id>`), and a
+# viewer that ignored it could only refuse a board with a foundry component on
+# it - which is exactly what it used to do.
+defcustom id=0x1000 components=2 wires=1
+defcomponent index=0 kind=0x4F x=0 y=0 rotation=0 word30=1 word40=1 custom=0 def=0x1000
+defcomponent index=1 kind=0x51 x=4 y=0 rotation=0 word30=1 word40=1 custom=0 def=0x1000
+defwire index=0 from=3,0 to=1,0 width=1 def=0x1000
+# The board: a constant driving the custom component's input, and a word Output
+# reading its output.  Pin lists travel with the record, the way the Mod writes
+# them, because a Mod type's pins are not in any frozen table.
+component index=1 kind=0x02 x=-6 y=0 rotation=0 word30=0 word40=1 custom=0 memory_bits=1 memory_extra=0 little_endian=0 id=11 inbits= outbits=1 inpins= outpins=1,0
+component index=2 kind=0x45 x=22 y=0 rotation=0 word30=1 word40=0 custom=0 memory_bits=8 memory_extra=0 little_endian=0 id=33 inbits=1 outbits= inpins=-3,0 outpins=
+component index=3 kind=0x4E x=10 y=0 rotation=0 word30=1 word40=1 custom=4096 memory_bits=1 memory_extra=0 little_endian=0 id=22 inbits=1 outbits=1 inpins=-1,0 outpins=1,0
+wire index=0 from=-5,0 to=9,0 width=1 slot=0
+wire index=1 from=11,0 to=19,0 width=1 slot=0

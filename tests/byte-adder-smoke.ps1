@@ -3,7 +3,7 @@
 # itself compares (carry_out << 8) | sum.  Both callback phases are asserted,
 # because the on-screen table reads the refresh path while the level test reads
 # the simulated cycles.
-param([string]$PackagePath, [string]$SchematicPath, [switch]$Stress, [switch]$Single)
+param([string]$PackagePath, [string]$SchematicPath, [switch]$Stress, [switch]$Single, [switch]$V3)
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
@@ -45,9 +45,11 @@ if($LASTEXITCODE){throw 'Byte adder package apply failed'}
 
 $taskPreviousProfile = $env:USERPROFILE
 $taskPreviousAppData = $env:APPDATA
+$taskPreviousDump = $env:TC_MODLOADER_DUMP_SOURCE
 try {
   $env:USERPROFILE = $taskProfile
   $env:APPDATA = Join-Path $taskProfile 'AppData\Roaming'
+  if($V3) { $env:TC_MODLOADER_DUMP_SOURCE = '1' }
   $taskProcess = Start-Process -FilePath (Join-Path $taskRoot 'Turing Complete.exe') -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru
   Start-Sleep -Seconds 45
   if(!$taskProcess.HasExited) {
@@ -57,6 +59,7 @@ try {
 } finally {
   $env:USERPROFILE = $taskPreviousProfile
   $env:APPDATA = $taskPreviousAppData
+  $env:TC_MODLOADER_DUMP_SOURCE = $taskPreviousDump
 }
 
 $taskLog = Join-Path $taskRoot 'tc-modloader-data\loader.log'
@@ -72,6 +75,19 @@ if($Single) {
     if([int]$taskSample.Groups[2].Value -ne (([int]$taskSample.Groups[1].Value * 2) -band 255)) {
       throw 'Single-pin calculation mismatch'
     }
+  }
+  if($V3) {
+    if($taskText -notmatch 'out v3 state=' -or $taskText -notmatch 'drive=255') {
+      throw "V3 registration or input drive evidence missing; inspect $taskLog"
+    }
+    $taskSources = @(Get-ChildItem -LiteralPath $taskRoot -Filter 'native-logic-source*.txt' -File)
+    $taskGenerated = ($taskSources | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+    foreach($taskNeedle in @('tc_logic_drive_in','tc_logic_drive_out','let zid')) {
+      if($taskGenerated -notmatch [regex]::Escape($taskNeedle)) {
+        throw "V3 generated source is missing $taskNeedle; inspect $taskRoot"
+      }
+    }
+    'PASS declarative V3: registered, received a driven input, emitted a real tri-state Switch and produced Z on refresh'
   }
   "PASS declarative single-pin byte component: level won, $($taskSamples.Count) samples checked"
   "Sandbox: $taskTest"

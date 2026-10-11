@@ -1,5 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
+if ((Get-Item -LiteralPath (Join-Path $taskRepo 'dist\TCModLoader-Setup.exe')).VersionInfo.FileDescription -cne
+    ('TC Mod Loader ' + (-join @([char]0x5b89, [char]0x88c5, [char]0x5668)))) {
+  throw 'Installer file description was corrupted by script encoding'
+}
 Import-Module (Join-Path $taskRepo 'tools\ReleaseTools.psm1') -Force
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -46,6 +50,19 @@ try {
 
   $taskReleaseManifest = Get-Content -LiteralPath (Join-Path $taskRepo 'release\manifest.json') -Raw | ConvertFrom-Json
   if ([int]$taskReleaseManifest.schemaVersion -ne 1) { throw 'Unexpected release manifest schema' }
+  # A source release must carry the inputs needed by build.ps1, including the
+  # simulator headers/viewer and the installer's icon, rather than depending on
+  # files that only exist in the developer's checkout.
+  foreach ($taskRequiredTree in @('simcore', 'assets')) {
+    if (@($taskReleaseManifest.sourceArchive.trees) -notcontains $taskRequiredTree) {
+      throw "Source release is missing a build input tree: $taskRequiredTree"
+    }
+  }
+  foreach ($taskRequiredFile in @('build-text-box.ps1', 'build-wire-palette.ps1')) {
+    if (@($taskReleaseManifest.sourceArchive.files) -notcontains $taskRequiredFile) {
+      throw "Source release is missing an example build script: $taskRequiredFile"
+    }
+  }
   $taskTargets = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
   foreach ($taskEntry in @($taskReleaseManifest.playerArchive.files) +
       @($taskReleaseManifest.playerArchive.licenses) + @($taskReleaseManifest.playerArchive.mods)) {
@@ -70,6 +87,13 @@ try {
   foreach ($taskBinary in @('dist\tc-loader.dll', 'dist\tcmod-cli.exe', 'dist\TCModLoader-Setup.exe')) {
     Assert-PeTimestampFile (Join-Path $taskRepo $taskBinary) $taskExpectedEpoch
   }
+  # The installer is a pair with the loader it deploys: the release refuses to
+  # stage an installer embedding some other build, or one whose version block no
+  # longer matches VERSION.  This is the same check tools/release.ps1 runs before
+  # it stages anything, so the fast tier catches it first.
+  $taskInstaller = Assert-TcInstallerMatchesRelease -Repo $taskRepo
+  "PASS release contract: the installer embeds dist\tc-loader.dll " +
+    "($($taskInstaller.LoaderSha256.Substring(0, 8))...) and carries version $($taskInstaller.Version)"
   $taskPlan = & (Join-Path $taskRepo 'tools\release.ps1') -Plan
   $taskPlanText = $taskPlan -join "`n"
   # The archive name has to follow VERSION, so this reads it instead of pinning

@@ -28,6 +28,21 @@
    compile, where it starts from the source's configuration and hears
    TC_LOGIC_CLONE. */
 #define TC_COMMAND_BOARD_DUPLICATE_COMPONENT 8u
+/* Deletes one component.  V2 carries the identity: `argument` is the instance
+   id, `custom_prototype_id` the type it belongs to (the same pair the duplicate
+   command names its source with).  A type the session's component catalogue
+   attributes to another Mod is refused before the command is queued; a type the
+   loader never brokered (a circuit the Mod imported through tc.component.model
+   itself) carries no owner anywhere in the loader, so the command is left to
+   the caller, exactly like TC_COMMAND_BOARD_DUPLICATE_COMPONENT.
+
+   The deletion goes through the game's own undo-aware wrapper
+   (`try_delete__modelZutilities_u8585`): it copies the records first, deletes
+   the component (and every wire attached to it) and hands the resulting change
+   list to the game's undo stack.  One `TC_COMMAND_BOARD_UNDO` therefore puts
+   the component back, which the low-level `board_delete_component` (a tombstone
+   with no undo entry) cannot do. */
+#define TC_COMMAND_BOARD_DELETE_COMPONENT 9u
 /* There is deliberately no wire-placement command yet.  The build's only
    context-free entry (add_wire_from_pos) appends a zero-length wire that the
    game itself refuses to address by point, so a queued command could only leave

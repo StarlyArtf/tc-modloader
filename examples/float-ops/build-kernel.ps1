@@ -24,6 +24,13 @@ $taskSoftfloatObjects = Join-Path $taskObjectRoot 'softfloat'
 $taskResponseFile = Join-Path $taskRoot 'build\float-ops\float-kernel-objects.rsp'
 $taskIncludeFile = Join-Path $taskRoot 'build\float-ops\float-kernel-includes.rsp'
 $taskSourceList = Join-Path $PSScriptRoot 'fp\softfloat-sources.txt'
+# The SDK headers are an input of every object that includes them: a change to
+# tc_component_types.h (the definition's tail, for instance) has to rebuild
+# components.o/editor.o, or the offline compatibility test links an object
+# built against the old layout and reports a definition-size mismatch that is
+# really a stale build.
+$taskSdkHeaders = @(Get-ChildItem -LiteralPath (Join-Path $taskRoot 'sdk') -Filter '*.h' |
+                    ForEach-Object { $_.FullName })
 
 # The option set mirrors build/Win64-MinGW-w64 in the upstream tree; the option
 # list and the include layout are documented in fp/softfloat/platform.h and in
@@ -84,38 +91,68 @@ if (Test-Stale $taskKernelObject @($taskKernelSource,
 }
 $taskObjects += $taskKernelObject
 
-# The text layer (plan 5.3): vendored Ryu plus fp/decimal.cpp.  Ryu is C, so it
-# goes through gcc like the SoftFloat subset.
-$taskRyuObject = Join-Path $taskObjectRoot 'ryu-f2s.o'
-$taskRyuSource = Join-Path $PSScriptRoot 'third_party\ryu\ryu\f2s.c'
-if (Test-Stale $taskRyuObject @($taskRyuSource)) {
-  & $taskGcc -std=c11 -O2 "-I$(Join-Path $PSScriptRoot 'third_party\ryu')" `
-    -c $taskRyuSource -o $taskRyuObject
-  if ($LASTEXITCODE) { throw 'Ryu did not compile' }
+# The width table (plan 7.1's format byte): binary16/binary32/binary64 behind
+# one entry point, with binary32 delegated to the kernel above.  It is a
+# separate translation unit so a component only pays for the widths it uses
+# being reachable, and so the binary32 kernel above stays byte-identical to the
+# release the golden vectors were taken from.
+$taskFormatObject = Join-Path $taskObjectRoot 'format.o'
+$taskFormatSource = Join-Path $PSScriptRoot 'fp\format.cpp'
+if (Test-Stale $taskFormatObject @($taskFormatSource,
+    (Join-Path $PSScriptRoot 'fp\format.hpp'),
+    (Join-Path $PSScriptRoot 'fp\fp32.hpp'),
+    (Join-Path $PSScriptRoot 'fp\environment.hpp'), $taskPlatform)) {
+  & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror @taskDefines @taskIncludes `
+    -c $taskFormatSource -o $taskFormatObject
+  if ($LASTEXITCODE) { throw 'The width table did not compile' }
 }
-$taskObjects += $taskRyuObject
+$taskObjects += $taskFormatObject
+
+# The text layer (plan 5.3): vendored Ryu plus fp/decimal.cpp.  Ryu is C, so it
+# goes through gcc like the SoftFloat subset.  Both formatters are compiled:
+# f2s for binary32 and d2s for binary64 (binary16 has no Ryu entry of its own and
+# formats its exact binary32 image instead).
+foreach ($taskRyuFile in @('f2s.c', 'd2s.c')) {
+  $taskRyuObject = Join-Path $taskObjectRoot `
+    (($taskRyuFile -replace '\.c$', '') + '.o')
+  $taskRyuSource = Join-Path $PSScriptRoot ('third_party\ryu\ryu\' + $taskRyuFile)
+  if (Test-Stale $taskRyuObject @($taskRyuSource)) {
+    & $taskGcc -std=c11 -O2 "-I$(Join-Path $PSScriptRoot 'third_party\ryu')" `
+      -c $taskRyuSource -o $taskRyuObject
+    if ($LASTEXITCODE) { throw "Ryu $taskRyuFile did not compile" }
+  }
+  $taskObjects += $taskRyuObject
+}
 
 $taskDecimalObject = Join-Path $taskObjectRoot 'decimal.o'
 $taskDecimalSource = Join-Path $PSScriptRoot 'fp\decimal.cpp'
 $taskTextFlags = @("-I$(Join-Path $PSScriptRoot 'third_party\fast_float\include')",
                    "-I$(Join-Path $PSScriptRoot 'third_party\ryu')")
 if (Test-Stale $taskDecimalObject @($taskDecimalSource,
-    (Join-Path $PSScriptRoot 'fp\decimal.hpp'))) {
-  & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror @taskTextFlags `
+    (Join-Path $PSScriptRoot 'fp\decimal.hpp'),
+    (Join-Path $PSScriptRoot 'fp\format.hpp'),
+    (Join-Path $PSScriptRoot 'fp\environment.hpp'), $taskPlatform)) {
+  # The SoftFloat option set travels with this compile too: the text layer calls
+  # the f16/f32/f64 conversions (fp/decimal.cpp), and they have to be the same
+  # build of the library the kernel uses.
+  & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror @taskDefines @taskIncludes `
+    @taskTextFlags `
     -c $taskDecimalSource -o $taskDecimalObject
   if ($LASTEXITCODE) { throw 'The decimal layer did not compile' }
 }
 $taskObjects += $taskDecimalObject
 
-# The M2 components (plan 6.1 and 7.2).
-foreach ($taskComponent in @('components.cpp', 'components_ui.cpp')) {
+# The M2 components (plan 6.1 and 7.2) and the property rows they declare to the
+# loader (tc.component.editor; the rows themselves are the host's now).
+foreach ($taskComponent in @('components.cpp', 'editor.cpp')) {
   $taskComponentObject = Join-Path $taskObjectRoot `
     ((Split-Path -Leaf $taskComponent) -replace '\.cpp$', '.o')
-  if (Test-Stale $taskComponentObject @(
+  $taskComponentInputs = @(
       (Join-Path $PSScriptRoot $taskComponent),
       (Join-Path $PSScriptRoot 'components.hpp'),
       (Join-Path $PSScriptRoot 'components_internal.hpp'),
-      $taskKernelSource, $taskDecimalSource)) {
+      $taskKernelSource, $taskDecimalSource) + $taskSdkHeaders
+  if (Test-Stale $taskComponentObject $taskComponentInputs) {
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror @taskDefines @taskIncludes `
       @taskTextFlags "-I$(Join-Path $taskRoot 'sdk')" `
       -c (Join-Path $PSScriptRoot $taskComponent) -o $taskComponentObject

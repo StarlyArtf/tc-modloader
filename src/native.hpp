@@ -16,6 +16,8 @@
 #include "services.hpp"
 #include "expression.hpp"
 #include "board_objects.hpp"
+#include "builtin_catalogue.hpp"
+#include "component_netlist.hpp"
 #include "save_deps.hpp"
 #include "board_pins.hpp"
 #include "simulation_read.hpp"
@@ -23,6 +25,12 @@
 #include "board_edits.hpp"
 #include "board_connect.hpp"
 #include "component_geometry.hpp"
+#include "component_editor.hpp"
+#include "component_images.hpp"
+#include "component_input.hpp"
+#include "component_channel.hpp"
+#include "mod_storage.hpp"
+#include "mod_settings.hpp"
 #include "picture_path.hpp"
 namespace tc {
 struct Symbols {
@@ -57,19 +65,52 @@ class NativeRuntime {
     loader then keeps that message instead of overwriting it with "running" once
     the plugin finishes loading, which is what the author asked to see. */
  struct ComponentRenderer {uint64_t customId=0;TCComponentRenderCallbackV1 draw=nullptr;void* user=nullptr;bool failed=false;};
+ struct ComponentFont {uint64_t handle=0,texture=0;uint32_t revision=1;float nativeSize=0.f;
+  void* atlas=nullptr;void* font=nullptr;};
 struct Loaded {NativeRuntime* owner;std::string id,folder,status;fs::path packageRoot;TCHost host{};TCPlugin plugin{};HMODULE dll{};std::vector<void*> hooks;std::vector<uint64_t> logicIds,componentIds;std::vector<UiPage> pages;std::vector<BoardSlot> slots;std::vector<ComponentRenderer> renderers;std::set<uint64_t> hiddenDefaultDrawings;std::set<uint64_t> hiddenSelectionHints;std::set<uint64_t> hiddenFoundryButtons;std::set<uint64_t> placementPreviews;
+  /* Ids this Mod registered while the game ran and then removed again.  The
+     game's delete drops the id from the ordered live list but leaves the entry
+     in its own prototype map, so a later add_custom_prototype of the same id is
+     refused as a duplicate.  A re-registration of one of these ids therefore
+     goes through the update path (update_custom_prototype), which rewrites
+     every index the game keeps for that id and puts it back in the live list. */
+  std::set<uint64_t> retiredIds;
+  /* tc.component.render V7: the images this Mod loaded for its own draw
+     callbacks.  The GL objects live in the texture manager (owner = this), this
+     table only keeps the names, the handles and the revisions. */
+  component_images::Table images;
+  std::map<std::string,ComponentFont> fonts;
+  TCComponentRenderDeviceCallbackV1 deviceCallback=nullptr;void* deviceUser=nullptr;
+  uint64_t deviceGeneration=0;
+  /* tc.component.editor V1: the editable rows a Mod declared for its own
+     types, keyed by custom id.  The host draws them over the game's own
+     component drawer and commits each edit through the configuration path
+     tc.component.storage uses, so a Mod ships a table instead of a window. */
+  std::map<uint64_t,std::vector<component_editor::Field>> editorFields;
+  /* ...and the table-level flags that came with them (V4's CONFIRM).  Kept
+     beside the rows rather than inside them: the flags describe the table, not
+     any one field. */
+  std::map<uint64_t,uint32_t> editorTableFlags;
+   std::vector<mod_settings::Field> settings;
+   TCModSettingChangedV1 settingChanged=nullptr;void* settingUser=nullptr;
  /* V5: the PNG a type is shown with in the game's own component column, its
     drawer preview and the placement ghost (custom id -> absolute path). */
- std::map<uint64_t,std::string> pictures;bool accepting=true,active=false,reported=false;};
+  std::map<uint64_t,std::string> pictures;bool accepting=true,active=false,reported=false;};
  struct InstanceFootprint {Loaded* owner=nullptr;uint64_t customId=0;float halfWidth=0.f,halfHeight=0.f;};
  ui_texture::Manager textures;
  Core& core;HMODULE engine;fs::path saveRoot;std::string currentLevelName;
+ mod_storage::Store modStorage;
+ component_input::Router componentInputs;
+ component_channel::Store componentChannels;
+ UiPage settingsPage;
  /* id → Mod/type cache the save page reads (src/save_deps.hpp): the only place
     the mapping exists, because a circuit file stores just the custom_id.  It
     lives with the loader's other data, not in any save. */
  TypeRegistry types;
- std::unique_ptr<Symbols> symbols;std::vector<std::unique_ptr<Loaded>> loaded;std::set<void*> ownedHooks;std::map<void*,std::string> loaderOwned;std::function<void(const std::string&)> logger;int lastFrame=-1,lastUiFrame=-1,lastSlotFrame=-1,lastToolFrame=-1;int64_t lastEngineFrame=-1;DWORD gameThreadId=0;bool inside=false,started=false;
+ std::unique_ptr<Symbols> symbols;std::vector<std::unique_ptr<Loaded>> loaded;std::set<void*> ownedHooks;std::map<void*,std::string> loaderOwned;std::function<void(const std::string&)> logger;int lastFrame=-1,lastUiFrame=-1,lastSlotFrame=-1,lastToolFrame=-1,lastComponentInputFrame=-1;int64_t lastEngineFrame=-1;DWORD gameThreadId=0;bool inside=false,started=false;
  std::map<uint64_t,InstanceFootprint> instanceFootprints;
+ std::set<uint32_t> componentKeysDown;
+ float componentWheelX=0.f,componentWheelY=0.f;
 int lastMenuFrame=-1;
 using BoardSetLen=uint64_t(*)(const void*);
  const void* selectedComponents=nullptr;
@@ -89,6 +130,19 @@ using BoardSetLen=uint64_t(*)(const void*);
  PrototypeGet prototypeGet=nullptr;
  CustomPrototypeGet customPrototypeGet=nullptr;
  CustomPrototypeSet customPrototypeSet=nullptr;
+ /* Runtime component edits change the game's global prototype list while the
+    editor is on the main menu.  A board presenter keeps its own menu copy, so
+    the first component-column draw after a mutation must rebuild that exact
+    copy.  Hooking build (not reload_component_menu itself) leaves diagnostic
+    Mods free to hook the reload function. */
+ using BuildComponentMenu=void(*)(void*,void*,void*,void*,uint64_t);
+ using ReloadComponentMenu=void(*)(void*,void*,uint8_t);
+ BuildComponentMenu buildComponentMenuOriginal=nullptr;
+ ReloadComponentMenu reloadComponentMenu=nullptr;
+ void* buildComponentMenuTarget=nullptr;
+ uint64_t componentMenuGeneration=0;
+ uint64_t componentMenuAppliedGeneration=0;
+ void* componentMenuAppliedContext=nullptr;
  PrototypeDestroy prototypeDestroy=nullptr;
  SequenceDestroy sequenceDestroy=nullptr;
  SequenceNew sequenceNew=nullptr;
@@ -105,15 +159,23 @@ using BoardSetLen=uint64_t(*)(const void*);
  using DrawCircle=void(*)(void*,RenderVec2,float,uint32_t,int,float);
  using DrawCircleFilled=void(*)(void*,RenderVec2,float,uint32_t,int);
  using DrawText=void(*)(void*,RenderVec2,uint32_t,const char*,const char*);
+ /* ImDrawList_AddImageQuad: the same entry the clock Mod used by hand before
+    tc.component.render V7 took the image path into the loader. */
+ using DrawImageQuad=void(*)(void*,uint64_t,RenderVec2,RenderVec2,RenderVec2,RenderVec2,
+                             RenderVec2,RenderVec2,RenderVec2,RenderVec2,uint32_t);
  using PushClipRect=void(*)(void*,RenderVec2,RenderVec2,bool);
  using PopClipRect=void(*)(void*);
+ using PushTextureId=void(*)(void*,uint64_t);
+ using PopTextureId=void(*)(void*);
  WorldToScreen renderWorldToScreen=nullptr;
  GetIo renderGetIo=nullptr;
  GetMainViewport renderGetMainViewport=nullptr;
  GetBackgroundDrawList renderGetBackgroundDrawList=nullptr;
  DrawLine renderLine=nullptr;DrawRect renderRect=nullptr;DrawRectFilled renderRectFilled=nullptr;
  DrawCircle renderCircle=nullptr;DrawCircleFilled renderCircleFilled=nullptr;DrawText renderText=nullptr;
+ DrawImageQuad renderImageQuad=nullptr;
  PushClipRect renderPushClip=nullptr;PopClipRect renderPopClip=nullptr;
+ PushTextureId renderPushTexture=nullptr;PopTextureId renderPopTexture=nullptr;
  /* ImFont_CalcTextSizeA: the game measures its own labels with it, and the draw
     table's measure_text answers with the same numbers (see renderTextSized). */
  void (*renderCalcTextSize)(void* out,const void* font,float size,float maxWidth,
@@ -123,7 +185,11 @@ using BoardSetLen=uint64_t(*)(const void*);
     weight (TCComponentRenderDrawV2::text_sized's `bold`).  Resolved with the
     tool text font; null means "use whichever face is current". */
  void* boldTextFont=nullptr;
- struct RenderDrawContext {NativeRuntime* owner=nullptr;void* list=nullptr;uint32_t commands=0;bool active=false;};
+ /* `plugin` is whose draw callback is running: an image handle is resolved in
+    that Mod's own table, so one Mod can never paint another's image. */
+ struct RenderDrawContext {NativeRuntime* owner=nullptr;void* list=nullptr;uint32_t commands=0;
+                           bool active=false;Loaded* plugin=nullptr;
+                           TCComponentInstanceHandle instance{};};
  /* The game's board redraw receives the complete component record as its sixth
     argument.  V2 suppresses that call only for an active Mod-owned custom id;
     the model, footprint and interaction structures are never changed. */
@@ -148,8 +214,26 @@ using BoardSetLen=uint64_t(*)(const void*);
     report needs.  The pair is also how a case reads the placement lifecycle. */
  int placementPreviewStartedCount=0;
  int placementPreviewEndedCount=0;
- const void* prototypeTable=nullptr;
- std::set<uint8_t> builtinKinds;
+const void* prototypeTable=nullptr;
+std::set<uint8_t> builtinKinds;
+ /* The built-in type catalogue behind tc.component.compose V1: one entry per
+    prototype the boot enumeration found, read once with the same pin decoding
+    the board reads use.  Lookups are by kind byte and by the stable spelling
+    (src/builtin_catalogue.hpp owns the spelling rules). */
+ std::vector<builtin_catalogue::Entry> builtinTypes;
+ std::map<uint32_t,size_t> builtinTypeByKind;
+ std::map<std::string,size_t> builtinTypeById;
+ /* Open `tc.component.compose` V2 build sessions, keyed by the id the service
+    handed the Mod.  A session is just a netlist under construction plus the
+    reason the last call refused; it disappears on commit, abort, or when the
+    Mod that opened it is rejected. */
+ struct ComposeSession {
+  Loaded* owner=nullptr;
+  component_netlist::Definition definition;
+  std::string status;
+ };
+ std::map<uint64_t,ComposeSession> composeSessions;
+ uint64_t nextComposeSession=1;
  /* Simulation reads.  The state buffer global is only used to answer "is there
     a buffer"; the values themselves come from the game's own reader. */
  unsigned char** simulationState=nullptr;
@@ -157,7 +241,12 @@ using BoardSetLen=uint64_t(*)(const void*);
     Board handle resolves to - that is why a placement can be a queued command
     without any presenter context. */
  using AddComponent=bool(*)(void*,void*);
+ /* The game's undo-aware delete: it takes the board model and two int64
+    sequences (component indices, wire ids), copies what it is about to remove
+    and pushes the change list onto the game's undo stack. */
+ using TryDelete=bool(*)(void*,const void*,const void*);
  AddComponent addComponent=nullptr;
+ TryDelete tryDelete=nullptr;
  /* Per content region (keyed by "<mod>/<id>"): last logged scroll offset and
     last logged scroll-strip state, so the logs are change-driven and bounded. */
  std::map<std::string,float> lastScrollY;std::map<std::string,int> lastStripState;
@@ -301,6 +390,54 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
  logger(std::string("Board snapshots: selection counters ")+
          (boardSetLen&&selectedComponents&&selectedWires?"armed":"unavailable"));
  }
+ /* Reads every built-in prototype once and keeps what the game declares about
+    it.  Deliberately only the measured fields: the name and description the
+    prototype carries, whether it carries a shape, and the pins - offsets, word
+    sizes and the auto markers - decoded by the same helper the board reads use,
+    so a kind's catalogue entry and a placed component's pin read can never
+    disagree.  Costs and capability bits are not invented here; see the contract
+    comment on TC_SERVICE_COMPONENT_COMPOSE for why. */
+ void collectBuiltinCatalogue(){
+  builtinTypes.clear();builtinTypeByKind.clear();builtinTypeById.clear();
+  if(!prototypeGet||!prototypeDestroy||builtinKinds.empty())return;
+  const auto readPins=[&](const TCPrototype& prototype,bool outputs,
+                          std::vector<builtin_catalogue::Pin>& out){
+   const uint64_t count=outputs?prototypeOutputCount(prototype):prototypeInputCount(prototype);
+   for(uint64_t index=0;index<count&&out.size()<TC_BUILTIN_PIN_LIMIT;++index){
+    const TCPin* pin=outputs?prototypeOutputPin(prototype,index):prototypeInputPin(prototype,index);
+    if(!pin)continue;
+    const TCPinInfoV1 info=board_pins::decodePin(*pin,outputs?TC_PIN_OUTPUT:TC_PIN_INPUT);
+    builtin_catalogue::Pin entry{};
+    entry.x=info.x;entry.y=info.y;entry.bits=info.bits;entry.wordSizeRaw=info.word_size_raw;
+    out.push_back(entry);
+   }
+  };
+  for(uint8_t kind:builtinKinds){
+   TCPrototypeKind key{};key.tag=kind;
+   TCPrototype prototype{};
+   prototypeGet(&key,&prototype);
+   builtin_catalogue::Entry entry;entry.kind=kind;
+   if(const char* name=prototypeNameCStr(prototype))entry.name=name;
+   if(const char* description=prototypeDescriptionCStr(prototype))entry.description=description;
+   if(const char* shape=prototypeShapeSvgCStr(prototype))entry.hasShape=shape&&*shape;
+   readPins(prototype,false,entry.inputs);
+   readPins(prototype,true,entry.outputs);
+   prototypeDestroy(&prototype);
+   builtinTypes.push_back(std::move(entry));
+  }
+  /* The boot set is ordered, so the duplicate ranks the spelling uses are
+     deterministic; then the two lookup tables are filled from the same pass. */
+  builtin_catalogue::assignTypeIds(builtinTypes);
+  for(size_t index=0;index<builtinTypes.size();++index){
+   builtinTypeByKind[builtinTypes[index].kind]=index;
+   builtinTypeById[builtinTypes[index].typeId]=index;
+  }
+  if(!builtinTypes.empty())
+   logger("Component compose: built-in catalogue "+std::to_string(builtinTypes.size())+
+          " kinds, "+std::to_string(builtin_catalogue::countWithoutDeclaredInputs(builtinTypes))+
+          " with no declared input pin, "+
+          std::to_string(builtin_catalogue::countWithShape(builtinTypes))+" with a shape");
+ }
  void bindBoardPinSources(){
   auto address=[this](const char* name)->void*{auto found=symbols->values.find(name);return found==symbols->values.end()?nullptr:found->second;};
   prototypeGet=reinterpret_cast<PrototypeGet>(address("get_prototype__modelZboardZcustom95prototype95list_u502"));
@@ -311,6 +448,7 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
   sequenceNew=reinterpret_cast<SequenceNew>(address("newSeq__modelZboardZboard_u5624"));
   prototypeTable=address("PROTOTYPES__modelZboardZprototype95list_u3772");
   board_pins::collectBuiltinKinds(prototypeTable,builtinKinds);
+  collectBuiltinCatalogue();
   logger(std::string("Board pins: prototype reads ")+
          (prototypeGet&&customPrototypeGet&&prototypeDestroy?"armed":"unavailable")+
          ", "+std::to_string(builtinKinds.size())+" built-in kinds");
@@ -328,8 +466,11 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
   renderCircleFilled=reinterpret_cast<DrawCircleFilled>(GetProcAddress(engine,"ImDrawList_AddCircleFilled"));
   renderText=reinterpret_cast<DrawText>(GetProcAddress(engine,"ImDrawList_AddText_Vec2"));
   renderCalcTextSize=reinterpret_cast<decltype(renderCalcTextSize)>(GetProcAddress(engine,"ImFont_CalcTextSizeA"));
+  renderImageQuad=reinterpret_cast<DrawImageQuad>(GetProcAddress(engine,"ImDrawList_AddImageQuad"));
   renderPushClip=reinterpret_cast<PushClipRect>(GetProcAddress(engine,"ImDrawList_PushClipRect"));
   renderPopClip=reinterpret_cast<PopClipRect>(GetProcAddress(engine,"ImDrawList_PopClipRect"));
+   renderPushTexture=reinterpret_cast<PushTextureId>(GetProcAddress(engine,"ImDrawList_PushTextureID"));
+   renderPopTexture=reinterpret_cast<PopTextureId>(GetProcAddress(engine,"ImDrawList_PopTextureID"));
   logger(std::string("Component render: overlay primitives ")+
          (renderWorldToScreen&&renderGetIo&&renderGetMainViewport&&renderGetBackgroundDrawList&&
           renderLine&&renderRect&&renderRectFilled&&renderCircle&&renderCircleFilled&&renderText&&
@@ -338,8 +479,10 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
   logger(std::string("Simulation reads: ")+
          (aliases.count("sim.state.read")&&aliases.count("sim.cycle")?"armed":"unavailable")+
          ", state buffer "+std::to_string(tc::sim::kStateBufferSize)+" bytes");
-  addComponent=reinterpret_cast<AddComponent>(address("add_component__presenterZutilitiesZhelper95functions_u5918"));
+ addComponent=reinterpret_cast<AddComponent>(address("add_component__presenterZutilitiesZhelper95functions_u5918"));
+  tryDelete=reinterpret_cast<TryDelete>(address("try_delete__modelZutilities_u8585"));
   logger(std::string("Board edits: component placement ")+(addComponent?"armed":"unavailable")+
+         ", component deletion "+(tryDelete?"armed":"unavailable")+
          "; wire placement stays out of the command bus (add_wire_from_pos only starts a wire)");
  }
  static int captureBoardSnapshotService(void* context,const TCGameHandle* handle,TCBoardSnapshotV1* out,uint32_t outSize){
@@ -476,14 +619,228 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
  /* tc.component.types: register a V2 definition.  The table is handed out per
     plugin (like the command bus), because a registration needs that plugin's
     own host - its mod id and its data directory - exactly like the V1 entry. */
- static int component_types_register_api(void* c,const TCComponentTypeDefinitionV2* definition){
-  auto& p=*(Loaded*)c;if(!p.accepting)return TC_COMPONENT_TYPES_ERR_UNAVAILABLE;
-  try {
-   const int result=tc::registerNativeComponentV2(&p.host,definition);
+  static int component_types_register_api(void* c,const TCComponentTypeDefinitionV2* definition){
+   auto& p=*(Loaded*)c;if(!p.accepting)return TC_COMPONENT_TYPES_ERR_UNAVAILABLE;
+   try {
+    std::vector<uint8_t> encoded;
+    const bool adopt=p.owner->foundryEntryCarriesId(definition->name?definition->name:"",
+                                                    definition->custom_id);
+    const int result=tc::registerNativeComponentV2(&p.host,definition,nullptr,&encoded,false,adopt);
     if(!result){p.logicIds.push_back(definition->custom_id);p.componentIds.push_back(definition->custom_id);
      p.owner->noteComponentType(p,definition->custom_id,definition->name,
-                                (int)definition->config_schema,definition->type_id);}
-   else log_api(c,("Component V2 registration rejected: "+std::to_string(result)).c_str());
+                                (int)definition->config_schema,definition->type_id);
+     /* The generated inner circuit is the only picture this type can have; hand
+        it to the foundry so the button opens the wiring instead of an empty
+        definition (see provideFoundrySchematicBytes). */
+     provideFoundrySchematicBytes(*p.owner,p.host,
+                                  definition->name?definition->name:"",
+                                  definition->custom_id,encoded);}
+    else log_api(c,("Component V2 registration rejected: "+std::to_string(result)).c_str());
+    return result;
+   } catch(const std::exception& e) {log_api(c,e.what());return TC_COMPONENT_TYPES_ERR_GAME;}
+    catch(...) {return TC_COMPONENT_TYPES_ERR_GAME;}
+  }
+  static int component_types_register_v3_api(void* c,const TCComponentTypeDefinitionV3* definition){
+   auto& p=*(Loaded*)c;if(!p.accepting)return TC_COMPONENT_TYPES_ERR_UNAVAILABLE;
+   try {
+    std::vector<uint8_t> encoded;
+    const bool adopt=p.owner->foundryEntryCarriesId(definition->name?definition->name:"",
+                                                    definition->custom_id);
+    const int result=tc::registerNativeComponentV3(&p.host,definition,&encoded,false,adopt);
+    if(!result){
+     p.logicIds.push_back(definition->custom_id);p.componentIds.push_back(definition->custom_id);
+     const size_t configTail=offsetof(TCComponentTypeDefinitionV3,config_schema)+sizeof(definition->config_schema);
+     const int schema=definition->size>=configTail?(int)definition->config_schema:-1;
+     p.owner->noteComponentType(p,definition->custom_id,definition->name,schema,definition->type_id);
+     provideFoundrySchematicBytes(*p.owner,p.host,
+                                  definition->name?definition->name:"",
+                                  definition->custom_id,encoded);
+    } else log_api(c,("Component V3 registration rejected: "+std::to_string(result)).c_str());
+    return result;
+   } catch(const std::exception& e) {log_api(c,e.what());return TC_COMPONENT_TYPES_ERR_GAME;}
+    catch(...) {return TC_COMPONENT_TYPES_ERR_GAME;}
+  }
+ /* tc.component.runtime: add a type that does not exist yet while the game is
+    running.  The load-time entry stays closed (a type must exist before the
+    game compiles a board that uses it); this one is the deliberate exception,
+    and it only opens while the component model is idle - on the game thread
+    with no board loaded, which is the main menu, where a Mod's own editor page
+    lives.  It can therefore never move a port or a state layout under a live
+    circuit, and it never touches a type that is already registered. */
+ static int component_runtime_register_api(void* c,const TCComponentTypeDefinitionV3* definition){
+  auto& p=*(Loaded*)c;
+  if(!p.active)return TC_COMPONENT_TYPES_ERR_UNAVAILABLE;
+  if(!definition)return TC_COMPONENT_TYPES_ERR_ARGUMENT;
+  auto& r=*p.owner;
+  if(r.gameThreadId&&GetCurrentThreadId()!=r.gameThreadId)return TC_COMPONENT_TYPES_ERR_STATE;
+  const void* board=nullptr;
+ if(r.currentBoardRaw(&board)&&board)return TC_COMPONENT_TYPES_ERR_STATE;
+ try {
+   std::vector<uint8_t> encoded;
+   /* An id this Mod registered and then deleted is still in the game's own
+      prototype map (the delete only takes it out of the ordered live list), so
+      the ordinary import would be refused as a duplicate - and the editor's
+      file manager always reuses the same custom id for a file it recreates.
+      Import through the update path instead, which rewrites every index the
+      game keeps for that id.  When the game really has forgotten it (a longer
+      session, or an id deleted before this loader ran), the update path
+      refuses and the plain import is tried once. */
+   const bool retired=p.retiredIds.count(definition->custom_id)!=0;
+   const bool adopt=r.foundryEntryCarriesId(definition->name?definition->name:"",
+                                            definition->custom_id);
+   int result=tc::registerNativeComponentV3(&p.host,definition,&encoded,retired,adopt);
+   if(result&&retired)result=tc::registerNativeComponentV3(&p.host,definition,&encoded,false,adopt);
+   if(result){
+    log_api(c,("Component runtime registration rejected: "+std::to_string(result)).c_str());
+    return result;
+   }
+   p.retiredIds.erase(definition->custom_id);
+   r.ensureLiveCustomType(definition->custom_id);
+   /* The bridge only emits for definitions it has activated, and the load-time
+      commit ran long ago, so this one is activated here. */
+   tc::logic::finish(std::vector<uint64_t>{definition->custom_id},true);
+   p.logicIds.push_back(definition->custom_id);p.componentIds.push_back(definition->custom_id);
+   const size_t configTail=offsetof(TCComponentTypeDefinitionV3,config_schema)+sizeof(definition->config_schema);
+   const int schema=definition->size>=configTail?(int)definition->config_schema:-1;
+   r.noteComponentType(p,definition->custom_id,definition->name,schema,definition->type_id);
+   /* A type added from a Mod's own page (the tc-verilog editor's "save and hot
+      reload") gets the same treatment as a load-time one: the foundry entry is
+      filled with the generated inner circuit so the component can be opened and
+      its wiring looked at. */
+   provideFoundrySchematicBytes(r,p.host,definition->name?definition->name:"",
+                                definition->custom_id,encoded);
+   ++r.componentMenuGeneration;
+   if(!r.componentMenuGeneration)++r.componentMenuGeneration;
+   const std::string line="Component runtime: registered type "+
+                          tc::logic::hex64(definition->custom_id)+
+                          " live; the game files it into the component column when it next builds that menu";
+   log_api(c,line.c_str());
+   return TC_COMPONENT_TYPES_OK;
+  } catch(const std::exception& e) {log_api(c,e.what());return TC_COMPONENT_TYPES_ERR_GAME;}
+   catch(...) {return TC_COMPONENT_TYPES_ERR_GAME;}
+ }
+ static bool component_runtime_idle(Loaded& p){
+  if(!p.active)return false;
+  auto& r=*p.owner;
+  if(r.gameThreadId&&GetCurrentThreadId()!=r.gameThreadId)return false;
+  const void* board=nullptr;
+  return !r.currentBoardRaw(&board)||!board;
+ }
+ static bool component_runtime_owned(const Loaded& p,uint64_t customId){
+  return std::find(p.componentIds.begin(),p.componentIds.end(),customId)!=p.componentIds.end();
+ }
+static void component_runtime_forget(Loaded& p,uint64_t customId){
+ p.logicIds.erase(std::remove(p.logicIds.begin(),p.logicIds.end(),customId),p.logicIds.end());
+ p.componentIds.erase(std::remove(p.componentIds.begin(),p.componentIds.end(),customId),
+                      p.componentIds.end());
+ p.retiredIds.insert(customId);
+ component_registry::dropType(customId,p.id);
+}
+static bool writableData(const void* address,size_t bytes){
+ if(!address||!bytes)return false;
+ MEMORY_BASIC_INFORMATION information{};
+ if(VirtualQuery(address,&information,sizeof(information))!=sizeof(information))return false;
+ if(information.State!=MEM_COMMIT||
+    (information.Protect&(PAGE_NOACCESS|PAGE_GUARD|PAGE_READONLY)))return false;
+ const auto* end=static_cast<const unsigned char*>(information.BaseAddress)+
+                 information.RegionSize;
+ return static_cast<const unsigned char*>(address)+bytes<=end;
+}
+/* The component column, the budget pass and the snapshot pass all read the
+   game's ordered live list (`cc_length`/`cc_live_values`), while the prototype
+   map is what add/update write.  The game appends to the live list only when
+   its map slot was empty, and its delete drops the id from the live list
+   without clearing that slot - so a type this Mod deleted and then registered
+   again would never return to the column.  Append it exactly the way the
+   game's own insert does, and only when it is missing. */
+bool ensureLiveCustomType(uint64_t customId){
+ if(!symbols)return false;
+ auto& values=symbols->values;
+ auto length=values.find("cc_length__modelZboardZcustom95prototype95list_u8");
+ auto live=values.find("cc_live_values__modelZboardZcustom95prototype95list_u7");
+ if(length==values.end()||!length->second||live==values.end()||!live->second)return false;
+ auto* count=reinterpret_cast<uint64_t*>(length->second);
+ auto* entries=static_cast<unsigned char*>(live->second);
+ if(!writableData(count,sizeof(*count))||!writableData(entries,16))return false;
+ const uint64_t now=*count;
+ if(now>9999)return false;
+ for(uint64_t index=0;index<now;++index){
+  uint64_t value=0;
+  std::memcpy(&value,entries+index*16,sizeof(value));
+  if(value==customId)return true;
+ }
+ auto* slot=entries+now*16;
+ if(!writableData(slot,16))return false;
+ const uint16_t low=static_cast<uint16_t>(customId);
+ std::memcpy(slot,&customId,sizeof(customId));
+ std::memcpy(slot+8,&low,sizeof(low));
+ *count=now+1;
+ logger("Component runtime: put type "+logic::hex64(customId)+
+        " back into the component column's live list");
+ return true;
+}
+static int component_runtime_unregister_api(void* c,uint64_t customId){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!customId||!component_runtime_owned(p,customId))return TC_COMPONENT_TYPES_ERR_ARGUMENT;
+  if(!component_runtime_idle(p))return TC_COMPONENT_TYPES_ERR_STATE;
+  try {
+   TCGameModel game;
+   if(!game.load(&p.host)||!game.hasCustomPrototype(customId))return TC_COMPONENT_TYPES_ERR_GAME;
+   if(!game.removeCustomPrototype(customId))return TC_COMPONENT_TYPES_ERR_GAME;
+   logic::finish(std::vector<uint64_t>{customId},false);
+   component_runtime_forget(p,customId);
+   ++p.owner->componentMenuGeneration;
+   if(!p.owner->componentMenuGeneration)++p.owner->componentMenuGeneration;
+   log_api(c,("Component runtime: unregistered type "+logic::hex64(customId)+
+              "; the next component-menu build will omit it").c_str());
+   return TC_COMPONENT_TYPES_OK;
+  } catch(const std::exception& e) {log_api(c,e.what());return TC_COMPONENT_TYPES_ERR_GAME;}
+   catch(...) {return TC_COMPONENT_TYPES_ERR_GAME;}
+ }
+ static int component_runtime_replace_api(void* c,const TCComponentTypeDefinitionV3* previous,
+                                          const TCComponentTypeDefinitionV3* replacement){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!previous||!replacement||!previous->custom_id||
+     previous->custom_id!=replacement->custom_id||
+     !component_runtime_owned(p,previous->custom_id))return TC_COMPONENT_TYPES_ERR_ARGUMENT;
+  if(!component_runtime_idle(p))return TC_COMPONENT_TYPES_ERR_STATE;
+  const uint64_t id=previous->custom_id;
+  try {
+   TCGameModel game;
+   if(!game.load(&p.host)||!game.hasCustomPrototype(id))
+    return TC_COMPONENT_TYPES_ERR_GAME;
+   /* Do not erase and re-import this id.  The game keeps an additional custom
+      id index outside the visible prototype table, so add_custom_prototype
+      still reports a duplicate after the table entry is deleted.  Its native
+      update path replaces those indexes in place. */
+   logic::finish(std::vector<uint64_t>{id},false);
+   std::vector<uint8_t> encoded;
+   const int result=tc::registerNativeComponentV3(&p.host,replacement,&encoded,true);
+   if(result==TC_COMPONENT_TYPES_OK){
+    logic::finish(std::vector<uint64_t>{id},true);
+    const size_t configTail=offsetof(TCComponentTypeDefinitionV3,config_schema)+
+                            sizeof(replacement->config_schema);
+    const int schema=replacement->size>=configTail?(int)replacement->config_schema:-1;
+    p.owner->noteComponentType(p,id,replacement->name,schema,replacement->type_id);
+    provideFoundrySchematicBytes(*p.owner,p.host,
+                                 replacement->name?replacement->name:"",id,encoded);
+    ++p.owner->componentMenuGeneration;
+    if(!p.owner->componentMenuGeneration)++p.owner->componentMenuGeneration;
+    log_api(c,("Component runtime: replaced type "+logic::hex64(id)+
+               "; the next component-menu build will use the new definition").c_str());
+    return result;
+   }
+   /* Registration is deliberately reversible: the editor keeps its old
+      Component object alive until this call returns, so its definition can be
+      restored if the game rejects the new shape. */
+   logic::finish(std::vector<uint64_t>{id},false);
+   const int restored=tc::registerNativeComponentV3(&p.host,previous,nullptr,true);
+   if(restored!=TC_COMPONENT_TYPES_OK){
+    log_api(c,("Component runtime: replacement and rollback both failed for "+
+               logic::hex64(id)).c_str());
+    return TC_COMPONENT_TYPES_ERR_GAME;
+   }
+   logic::finish(std::vector<uint64_t>{id},true);
    return result;
   } catch(const std::exception& e) {log_api(c,e.what());return TC_COMPONENT_TYPES_ERR_GAME;}
    catch(...) {return TC_COMPONENT_TYPES_ERR_GAME;}
@@ -1121,8 +1478,8 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
   /* The event source's line is kept verbatim: it is armed here now, but tests and
      the documentation read it as the SAVE event's state. */
   if(saveHooked)logger("Event source save armed");
-  logger(std::string("Component lifecycle: save dispatch ")+
-         (saveHooked||saveSchematicOriginal?"armed":"unavailable"));
+ logger(std::string("Component lifecycle: save dispatch ")+
+        (saveHooked||saveSchematicOriginal?"armed":"unavailable"));
  }
  /* The capture window is the level load itself; the report waits for the frame
     after it, when the Board is complete and the missing components are known to
@@ -1707,6 +2064,9 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
  std::map<uint64_t,CommandRecord> commands;
  std::vector<uint64_t> pendingCommands;
  uint64_t nextCommandId=0;
+ /* Handles for tc.component.render V7 images: loader-wide unique, so a handle
+    from one Mod's table is simply unknown in another's. */
+ uint64_t nextImageHandle=1,nextFontHandle=1;
  static constexpr size_t kMaxPendingCommandsPerPlugin=64,kMaxCommandRecords=512;
  struct TransactionRecord {Loaded* owner;TCGameHandle board;uint32_t flags;uint64_t baselineHash;std::vector<TCCommandV2> steps;TCTransactionStatusV1 status;};
  std::map<uint64_t,TransactionRecord> transactions;
@@ -1731,8 +2091,8 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
     loader cannot name that pointer itself, so it records it from the game's own
     call.  See board.after_place in the symbol profile. */
  void* afterPlaceSlot=nullptr;
- void* saveOriginal=nullptr;
- void* saveSchematicOriginal=nullptr;
+void* saveOriginal=nullptr;
+void* saveSchematicOriginal=nullptr;
  void* sceneOriginal=nullptr;
  bool wantsEvents(uint32_t kind) const {for(auto& listener:listeners)if(listener.kinds&kind)return true;return false;}
  void dispatchEvent(uint32_t kind,uint32_t flags,void* subject,const char* name){
@@ -1802,6 +2162,7 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
    if(replaced)self->readBoardSummary(old,oldSummary);
    self->gameHandles.enterBoard(args->board_model,self->engineFrame());self->observedBoard={};
    self->instanceFootprints.clear();
+   self->componentInputs.clearBoard();self->componentChannels.clear();self->componentKeysDown.clear();
    /* A new board means the old instances are gone: their callbacks would never
       be reached again, so release them (and fire on_destroy) before anything of
       the new board is bound. */
@@ -1855,6 +2216,7 @@ static int hook_api(void* c,void* target,void* detour,void** original){auto& p=*
    else {
    self->observedBoard={};
    self->instanceFootprints.clear();
+   self->componentInputs.clearBoard();self->componentChannels.clear();self->componentKeysDown.clear();
    self->defaultDrawingSuppressedInstances.clear();
     self->hintSuppressedIndices.clear();
     self->hintSuppressedFrame=-1;
@@ -2155,6 +2517,25 @@ void armEventSources(){
   if((now.flags&TC_LIFECYCLE_HAS_SELECTION_COUNTS)&&(before.flags&TC_LIFECYCLE_HAS_SELECTION_COUNTS)&&now.selectionHash!=before.selectionHash)dispatchLifecycle(TC_LIFECYCLE_SELECTION_CHANGED,board,now);
   observedBoard.summary=now;
  }
+ /* Component lifecycle, placement half: where every live instance sits, read
+    once per frame from its own board record - the same record the handles
+    already name.  A reading that differs from the last frame arrives as
+    TC_LOGIC_MOVE / TC_LOGIC_ROTATE through the type's lifecycle table; the
+    first reading of a freshly bound instance only seeds it (being compiled is
+    not a move). */
+ void pollComponentGeometry(){
+  static constexpr uint32_t kMaxPolledInstances=512;
+  TCComponentInstanceHandle handles[kMaxPolledInstances]{};
+  uint32_t written=0,total=0;
+  if(tc::logic::instanceEnumerate(0,handles,kMaxPolledInstances,&written,&total)!=TC_COMPONENT_INSTANCES_OK)return;
+  for(uint32_t index=0;index<written;++index){
+   const unsigned char* record=boardRecordOf(handles[index].custom_id,handles[index].instance_id);
+   if(!record)continue;
+   tc::logic::updateInstanceGeometry(handles[index].custom_id,handles[index].instance_id,
+                                    board_objects::readI16(record,2),board_objects::readI16(record,4),
+                                    board_objects::readU8(record,6));
+  }
+ }
  static int lifecycle_subscribe_api(void* c,uint32_t kinds,TCGameLifecycleCallback callback,void* user){
   auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;const uint32_t all=TC_LIFECYCLE_BOARD_ENTERED|TC_LIFECYCLE_BOARD_LEFT|TC_LIFECYCLE_OBJECTS_CHANGED|TC_LIFECYCLE_SELECTION_CHANGED;
   if(!p.accepting)return TC_LIFECYCLE_ERR_UNAVAILABLE;if(!callback||!kinds||(kinds&~all))return TC_LIFECYCLE_ERR_ARGUMENT;if(r.lifecycleListeners.size()>=kMaxLifecycleListeners)return TC_LIFECYCLE_ERR_CAPACITY;
@@ -2178,6 +2559,39 @@ void armEventSources(){
   converted.reserved=command->reserved;converted.subject=command->subject;converted.argument=command->argument;
   return p.owner->command_submit_v2(p,converted,requestId);
  }
+ /* The shape check a command has to pass before it is queued *or* staged: the
+    transaction path runs the same steps through the same executor, so a check
+    that only lived in `submit` would let a transaction smuggle in a command -
+    or a type - the bus itself refuses.  The Board handle's liveness is checked
+    by the caller, because only it knows whether the handle should be the
+    current Board or the transaction's own. */
+ int validateCommand(const Loaded& p,const TCCommandV2& command) const {
+  if(command.flags||command.subject.size<sizeof(TCGameHandle)||
+     command.subject.kind!=TC_GAME_OBJECT_BOARD)return TC_COMMAND_ERR_ARGUMENT;
+  if(command.type<TC_COMMAND_SIM_RUN||command.type>TC_COMMAND_BOARD_DELETE_COMPONENT)
+   return TC_COMMAND_ERR_ARGUMENT;
+  if(command.type==TC_COMMAND_SIM_RUN&&command.argument<0)return TC_COMMAND_ERR_ARGUMENT;
+  if(command.type==TC_COMMAND_BOARD_PLACE_COMPONENT){
+   /* A placement names either a built-in kind or a custom prototype, and both
+      coordinates have to fit the record's 16-bit fields. */
+   if(command.custom_prototype_id){if(command.kind!=board_edits::kCustomKind)return TC_COMMAND_ERR_ARGUMENT;}
+   else if(!command.kind)return TC_COMMAND_ERR_ARGUMENT;
+   if(command.rotation>255)return TC_COMMAND_ERR_ARGUMENT;
+   if(command.x<-32768||command.x>32767||command.y<-32768||command.y>32767)
+    return TC_COMMAND_ERR_ARGUMENT;
+  }
+  if(command.type==TC_COMMAND_BOARD_DELETE_COMPONENT){
+   /* The component is named by (instance id, type).  A type the session's
+      catalogue attributes to *another* Mod is refused: the loader knows that
+      owner, so it can tell the two apart.  A type it never brokered (a circuit
+      the Mod imported itself - the path examples/circuit-and takes) carries no
+      owner anywhere in the loader, so it is left to the caller, exactly like
+      DUPLICATE_COMPONENT, which has never required ownership either. */
+   if(!command.custom_prototype_id||!command.argument)return TC_COMMAND_ERR_ARGUMENT;
+   if(typeOwnedByAnotherMod(p,command.custom_prototype_id))return TC_COMMAND_ERR_ARGUMENT;
+  }
+  return TC_COMMAND_OK;
+ }
  static int command_submit_api_v2(void* c,const TCCommandV2* command,uint64_t* requestId){
   auto& p=*static_cast<Loaded*>(c);
   if(!command||!requestId||command->size<sizeof(TCCommandV2))return TC_COMMAND_ERR_ARGUMENT;
@@ -2189,17 +2603,8 @@ void armEventSources(){
   auto& r=*p.owner;
   if(!requestId)return TC_COMMAND_ERR_ARGUMENT;
   if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId)return TC_COMMAND_ERR_THREAD;
-  if((!p.accepting&&!p.active)||command.flags||command.subject.size<sizeof(TCGameHandle)||command.subject.kind!=TC_GAME_OBJECT_BOARD)return TC_COMMAND_ERR_ARGUMENT;
-  if(command.type<TC_COMMAND_SIM_RUN||command.type>TC_COMMAND_BOARD_DUPLICATE_COMPONENT)return TC_COMMAND_ERR_ARGUMENT;
-  if(command.type==TC_COMMAND_SIM_RUN&&command.argument<0)return TC_COMMAND_ERR_ARGUMENT;
-  if(command.type==TC_COMMAND_BOARD_PLACE_COMPONENT){
-   /* A placement names either a built-in kind or a custom prototype, and both
-      coordinates have to fit the record's 16-bit fields. */
-   if(command.custom_prototype_id){if(command.kind!=board_edits::kCustomKind)return TC_COMMAND_ERR_ARGUMENT;}
-   else if(!command.kind)return TC_COMMAND_ERR_ARGUMENT;
-   if(command.rotation>255)return TC_COMMAND_ERR_ARGUMENT;
-   if(command.x<-32768||command.x>32767||command.y<-32768||command.y>32767)return TC_COMMAND_ERR_ARGUMENT;
-  }
+  if(!p.accepting&&!p.active)return TC_COMMAND_ERR_ARGUMENT;
+  const int shape=validateCommand(p,command);if(shape!=TC_COMMAND_OK)return shape;
   if(r.gameHandles.valid(&command.subject)!=1)return TC_COMMAND_ERR_STALE;
   size_t outstanding=0;for(auto& item:r.commands)if(item.second.owner==&p&&(item.second.status.state==TC_COMMAND_STATE_QUEUED||item.second.status.state==TC_COMMAND_STATE_RUNNING))++outstanding;
   if(outstanding>=kMaxPendingCommandsPerPlugin)return TC_COMMAND_ERR_CAPACITY;
@@ -2235,15 +2640,265 @@ void armEventSources(){
   }
   return TC_SERVICE_ERR_VERSION;
  }
+ /* Whether the session's catalogue attributes a type to some *other* Mod.  A
+    declarative registration and a loader-brokered circuit import both carry
+    their owner's id; a circuit the Mod imported through the component model
+    itself never passes through that path, so the loader has no record and no
+    opinion. */
+ bool typeOwnedByAnotherMod(const Loaded& p,uint64_t customId) const {
+  component_registry::Type type{};
+  if(!component_registry::find(customId,&type))return false;
+  return !type.owner_mod.empty()&&type.owner_mod!=p.id;
+ }
+ bool ownsInstance(const Loaded& p,const TCComponentInstanceHandle* handle) const {
+  return handle&&handle->size>=sizeof(*handle)&&
+         handle->version==TC_COMPONENT_INSTANCES_API_VERSION_1&&
+         std::find(p.componentIds.begin(),p.componentIds.end(),handle->custom_id)!=p.componentIds.end();
+ }
+ static int component_input_set_handler_api(void* c,uint64_t customId,float minX,float minY,
+                                            float maxX,float maxY,
+                                            TCComponentInputCallbackV1 callback,void* user){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!p.accepting)return TC_COMPONENT_INPUT_ERR_STATE;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),customId)==p.componentIds.end())
+   return TC_COMPONENT_INPUT_ERR_OWNERSHIP;
+  return p.owner->componentInputs.setHandler(&p,customId,minX,minY,maxX,maxY,callback,user);
+ }
+ static int component_input_clear_handler_api(void* c,uint64_t customId){
+  auto& p=*static_cast<Loaded*>(c);
+  return p.owner->componentInputs.clearHandler(&p,customId);
+ }
+ static int component_input_route_api(void* c,const TCComponentInstanceHandle* handle,
+                                      uint32_t requests){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!p.owner->ownsInstance(p,handle))return TC_COMPONENT_INPUT_ERR_OWNERSHIP;
+  if(tc::logic::instanceValidate(handle)!=TC_COMPONENT_INSTANCES_OK)return TC_COMPONENT_INPUT_ERR_STALE;
+  return p.owner->componentInputs.route(&p,*handle,requests);
+ }
+ static int component_input_state_api(void* c,const TCComponentInstanceHandle* handle,
+                                      TCComponentInputStateV1* out){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!p.owner->ownsInstance(p,handle))return TC_COMPONENT_INPUT_ERR_OWNERSHIP;
+  if(tc::logic::instanceValidate(handle)!=TC_COMPONENT_INSTANCES_OK)return TC_COMPONENT_INPUT_ERR_STALE;
+  return p.owner->componentInputs.state(&p,*handle,out);
+ }
+ int queryComponentInputService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+  if(version!=TC_COMPONENT_INPUT_API_VERSION_1)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCComponentInputApiV1))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCComponentInputApiV1*>(out)=TCComponentInputApiV1{
+      sizeof(TCComponentInputApiV1),TC_COMPONENT_INPUT_API_VERSION_1,&p,
+      &component_input_set_handler_api,&component_input_clear_handler_api,
+      &component_input_route_api,&component_input_state_api};
+  return TC_SERVICE_OK;
+ }
+ int validateChannelInstance(Loaded& p,const TCComponentInstanceHandle* handle){
+  if(!ownsInstance(p,handle))return TC_COMPONENT_CHANNEL_ERR_OWNERSHIP;
+  return tc::logic::instanceValidate(handle)==TC_COMPONENT_INSTANCES_OK?
+         TC_COMPONENT_CHANNEL_OK:TC_COMPONENT_CHANNEL_ERR_STALE;
+ }
+ static int component_channel_open_api(void* c,const TCComponentInstanceHandle* handle,
+                                       const TCComponentChannelConfigV1* config){
+  auto& p=*static_cast<Loaded*>(c);if(!config)return TC_COMPONENT_CHANNEL_ERR_ARGUMENT;
+  const int valid=p.owner->validateChannelInstance(p,handle);if(valid)return valid;
+  return p.owner->componentChannels.open(&p,*handle,*config);
+ }
+ static int component_channel_close_api(void* c,const TCComponentInstanceHandle* handle){
+  auto& p=*static_cast<Loaded*>(c);const int valid=p.owner->validateChannelInstance(p,handle);
+  if(valid)return valid;
+  return p.owner->componentChannels.close(&p,*handle);
+ }
+ static int component_channel_send_api(void* c,const TCComponentInstanceHandle* handle,
+                                       uint32_t direction,const void* data,uint32_t bytes,
+                                       uint64_t* sequence){
+  auto& p=*static_cast<Loaded*>(c);const int valid=p.owner->validateChannelInstance(p,handle);if(valid)return valid;
+  return p.owner->componentChannels.send(&p,*handle,direction,data,bytes,sequence);
+ }
+ static int component_channel_receive_api(void* c,const TCComponentInstanceHandle* handle,
+                                          uint32_t direction,void* out,uint32_t capacity,
+                                          TCComponentChannelMessageV1* message){
+  auto& p=*static_cast<Loaded*>(c);const int valid=p.owner->validateChannelInstance(p,handle);if(valid)return valid;
+  return p.owner->componentChannels.receive(&p,*handle,direction,out,capacity,message);
+ }
+ static int component_channel_publish_api(void* c,const TCComponentInstanceHandle* handle,
+                                          const void* data,uint32_t bytes,uint64_t* revision){
+  auto& p=*static_cast<Loaded*>(c);const int valid=p.owner->validateChannelInstance(p,handle);if(valid)return valid;
+  return p.owner->componentChannels.publish(&p,*handle,data,bytes,revision);
+ }
+ static int component_channel_read_api(void* c,const TCComponentInstanceHandle* handle,
+                                       uint64_t known,void* out,uint32_t capacity,
+                                       uint32_t* bytes,uint64_t* revision){
+  auto& p=*static_cast<Loaded*>(c);const int valid=p.owner->validateChannelInstance(p,handle);if(valid)return valid;
+  return p.owner->componentChannels.read(&p,*handle,known,out,capacity,bytes,revision);
+ }
+ static int component_channel_stats_api(void* c,const TCComponentInstanceHandle* handle,
+                                        TCComponentChannelStatsV1* out){
+  auto& p=*static_cast<Loaded*>(c);const int valid=p.owner->validateChannelInstance(p,handle);if(valid)return valid;
+  return p.owner->componentChannels.stats(&p,*handle,out);
+ }
+ int queryComponentChannelService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+  if(version!=TC_COMPONENT_CHANNEL_API_VERSION_1)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCComponentChannelApiV1))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCComponentChannelApiV1*>(out)=TCComponentChannelApiV1{
+      sizeof(TCComponentChannelApiV1),TC_COMPONENT_CHANNEL_API_VERSION_1,&p,
+      &component_channel_open_api,&component_channel_close_api,&component_channel_send_api,
+      &component_channel_receive_api,&component_channel_publish_api,&component_channel_read_api,
+      &component_channel_stats_api};
+  return TC_SERVICE_OK;
+ }
  static int query_service_api(void* c,const char* id,uint32_t version,void* out,uint32_t outSize){
  auto& p=*(Loaded*)c;if(!id)return TC_SERVICE_ERR_ARGUMENT;
+ if(std::strcmp(id,TC_SERVICE_MOD_STORAGE)==0)return p.owner->queryModStorageService(p,version,out,outSize);
+ if(std::strcmp(id,TC_SERVICE_MOD_SETTINGS)==0)return p.owner->queryModSettingsService(p,version,out,outSize);
  if(std::strcmp(id,TC_SERVICE_COMMANDS)==0)return p.owner->queryCommandService(p,version,out,outSize);
  if(std::strcmp(id,TC_SERVICE_LIFECYCLE)==0)return p.owner->queryLifecycleService(p,version,out,outSize);
  if(std::strcmp(id,TC_SERVICE_TRANSACTIONS)==0)return p.owner->queryTransactionService(p,version,out,outSize);
  if(std::strcmp(id,TC_SERVICE_COMPONENT_TYPES)==0)return p.owner->queryComponentTypesService(p,version,out,outSize);
+ if(std::strcmp(id,TC_SERVICE_COMPONENT_RUNTIME)==0)return p.owner->queryComponentRuntimeService(p,version,out,outSize);
+ if(std::strcmp(id,TC_SERVICE_COMPONENT_COMPOSE)==0)return p.owner->queryComponentComposeService(p,version,out,outSize);
  if(std::strcmp(id,TC_SERVICE_COMPONENT_GEOMETRY)==0)return p.owner->queryComponentGeometryService(p,version,out,outSize);
  if(std::strcmp(id,TC_SERVICE_COMPONENT_RENDER)==0)return p.owner->queryComponentRenderService(p,version,out,outSize);
+ if(std::strcmp(id,TC_SERVICE_COMPONENT_INPUT)==0)return p.owner->queryComponentInputService(p,version,out,outSize);
+ if(std::strcmp(id,TC_SERVICE_COMPONENT_CHANNEL)==0)return p.owner->queryComponentChannelService(p,version,out,outSize);
+ if(std::strcmp(id,TC_SERVICE_COMPONENT_EDITOR)==0)return p.owner->queryComponentEditorService(p,version,out,outSize);
  return p.owner->services.query(id,version,out,outSize);
+ }
+ static bool modStorageAvailable(const Loaded& p){return p.owner&&(p.accepting||p.active);}
+ static int mod_storage_read_api(void* c,uint32_t scope,const char* key,void* out,
+                                 uint32_t capacity,uint32_t* bytes){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!modStorageAvailable(p))return TC_MOD_STORAGE_ERR_UNAVAILABLE;
+  return p.owner->modStorage.readValue(p.id,scope,key,out,capacity,bytes);
+ }
+ static int mod_storage_write_api(void* c,uint32_t scope,const char* key,const void* data,
+                                  uint32_t size){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!modStorageAvailable(p))return TC_MOD_STORAGE_ERR_UNAVAILABLE;
+  return p.owner->modStorage.writeValue(p.id,scope,key,data,size);
+ }
+ static int mod_storage_remove_api(void* c,uint32_t scope,const char* key){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!modStorageAvailable(p))return TC_MOD_STORAGE_ERR_UNAVAILABLE;
+  return p.owner->modStorage.removeValue(p.id,scope,key);
+ }
+ static int mod_storage_has_api(void* c,uint32_t scope,const char* key){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!modStorageAvailable(p))return TC_MOD_STORAGE_ERR_UNAVAILABLE;
+  return p.owner->modStorage.hasValue(p.id,scope,key);
+ }
+ static int mod_storage_version_api(void* c,uint32_t scope,const char* key,uint32_t* schema){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!modStorageAvailable(p))return TC_MOD_STORAGE_ERR_UNAVAILABLE;
+  return p.owner->modStorage.getVersion(p.id,scope,key,schema);
+ }
+ static int mod_storage_migrate_api(void* c,uint32_t scope,const char* key,uint32_t target,
+                                    const void* defaults,uint32_t defaultSize,
+                                    TCModStorageMigrateV1 callback,void* user,uint32_t* resulting){
+  auto& p=*static_cast<Loaded*>(c);
+  if(!modStorageAvailable(p))return TC_MOD_STORAGE_ERR_UNAVAILABLE;
+  return p.owner->modStorage.migrateValue(p.id,scope,key,target,defaults,defaultSize,
+                                          callback,user,resulting);
+ }
+ int queryModStorageService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+   if(version==TC_MOD_STORAGE_API_VERSION_1){
+    if(outSize<sizeof(TCModStorageApiV1))return TC_SERVICE_ERR_SIZE;
+    *static_cast<TCModStorageApiV1*>(out)=TCModStorageApiV1{
+        sizeof(TCModStorageApiV1),TC_MOD_STORAGE_API_VERSION_1,&p,
+        &mod_storage_read_api,&mod_storage_write_api,&mod_storage_remove_api,
+        &mod_storage_has_api};
+    return TC_SERVICE_OK;
+   }
+   if(version==TC_MOD_STORAGE_API_VERSION_2){
+    if(outSize<sizeof(TCModStorageApiV2))return TC_SERVICE_ERR_SIZE;
+    *static_cast<TCModStorageApiV2*>(out)=TCModStorageApiV2{
+        sizeof(TCModStorageApiV2),TC_MOD_STORAGE_API_VERSION_2,&p,
+        &mod_storage_read_api,&mod_storage_write_api,&mod_storage_remove_api,
+        &mod_storage_has_api,&mod_storage_version_api,&mod_storage_migrate_api};
+    return TC_SERVICE_OK;
+   }
+   return TC_SERVICE_ERR_VERSION;
+ }
+ int applySetting(Loaded& p,mod_settings::Field& field,const mod_settings::Value& value){
+  if(value.type!=field.type)return TC_MOD_SETTINGS_ERR_TYPE;
+  const TCModSettingValueV1 publicValue=mod_settings::publicValue(value);
+  if(p.settingChanged){
+   try{if(p.settingChanged(p.settingUser,field.id.c_str(),&publicValue)!=TC_MOD_SETTINGS_OK)
+    return TC_MOD_SETTINGS_ERR_ARGUMENT;}
+   catch(...){return TC_MOD_SETTINGS_ERR_ARGUMENT;}
+  }
+  const std::string encoded=mod_settings::encode(value);
+  const int stored=modStorage.writeVersioned(p.id,field.scope,field.storageKey.c_str(),1,
+                                              encoded.data(),(uint32_t)encoded.size());
+  if(stored!=TC_MOD_STORAGE_OK)return TC_MOD_SETTINGS_ERR_STORAGE;
+  field.current=value;
+  logger("Mod setting changed: "+p.id+"/"+field.id+" scope="+
+         (field.scope==TC_MOD_STORAGE_SCOPE_GLOBAL?"global":"profile"));
+  return TC_MOD_SETTINGS_OK;
+ }
+ static int mod_settings_set_fields_api(void* c,const TCModSettingFieldV1* fields,uint32_t count,
+                                        TCModSettingChangedV1 changed,void* user){
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!p.accepting)return TC_MOD_SETTINGS_ERR_UNAVAILABLE;
+  if(r.gameThreadId&&GetCurrentThreadId()!=r.gameThreadId)return TC_MOD_SETTINGS_ERR_THREAD;
+  std::vector<mod_settings::Field> copied;std::string reason;
+  const int validation=mod_settings::copyFields(fields,count,&copied,&reason);
+  if(validation!=TC_MOD_SETTINGS_OK){r.logger("Mod settings rejected: "+p.id+": "+reason);return validation;}
+  for(auto& field:copied){
+   uint32_t bytes=0;
+   int status=r.modStorage.readValue(p.id,field.scope,field.storageKey.c_str(),nullptr,0,&bytes);
+   if(status==TC_MOD_STORAGE_ERR_NOT_FOUND){
+    const std::string encoded=mod_settings::encode(field.defaultValue);
+    status=r.modStorage.writeVersioned(p.id,field.scope,field.storageKey.c_str(),1,
+                                       encoded.data(),(uint32_t)encoded.size());
+    if(status!=TC_MOD_STORAGE_OK)return TC_MOD_SETTINGS_ERR_STORAGE;
+    field.current=field.defaultValue;
+    continue;
+   }
+   if(status!=TC_MOD_STORAGE_OK)return TC_MOD_SETTINGS_ERR_STORAGE;
+   std::string encoded(bytes,'\0');
+   if(bytes){uint32_t written=0;status=r.modStorage.readValue(p.id,field.scope,
+      field.storageKey.c_str(),encoded.data(),bytes,&written);
+    if(status!=TC_MOD_STORAGE_OK||written!=bytes)return TC_MOD_SETTINGS_ERR_STORAGE;}
+   mod_settings::Value value;
+   if(mod_settings::decode(field,encoded,&value))field.current=std::move(value);
+   else{field.current=field.defaultValue;r.logger("Mod setting invalid; using default without overwriting: "+
+        p.id+"/"+field.id);}
+  }
+  p.settings=std::move(copied);p.settingChanged=changed;p.settingUser=user;
+  r.logger("Mod settings registered: "+p.id+" fields="+std::to_string(p.settings.size()));
+  return TC_MOD_SETTINGS_OK;
+ }
+ static int mod_settings_clear_fields_api(void* c){
+  auto& p=*static_cast<Loaded*>(c);if(!p.accepting)return TC_MOD_SETTINGS_ERR_UNAVAILABLE;
+  p.settings.clear();p.settingChanged=nullptr;p.settingUser=nullptr;return TC_MOD_SETTINGS_OK;
+ }
+ static int mod_settings_get_api(void* c,const char* id,TCModSettingValueV1* out,uint32_t outSize){
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if((!p.accepting&&!p.active))return TC_MOD_SETTINGS_ERR_UNAVAILABLE;
+  if(r.gameThreadId&&GetCurrentThreadId()!=r.gameThreadId)return TC_MOD_SETTINGS_ERR_THREAD;
+  if(!id||!out||outSize<sizeof(TCModSettingValueV1))return TC_MOD_SETTINGS_ERR_ARGUMENT;
+  for(auto& field:p.settings)if(field.id==id){*out=mod_settings::publicValue(field.current);return TC_MOD_SETTINGS_OK;}
+  return TC_MOD_SETTINGS_ERR_NOT_FOUND;
+ }
+ static int mod_settings_reset_api(void* c,const char* id){
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if((!p.accepting&&!p.active))return TC_MOD_SETTINGS_ERR_UNAVAILABLE;
+  if(r.gameThreadId&&GetCurrentThreadId()!=r.gameThreadId)return TC_MOD_SETTINGS_ERR_THREAD;
+  if(!id)return TC_MOD_SETTINGS_ERR_ARGUMENT;
+  for(auto& field:p.settings)if(field.id==id)return r.applySetting(p,field,field.defaultValue);
+  return TC_MOD_SETTINGS_ERR_NOT_FOUND;
+ }
+ int queryModSettingsService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+  if(version!=TC_MOD_SETTINGS_API_VERSION_1)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCModSettingsApiV1))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCModSettingsApiV1*>(out)=TCModSettingsApiV1{
+      sizeof(TCModSettingsApiV1),TC_MOD_SETTINGS_API_VERSION_1,&p,
+      &mod_settings_set_fields_api,&mod_settings_clear_fields_api,
+      &mod_settings_get_api,&mod_settings_reset_api};
+  return TC_SERVICE_OK;
  }
  void dropCommands(Loaded& p){for(auto& item:commands)if(item.second.owner==&p&&item.second.status.state==TC_COMMAND_STATE_QUEUED){item.second.status.state=TC_COMMAND_STATE_CANCELLED;item.second.status.result=TC_COMMAND_ERR_UNAVAILABLE;item.second.status.completed_frame=engineFrame();}}
  static bool sameHandle(const TCGameHandle& a,const TCGameHandle& b){return a.kind==b.kind&&a.generation==b.generation&&a.token==b.token;}
@@ -2277,13 +2932,8 @@ void armEventSources(){
  /* Validates one staged step the same way a direct submit does, so a transaction
     cannot smuggle in a command the bus would have refused. */
  int stageTransaction(TransactionRecord& tx,const TCCommandV2& command){
-  if(command.flags||command.type<TC_COMMAND_SIM_RUN||!sameHandle(command.subject,tx.board))return TC_TRANSACTION_ERR_ARGUMENT;
-  if(command.type==TC_COMMAND_SIM_RUN&&command.argument<0)return TC_TRANSACTION_ERR_ARGUMENT;
-  if(command.type==TC_COMMAND_BOARD_PLACE_COMPONENT){
-   if(command.custom_prototype_id){if(command.kind!=board_edits::kCustomKind)return TC_TRANSACTION_ERR_ARGUMENT;}
-   else if(!command.kind)return TC_TRANSACTION_ERR_ARGUMENT;
-   if(command.rotation>255||command.x<-32768||command.x>32767||command.y<-32768||command.y>32767)return TC_TRANSACTION_ERR_ARGUMENT;
-  }
+  if(!sameHandle(command.subject,tx.board))return TC_TRANSACTION_ERR_ARGUMENT;
+  if(validateCommand(*tx.owner,command)!=TC_COMMAND_OK)return TC_TRANSACTION_ERR_ARGUMENT;
   if(tx.steps.size()>=kMaxTransactionSteps)return TC_TRANSACTION_ERR_CAPACITY;
   tx.steps.push_back(command);tx.status.staged_count=tx.steps.size();return TC_TRANSACTION_OK;
  }
@@ -2307,13 +2957,734 @@ void armEventSources(){
    plugin's host (mod id, data directory) - same rule as the command bus. */
 int queryComponentTypesService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
   if(!out)return TC_SERVICE_ERR_ARGUMENT;
-  if(version!=TC_COMPONENT_TYPES_API_VERSION_1)return TC_SERVICE_ERR_VERSION;
-  if(outSize<sizeof(TCComponentTypesApiV1))return TC_SERVICE_ERR_SIZE;
-  *static_cast<TCComponentTypesApiV1*>(out)=TCComponentTypesApiV1{
-      sizeof(TCComponentTypesApiV1),TC_COMPONENT_TYPES_API_VERSION_1,&p,
-      &component_types_register_api};
+  if(version==TC_COMPONENT_TYPES_API_VERSION_1){
+   if(outSize<sizeof(TCComponentTypesApiV1))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentTypesApiV1*>(out)=TCComponentTypesApiV1{
+       sizeof(TCComponentTypesApiV1),TC_COMPONENT_TYPES_API_VERSION_1,&p,
+       &component_types_register_api};
+   return TC_SERVICE_OK;
+  }
+  if(version!=TC_COMPONENT_TYPES_API_VERSION_2)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCComponentTypesApiV2))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCComponentTypesApiV2*>(out)=TCComponentTypesApiV2{
+      sizeof(TCComponentTypesApiV2),TC_COMPONENT_TYPES_API_VERSION_2,&p,
+      &component_types_register_api,&component_types_register_v3_api};
   return TC_SERVICE_OK;
 }
+/* tc.component.runtime V1: the running-game registration entry, handed out per
+   plugin for the same reason as above - the registration needs that plugin's
+   own host. */
+int queryComponentRuntimeService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+  if(version==TC_COMPONENT_RUNTIME_API_VERSION_1){
+   if(outSize<sizeof(TCComponentRuntimeApiV1))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentRuntimeApiV1*>(out)=TCComponentRuntimeApiV1{
+       sizeof(TCComponentRuntimeApiV1),TC_COMPONENT_RUNTIME_API_VERSION_1,&p,
+       &component_runtime_register_api};
+   return TC_SERVICE_OK;
+  }
+  if(version!=TC_COMPONENT_RUNTIME_API_VERSION_2)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCComponentRuntimeApiV2))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCComponentRuntimeApiV2*>(out)=TCComponentRuntimeApiV2{
+      sizeof(TCComponentRuntimeApiV2),TC_COMPONENT_RUNTIME_API_VERSION_2,&p,
+      &component_runtime_register_api,&component_runtime_replace_api,
+      &component_runtime_unregister_api};
+  return TC_SERVICE_OK;
+}
+/* tc.component.compose V1: the built-in type catalogue.  Loader-wide read-only
+   data, so the context is the runtime itself (unlike the registration services,
+   which need the calling plugin).  Nothing is published when the boot
+   enumeration found no prototype table: an empty catalogue would read as "this
+   build has no components" instead of "this loader cannot answer". */
+static void composeFill(const builtin_catalogue::Entry& entry,TCBuiltinTypeInfoV1& info){
+  info=TCBuiltinTypeInfoV1{};
+  info.size=sizeof(info);
+  info.kind=entry.kind;
+  info.flags=(entry.inputs.empty()?TC_BUILTIN_FLAG_NO_DECLARED_INPUTS:0u)|
+             (entry.hasShape?TC_BUILTIN_FLAG_HAS_SHAPE:0u);
+  info.input_count=static_cast<uint32_t>(entry.inputs.size());
+  info.output_count=static_cast<uint32_t>(entry.outputs.size());
+  info.pin_limit=TC_BUILTIN_PIN_LIMIT;
+  component_registry::copyField(info.type_id,sizeof(info.type_id),entry.typeId);
+  component_registry::copyField(info.name,sizeof(info.name),entry.name);
+  component_registry::copyField(info.description,sizeof(info.description),entry.description);
+ }
+ static uint32_t compose_count_api(void* c){
+  return static_cast<uint32_t>(static_cast<Loaded*>(c)->owner->builtinTypes.size());
+ }
+ static int compose_get_api(void* c,uint32_t index,TCBuiltinTypeInfoV1* out){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  if(!out||out->size<sizeof(TCBuiltinTypeInfoV1))return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  if(index>=r.builtinTypes.size())return TC_COMPONENT_COMPOSE_ERR_RANGE;
+  composeFill(r.builtinTypes[index],*out);
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static int compose_find_api(void* c,uint32_t kind,TCBuiltinTypeInfoV1* out){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  if(!out||out->size<sizeof(TCBuiltinTypeInfoV1))return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  const auto found=r.builtinTypeByKind.find(kind);
+  if(found==r.builtinTypeByKind.end())return TC_COMPONENT_COMPOSE_ERR_UNKNOWN;
+  composeFill(r.builtinTypes[found->second],*out);
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static int compose_find_by_type_id_api(void* c,const char* typeId,TCBuiltinTypeInfoV1* out){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  if(!out||out->size<sizeof(TCBuiltinTypeInfoV1))return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  if(!typeId||!*typeId)return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  const auto exact=r.builtinTypeById.find(typeId);
+  if(exact!=r.builtinTypeById.end()){composeFill(r.builtinTypes[exact->second],*out);return TC_COMPONENT_COMPOSE_OK;}
+  const int folded=builtin_catalogue::indexOfTypeId(r.builtinTypes,std::string(typeId));
+  if(folded<0)return TC_COMPONENT_COMPOSE_ERR_UNKNOWN;
+  composeFill(r.builtinTypes[static_cast<size_t>(folded)],*out);
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static int compose_pin_api(void* c,uint32_t kind,uint32_t direction,uint32_t index,
+                            TCBuiltinPinV1* out){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  if(!out||out->size<sizeof(TCBuiltinPinV1))return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  if(direction!=TC_COMPONENT_PIN_INPUT&&direction!=TC_COMPONENT_PIN_OUTPUT)
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  const auto found=r.builtinTypeByKind.find(kind);
+  if(found==r.builtinTypeByKind.end())return TC_COMPONENT_COMPOSE_ERR_UNKNOWN;
+  const auto& pins=direction==TC_COMPONENT_PIN_INPUT?r.builtinTypes[found->second].inputs
+                                                   :r.builtinTypes[found->second].outputs;
+  if(index>=pins.size())return TC_COMPONENT_COMPOSE_ERR_RANGE;
+  const builtin_catalogue::Pin& pin=pins[index];
+  *out=TCBuiltinPinV1{};
+  out->size=sizeof(*out);
+  out->direction=direction;
+  out->index=index;
+  out->bits=pin.bits;
+  out->x=pin.x;out->y=pin.y;
+  out->word_size_raw=pin.wordSizeRaw;
+  out->flags=(pin.bits?0u:TC_BUILTIN_PIN_AUTO_WIDTH);
+  if(!pin.bits&&pin.wordSizeRaw!=board_pins::kPinAutoSize)out->flags=TC_BUILTIN_PIN_RAW_WIDTH;
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ /* ---- V2: the internal-netlist builder ----------------------------------- */
+ static void composeRefuse(ComposeSession& session,const std::string& why){
+  session.status=why;
+ }
+ /* Resolves one inner part by the spelling the Mod asked for.  A built-in
+    spelling comes from the boot catalogue (kind + declared pins); any other
+    spelling is a registered Mod type, whose pins are read from its own prototype
+    - that is the nesting path, and it is why the inner type has to exist before
+    the outer definition is committed. */
+ bool composePart(NativeRuntime& r,const std::string& spelling,component_netlist::Node& node,
+                  std::string& why) const {
+  const auto builtin=r.builtinTypeById.find(spelling);
+  if(builtin!=r.builtinTypeById.end()){
+   const builtin_catalogue::Entry& entry=r.builtinTypes[builtin->second];
+   node.kind=entry.kind;
+   node.sinks=entry.inputs;
+   node.sources=entry.outputs;
+   node.stateful=entry.inputs.empty();
+   if(node.sinks.empty()&&node.sources.empty()){
+    why="the part '"+spelling+"' declares no pin at all";
+    return false;
+   }
+   return true;
+  }
+  std::string wanted=spelling;
+  component_registry::Type found{};
+  bool known=false;
+  for(const component_registry::Type& candidate:component_registry::snapshot())
+   if(candidate.active&&component_registry::typeId(candidate)==wanted){found=candidate;known=true;break;}
+  if(!known){
+   /* A custom id is accepted too - "0x<id>", or "<owner>/0x<id>" - so a Mod can
+      nest a type it just registered without looking the spelling up first.  When
+      an owner is spelled it has to match, so two Mods cannot name each other's
+      ids by accident. */
+   const size_t marker=wanted.rfind("0x");
+   if(marker!=std::string::npos){
+    const std::string owner=marker?wanted.substr(0,marker-1):std::string();
+    const char* digits=wanted.c_str()+marker+2;
+    if(*digits&&std::all_of(digits,digits+std::strlen(digits),
+                            [](char letter){return std::isxdigit(static_cast<unsigned char>(letter))!=0;})){
+     const uint64_t id=std::strtoull(digits,nullptr,16);
+     for(const component_registry::Type& candidate:component_registry::snapshot())
+      if(candidate.active&&candidate.custom_id==id&&
+         (owner.empty()||candidate.owner_mod==owner)){found=candidate;known=true;break;}
+    }
+   }
+  }
+  if(!known){
+   why="no such part: '"+spelling+"' is neither a built-in spelling nor a registered type's type_id";
+   return false;
+  }
+  if(!customPrototypeGet){
+   why="the game's custom prototype table is unavailable";
+   return false;
+  }
+  node.kind=board_edits::kCustomKind;
+  node.customId=found.custom_id;
+  TCPrototype prototype{};
+  customPrototypeGet(found.custom_id,&prototype);
+  const auto readPins=[&](bool outputs,std::vector<builtin_catalogue::Pin>& out){
+   const uint64_t count=outputs?prototypeOutputCount(prototype):prototypeInputCount(prototype);
+   for(uint64_t index=0;index<count;++index){
+    const TCPin* pin=outputs?prototypeOutputPin(prototype,index):prototypeInputPin(prototype,index);
+    if(!pin)continue;
+    const TCPinInfoV1 info=board_pins::decodePin(*pin,outputs?TC_PIN_OUTPUT:TC_PIN_INPUT);
+    out.push_back(builtin_catalogue::Pin{info.x,info.y,info.bits,info.word_size_raw});
+   }
+  };
+  readPins(false,node.sinks);
+  readPins(true,node.sources);
+  if(prototypeDestroy)prototypeDestroy(&prototype);
+  if(node.sinks.empty()&&node.sources.empty()){
+   why="the type '"+spelling+"' has no pin the builder can address";
+   return false;
+  }
+  return true;
+ }
+ static int compose_begin_api(void* c,const TCComposeTypeV1* type,uint64_t* session){
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!type||!session||type->size<sizeof(TCComposeTypeV1)||!type->custom_id||
+     !type->name||!*type->name)return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  if(!p.accepting)return TC_COMPONENT_COMPOSE_ERR_UNAVAILABLE;
+  if((!type->input_count&&!type->output_count)||
+     type->input_count>component_netlist::kMaxPinsPerDirection||
+     type->output_count>component_netlist::kMaxPinsPerDirection||
+     (type->input_count&&!type->inputs)||(type->output_count&&!type->outputs))
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  component_registry::Type existing{};
+  if(component_registry::find(type->custom_id,&existing))return TC_COMPONENT_COMPOSE_ERR_DUPLICATE;
+  {std::lock_guard<std::mutex> lock(logic::registryMutex);
+   if(logic::definitions.count(type->custom_id))return TC_COMPONENT_COMPOSE_ERR_DUPLICATE;}
+  ComposeSession opened;
+  opened.owner=&p;
+  opened.definition.customId=type->custom_id;
+  opened.definition.name=type->name;
+  opened.definition.gateCost=type->gate_cost<0?0:type->gate_cost;
+  opened.definition.delay=type->delay<0?0:type->delay;
+  const auto copyPins=[&](const TCComponentPinV2* pins,uint32_t count,
+                          std::vector<component_netlist::Pin>& out){
+   for(uint32_t index=0;index<count;++index){
+    const TCComponentPinV2& pin=pins[index];
+    if(pin.bits<1||pin.bits>64)return false;
+    out.push_back(component_netlist::Pin{pin.name?pin.name:"",pin.bits});
+   }
+   return true;
+  };
+  if(!copyPins(type->inputs,type->input_count,opened.definition.inputs)||
+     !copyPins(type->outputs,type->output_count,opened.definition.outputs))
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  const uint64_t id=r.nextComposeSession++;
+  r.composeSessions.emplace(id,std::move(opened));
+  *session=id;
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static int compose_node_api(void* c,uint64_t session,const char* typeId,int32_t x,int32_t y,
+                             uint32_t bits,uint32_t* nodeIndex){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  const auto found=r.composeSessions.find(session);
+  if(found==r.composeSessions.end())return TC_COMPONENT_COMPOSE_ERR_BUILD;
+  ComposeSession& open=found->second;
+  if(!typeId||!*typeId){
+   composeRefuse(open,"node() needs the part's spelling");
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  }
+  component_netlist::Node node;
+  node.x=x;node.y=y;node.bits=bits?bits:1u;
+  node.typeId=typeId;
+  std::string why;
+  if(!r.composePart(r,typeId,node,why)){
+   composeRefuse(open,why);
+   return TC_COMPONENT_COMPOSE_ERR_NETLIST;
+  }
+  open.definition.nodes.push_back(std::move(node));
+  if(nodeIndex)
+   *nodeIndex=open.definition.firstInner()+static_cast<uint32_t>(open.definition.nodes.size())-1;
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static int compose_connect_api(void* c,uint64_t session,uint32_t fromNode,uint32_t fromPin,
+                                uint32_t toNode,uint32_t toPin){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  const auto found=r.composeSessions.find(session);
+  if(found==r.composeSessions.end())return TC_COMPONENT_COMPOSE_ERR_BUILD;
+  ComposeSession& open=found->second;
+  const component_netlist::Definition& d=open.definition;
+  component_netlist::Point scratch{};
+  if(!component_netlist::sourcePoint(d,fromNode,fromPin,scratch)){
+   composeRefuse(open,"node "+std::to_string(fromNode)+" pin "+std::to_string(fromPin)+
+                      " is not a source pin");
+   return TC_COMPONENT_COMPOSE_ERR_NETLIST;
+  }
+  if(!component_netlist::sinkPoint(d,toNode,toPin,scratch)){
+   composeRefuse(open,"node "+std::to_string(toNode)+" pin "+std::to_string(toPin)+
+                      " is not a sink pin");
+   return TC_COMPONENT_COMPOSE_ERR_NETLIST;
+  }
+  open.definition.connections.push_back(component_netlist::Connection{fromNode,fromPin,toNode,toPin});
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+  /* The game's foundry opens a *player* component: it looks the selected type up
+     by name under <profile>/schematics/foundry/<name>/circuit.data, and a Mod
+     type has no such entry, so the button shows an empty definition.  That file
+     is exactly the component definition the loader generates (measured
+     2026-09-29 against the foundry's own files: same header, same pin records -
+     writing our bytes there made the foundry draw all 65 parts of a composite).
+
+     A callback type has no hand-drawn schematic, but it does have a generated
+     inner circuit: the pins, one collector per input, the dependency cones that
+     tell the game which inputs each output reads, the drivers and the wires
+     between them (see component_definition::encode).  Writing those same bytes
+     here is what lets a player open a Mod component in the foundry and actually
+     look at its wiring, instead of an empty board.
+
+     The entry is filled only when the game has nothing but its own placeholder;
+     a copy the player has edited is left alone. */
+  /* True when <profile>/schematics/foundry/<name>/circuit.data exists and carries
+     this custom id: the entry the loader itself filled (possibly re-saved by the
+     game in its own container since).  The game imports everything under
+     `schematics/foundry/` as a player component when it boots - before any plugin
+     loads - so a type whose entry is already there arrives at registration with
+     its prototype already in the game's table.  The registration paths use this
+     to replace that prototype in place instead of refusing the id. */
+  bool foundryEntryCarriesId(const std::string& name,uint64_t customId) const {
+   if(saveRoot.empty()||name.empty())return false;
+   const fs::path file=saveRoot/"schematics"/"foundry"/fs::u8path(name)/"circuit.data";
+   std::ifstream probe(file,std::ios::binary);
+   if(!probe)return false;
+   char head[64]={};
+   probe.read(head,sizeof(head));
+   const auto got=static_cast<size_t>(probe.gcount());
+   uint8_t wanted[8]={};
+   for(int i=0;i<8;++i)wanted[i]=static_cast<uint8_t>((customId>>(8*i))&0xff);
+   for(size_t offset=0;offset+8<=got&&offset<sizeof(head);++offset)
+    if(std::memcmp(head+offset,wanted,8)==0)return true;
+   return false;
+  }
+  static void provideFoundrySchematicBytes(NativeRuntime& runtime,const TCHost& host,
+                                           const std::string& name,uint64_t customId,
+                                           const std::vector<uint8_t>& bytes){
+   if(runtime.saveRoot.empty()||name.empty()||bytes.empty())return;
+   std::error_code ec;
+   const fs::path directory=runtime.saveRoot/"schematics"/"foundry"/fs::u8path(name);
+   const fs::path file=directory/"circuit.data";
+   const auto size=fs::file_size(file,ec);
+   /* The game re-saves the entry in its own container (v16, real snappy) once the
+      foundry has opened it, so "missing or empty" does not tell our entry from a
+      player's component with the same name.  The id does: a definition starts
+      with its custom id, so an entry carrying this type's id is ours and gets
+      refreshed when the layout changes; anything else is the player's and is left
+      alone. */
+   if(!ec&&size>64&&!runtime.foundryEntryCarriesId(name,customId))
+    return; /* the player's own component of the same name */
+   fs::create_directories(directory,ec);
+   std::ofstream out(file,std::ios::binary|std::ios::trunc);
+   if(!out){host.log(host.context,("foundry view: cannot write "+file.u8string()).c_str());return;}
+   out.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
+   host.log(host.context,("foundry view: filled "+file.u8string()+
+                          " so the component can be opened in the foundry").c_str());
+  }
+  static void provideFoundrySchematic(NativeRuntime& runtime,const TCHost& host,
+                                      const component_netlist::Definition& d){
+   provideFoundrySchematicBytes(runtime,host,d.name,d.customId,component_netlist::encode(d));
+  }
+ static int compose_commit_api(void* c,uint64_t session){
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  auto found=r.composeSessions.find(session);
+  if(found==r.composeSessions.end())return TC_COMPONENT_COMPOSE_ERR_BUILD;
+  ComposeSession& open=found->second;
+  std::string why;
+  const component_netlist::Error error=component_netlist::validate(open.definition,why);
+  if(error!=component_netlist::Error::None){
+   composeRefuse(open,std::string(component_netlist::errorText(error))+
+                      (why.empty()?std::string():std::string(": ")+why));
+   return TC_COMPONENT_COMPOSE_ERR_NETLIST;
+  }
+  std::string status;
+  const bool adopt=r.foundryEntryCarriesId(open.definition.name,open.definition.customId);
+  const int result=tc::registerCompositeComponent(&p.host,open.definition,status,adopt);
+  if(result){
+   composeRefuse(open,status.empty()?"the game refused the composite definition":status);
+   return result==-3?TC_COMPONENT_COMPOSE_ERR_DUPLICATE:TC_COMPONENT_COMPOSE_ERR_GAME;
+  }
+  p.componentIds.push_back(open.definition.customId);
+  p.owner->noteComponentType(p,open.definition.customId,open.definition.name.c_str(),0,nullptr);
+  {
+   tc::component_registry::Type entry;
+   entry.custom_id=open.definition.customId;
+   entry.owner_mod=p.id;
+   entry.name=open.definition.name;
+   entry.gate_cost=static_cast<uint64_t>(open.definition.gateCost);
+   entry.delay=static_cast<uint64_t>(open.definition.delay);
+   entry.implementation=TC_COMPONENT_IMPL_COMPOSITE;
+   entry.schema_version=0;
+   entry.active=true;
+   for(const component_netlist::Pin& pin:open.definition.inputs)
+    entry.inputs.push_back(tc::component_registry::Pin{pin.name,pin.bits});
+   for(const component_netlist::Pin& pin:open.definition.outputs)
+    entry.outputs.push_back(tc::component_registry::Pin{pin.name,pin.bits});
+   tc::component_registry::note(std::move(entry));
+  }
+  provideFoundrySchematic(r,p.host,open.definition);
+  r.composeSessions.erase(found);
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static int compose_abort_api(void* c,uint64_t session){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  const auto found=r.composeSessions.find(session);
+  if(found==r.composeSessions.end())return TC_COMPONENT_COMPOSE_ERR_BUILD;
+  r.composeSessions.erase(found);
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ static const char* compose_status_api(void* c,uint64_t session){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  const auto found=r.composeSessions.find(session);
+  return found==r.composeSessions.end()?"":found->second.status.c_str();
+ }
+ /* How wide this type's own pin lane is: the room the inner circuit is laid out
+    in.  The historic shape is two cells (-18 / +13); a wider lane moves the
+    columns apart (the declarative API's `pin_lane`, same convention). */
+ static int compose_pin_lane_api(void* c,uint64_t session,uint32_t lane){
+  auto& r=*static_cast<Loaded*>(c)->owner;
+  const auto found=r.composeSessions.find(session);
+  if(found==r.composeSessions.end())return TC_COMPONENT_COMPOSE_ERR_BUILD;
+  if(!component_netlist::validPinLane(lane)){
+   composeRefuse(found->second,"the pin lane has to be 1..16 board cells");
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  }
+  found->second.definition.pinLane=lane;
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ /* tc.component.compose V2: plan section 8.3's `clone_builtin_metadata`.  The
+    fields it copies are the ones a *metadata* clone can honestly promise: the
+    name and description the player reads, and (on request) the declared cost
+    pair.  Pins are not copyable after registration, and the icon is not
+    copyable at all - the game ignores a custom prototype's shape (measured), so
+    the contract points at tc.component.render V5's picture instead. */
+ static int compose_clone_metadata_api(void* c,uint64_t customId,const char* builtinTypeId,
+                                       uint32_t flags){
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!p.accepting&&!p.active)return TC_COMPONENT_COMPOSE_ERR_UNAVAILABLE;
+  if(!builtinTypeId||!*builtinTypeId||!flags||
+     (flags&~(TC_COMPOSE_CLONE_NAME|TC_COMPOSE_CLONE_DESCRIPTION|TC_COMPOSE_CLONE_COST)))
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  const auto builtin=r.builtinTypeById.find(builtinTypeId);
+  if(builtin==r.builtinTypeById.end())return TC_COMPONENT_COMPOSE_ERR_UNKNOWN;
+  component_registry::Type own{};
+  if(!component_registry::find(customId,&own)||own.owner_mod!=p.id)
+   return TC_COMPONENT_COMPOSE_ERR_ARGUMENT; /* only a Mod's own type */
+  if(!r.customPrototypeGet||!r.customPrototypeSet||!r.prototypeDestroy)
+   return TC_COMPONENT_COMPOSE_ERR_UNAVAILABLE;
+  const builtin_catalogue::Entry& source=r.builtinTypes[builtin->second];
+  TCGameModel game;
+  if(!game.load(&p.host))return TC_COMPONENT_COMPOSE_ERR_UNAVAILABLE;
+  TCPrototype prototype{};
+  r.customPrototypeGet(customId,&prototype);
+  bool ok=true;
+  if(flags&TC_COMPOSE_CLONE_NAME)ok=game.setPrototypeName(prototype,source.name.c_str())&&ok;
+  if(flags&TC_COMPOSE_CLONE_DESCRIPTION)
+   ok=game.setPrototypeDescription(prototype,source.description.c_str())&&ok;
+  if(flags&TC_COMPOSE_CLONE_COST){
+   TCPrototypeKind key{};key.tag=static_cast<uint8_t>(source.kind);
+   TCPrototype builtinPrototype{};
+   r.prototypeGet(&key,&builtinPrototype);
+   ok=game.setPrototypeGateCost(prototype,prototypeGateCost(builtinPrototype))&&ok;
+   ok=game.setPrototypeDelay(prototype,prototypeDelay(builtinPrototype))&&ok;
+   r.prototypeDestroy(&builtinPrototype);
+  }
+  if(ok)r.customPrototypeSet(customId,&prototype);
+  r.prototypeDestroy(&prototype);
+  if(!ok)return TC_COMPONENT_COMPOSE_ERR_GAME;
+  /* The loader's own catalogue follows, so the Mods page and any Mod querying
+     tc.component.registry see the cloned text too. */
+  component_registry::Type updated=own;
+  if(flags&TC_COMPOSE_CLONE_NAME)updated.name=source.name;
+  if(flags&TC_COMPOSE_CLONE_DESCRIPTION)updated.description=source.description;
+  component_registry::note(std::move(updated));
+  r.logger("["+p.id+"] Component compose: cloned metadata of '"+source.typeId+"' onto "+
+         component_registry::typeId(own)+" flags="+std::to_string(flags));
+  return TC_COMPONENT_COMPOSE_OK;
+ }
+ /* Plan section 8.3's `register_builtin_alias`: this build has no path for it
+    (the game dispatches by kind byte, and a Mod type's instances carry 0x4e), so
+    the call refuses explicitly rather than registering a look-alike shell.  The
+    reasoning and the two measurements behind it are in the contract comment and
+    docs/sdk/services.md. */
+ static int compose_alias_api(void* c,uint64_t customId,const char* builtinTypeId){
+  auto& p=*static_cast<Loaded*>(c);
+  auto& r=*p.owner;
+  if(!builtinTypeId||!*builtinTypeId)return TC_COMPONENT_COMPOSE_ERR_ARGUMENT;
+  if(r.builtinTypeById.find(builtinTypeId)==r.builtinTypeById.end())
+   return TC_COMPONENT_COMPOSE_ERR_UNKNOWN;
+  r.logger("["+p.id+"] Component compose: alias of '"+std::string(builtinTypeId)+
+         "' refused (this build dispatches by kind byte; use clone_metadata + a composite node)");
+  (void)customId;
+  return TC_COMPONENT_COMPOSE_ERR_UNSUPPORTED;
+ }
+ void dropComposeSessions(Loaded& p){
+  for(auto it=composeSessions.begin();it!=composeSessions.end();)
+   if(it->second.owner==&p)it=composeSessions.erase(it);else ++it;
+ }
+ int queryComponentComposeService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+  if(builtinTypes.empty()||builtinTypeByKind.empty())return TC_SERVICE_ERR_UNAVAILABLE;
+  if(version==TC_COMPONENT_COMPOSE_API_VERSION_1){
+   if(outSize<sizeof(TCComponentComposeApiV1))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentComposeApiV1*>(out)=TCComponentComposeApiV1{
+       sizeof(TCComponentComposeApiV1),TC_COMPONENT_COMPOSE_API_VERSION_1,&p,
+       &compose_count_api,&compose_get_api,&compose_find_api,&compose_find_by_type_id_api,
+       &compose_pin_api};
+   return TC_SERVICE_OK;
+  }
+  if(version!=TC_COMPONENT_COMPOSE_API_VERSION_2)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCComponentComposeApiV2))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCComponentComposeApiV2*>(out)=TCComponentComposeApiV2{
+      sizeof(TCComponentComposeApiV2),TC_COMPONENT_COMPOSE_API_VERSION_2,&p,
+      &compose_count_api,&compose_get_api,&compose_find_api,&compose_find_by_type_id_api,
+      &compose_pin_api,&compose_begin_api,&compose_node_api,&compose_connect_api,
+      &compose_commit_api,&compose_abort_api,&compose_status_api,
+      &compose_clone_metadata_api,&compose_alias_api,&compose_pin_lane_api};
+  return TC_SERVICE_OK;
+ }
+/* tc.component.editor V1: the declarative property rows (plan §14).  The
+   context is the calling plugin's own Loaded record, because a declaration has
+   to be checked against that plugin's types and it has to disappear with them. */
+static int component_editor_set_fields_api(void* c,uint64_t customId,
+                                           const TCComponentFieldV1* fields,uint32_t count){
+  if(!c)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);
+  auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId)return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(!p.accepting)return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(!customId)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),customId)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  if(!count){p.editorFields.erase(customId);p.editorTableFlags.erase(customId);return TC_COMPONENT_EDITOR_OK;}
+  if(!fields)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(count>component_editor::kMaxFields)return TC_COMPONENT_EDITOR_ERR_LIMIT;
+  /* The rows edit the instance's configuration, so the type has to have one.
+     It is the definition the Mod registered a moment ago in this same load. */
+  uint32_t configBytes=0;
+  {
+   std::lock_guard<std::mutex> lock(tc::logic::registryMutex);
+   const auto found=tc::logic::definitions.find(customId);
+   if(found==tc::logic::definitions.end())return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+   configBytes=static_cast<uint32_t>(found->second->defaultConfig.size());
+  }
+  if(!configBytes){
+   r.logger("Component editor: type "+hexValue(customId)+
+            " declared no configuration, so it has nothing to edit");
+   return TC_COMPONENT_EDITOR_ERR_FIELD;
+  }
+  std::vector<component_editor::Field> converted;
+  converted.reserve(count);
+  for(uint32_t index=0;index<count;++index){
+   if(fields[index].flags&~TC_COMPONENT_FIELD_V2_KNOWN_FLAGS){
+    r.logger("Component editor: a V1/V2 table used V3-only flags");
+    return TC_COMPONENT_EDITOR_ERR_FIELD;
+   }
+   component_editor::Field field=component_editor::fromDeclared(fields[index]);
+   for(const auto& earlier:converted)
+    if(earlier.id==field.id){
+     r.logger("Component editor: refused the rows of type "+hexValue(customId)+
+              ": two fields are called \""+field.id+"\"");
+     return TC_COMPONENT_EDITOR_ERR_FIELD;
+    }
+   converted.push_back(std::move(field));
+  }
+  /* Field rules and then the table rules: a row that shares a line has to have
+     something to share it with, and unknown flags are refused rather than
+     ignored (a typo would otherwise change the layout silently). */
+  {
+   std::string why;
+   if(!component_editor::validateTable(converted,configBytes,why)){
+    r.logger("Component editor: refused the rows of type "+hexValue(customId)+": "+why);
+    return TC_COMPONENT_EDITOR_ERR_FIELD;
+   }
+  }
+  p.editorFields[customId]=std::move(converted);
+  /* A V1/V2 table has no table-level flags, so a type re-declared this way must
+     not keep a staged mode an earlier V4 declaration left behind. */
+  p.editorTableFlags[customId]=0;
+  std::string summary;
+  for(const auto& field:p.editorFields[customId]){
+   if(!summary.empty())summary+=", ";
+   summary+=field.id+"("+component_editor::kindName(field)+")";
+  }
+  r.logger("Component editor: type "+hexValue(customId)+" edits "+summary);
+  return TC_COMPONENT_EDITOR_OK;
+ }
+static int component_editor_clear_fields_api(void* c,uint64_t customId){
+  if(!c)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);
+  if(!p.accepting)return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(!customId)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),customId)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  p.editorFields.erase(customId);
+  p.editorTableFlags.erase(customId);
+  return TC_COMPONENT_EDITOR_OK;
+ }
+/* Shared by every V3/V4 table declaration: copy the Mod's fields, check them
+   against the type's own configuration, check the table flags, and keep both.
+   `knownFlags` is the flag set the caller's entry point is allowed to use and
+   `tag` names that entry point in the log, so a refused table says which API
+   version refused it. */
+static int componentEditorDeclareV2(Loaded& p,uint64_t customId,
+                                    const TCComponentFieldV2* fields,uint32_t count,
+                                    uint32_t tableFlags,uint32_t knownFlags,
+                                    const char* tag){
+  auto& r=*p.owner;
+  if(!fields)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(count>component_editor::kMaxFields)return TC_COMPONENT_EDITOR_ERR_LIMIT;
+  uint32_t configBytes=0;
+  {
+   std::lock_guard<std::mutex> lock(tc::logic::registryMutex);
+   const auto found=tc::logic::definitions.find(customId);
+   if(found==tc::logic::definitions.end())return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+   configBytes=static_cast<uint32_t>(found->second->defaultConfig.size());
+  }
+  if(!configBytes)return TC_COMPONENT_EDITOR_ERR_FIELD;
+  std::vector<component_editor::Field> converted;converted.reserve(count);
+  for(uint32_t index=0;index<count;++index){
+   const TCComponentFieldV2& declared=fields[index];
+   if(declared.size<sizeof(TCComponentFieldV2)||
+      declared.version!=TC_COMPONENT_FIELD_DEFINITION_VERSION_2||
+      declared.context_actions>TC_COMPONENT_EDITOR_MAX_CONTEXT_ACTIONS||
+      (declared.context_actions&&
+       (!declared.context_action_ids||!declared.context_action_labels)))
+    return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+   component_editor::Field field=component_editor::fromDeclared(declared);
+   for(const auto& earlier:converted)if(earlier.id==field.id){
+    r.logger(std::string("Component editor ")+tag+": type "+hexValue(customId)+
+             " repeats field \""+field.id+"\"");
+    return TC_COMPONENT_EDITOR_ERR_FIELD;
+   }
+   converted.push_back(std::move(field));
+  }
+  std::string why;
+  if(!component_editor::validateTable(converted,configBytes,why,knownFlags)){
+   r.logger(std::string("Component editor ")+tag+": refused the rows of type "+
+            hexValue(customId)+": "+why);
+   return TC_COMPONENT_EDITOR_ERR_FIELD;
+  }
+  if(!component_editor::validateTableFlags(tableFlags,converted,why)){
+   r.logger(std::string("Component editor ")+tag+": refused the table of type "+
+            hexValue(customId)+": "+why);
+   return TC_COMPONENT_EDITOR_ERR_FIELD;
+  }
+  p.editorFields[customId]=std::move(converted);
+  p.editorTableFlags[customId]=tableFlags;
+  std::string summary;
+  for(const auto& field:p.editorFields[customId]){
+   if(!summary.empty())summary+=", ";
+   summary+=field.id+"("+component_editor::kindName(field)+")";
+  }
+  r.logger(std::string("Component editor ")+tag+": type "+hexValue(customId)+
+           " edits "+summary+
+           ((tableFlags&TC_COMPONENT_EDITOR_TABLE_CONFIRM)?" table=confirm":""));
+  return TC_COMPONENT_EDITOR_OK;
+ }
+static int component_editor_set_fields_v2_api(void* c,uint64_t customId,
+                                              const TCComponentFieldV2* fields,
+                                              uint32_t count){
+  if(!c)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId||!p.accepting)
+   return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(!customId)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),customId)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  if(!count){p.editorFields.erase(customId);p.editorTableFlags.erase(customId);return TC_COMPONENT_EDITOR_OK;}
+  return componentEditorDeclareV2(p,customId,fields,count,0,
+                                  TC_COMPONENT_FIELD_V3_KNOWN_FLAGS,"V3");
+ }
+/* The same call as seen by a V4 caller: the table may use the V4 flags. */
+static int component_editor_set_fields_v2_v4_api(void* c,uint64_t customId,
+                                                 const TCComponentFieldV2* fields,
+                                                 uint32_t count){
+  if(!c)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId||!p.accepting)
+   return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(!customId)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),customId)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  if(!count){p.editorFields.erase(customId);p.editorTableFlags.erase(customId);return TC_COMPONENT_EDITOR_OK;}
+  return componentEditorDeclareV2(p,customId,fields,count,0,
+                                  TC_COMPONENT_FIELD_KNOWN_FLAGS,"V4");
+ }
+/* The V4 entry point: the same table plus its table-level flags.  The checks are
+   identical, which is why both go through one helper - the only difference is
+   which flag set the table is allowed to use and what the log calls it. */
+static int component_editor_set_fields_v3_api(void* c,uint64_t customId,
+                                              const TCComponentFieldV2* fields,
+                                              uint32_t count,uint32_t tableFlags){
+  if(!c)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId||!p.accepting)
+   return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(!customId)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),customId)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  if(!count){p.editorFields.erase(customId);p.editorTableFlags.erase(customId);return TC_COMPONENT_EDITOR_OK;}
+  return componentEditorDeclareV2(p,customId,fields,count,tableFlags,
+                                  TC_COMPONENT_FIELD_KNOWN_FLAGS,"V4");
+ }
+static int component_editor_begin_edit_api(void* c,const TCComponentInstanceHandle* handle){
+  if(!c||!handle)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId)return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),handle->custom_id)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  return tc::logic::storageBeginEdit(handle);
+ }
+static int component_editor_commit_edit_api(void* c,const TCComponentInstanceHandle* handle){
+  if(!c||!handle)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId)return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),handle->custom_id)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  return tc::logic::storageCommitEdit(handle);
+ }
+static int component_editor_abort_edit_api(void* c,const TCComponentInstanceHandle* handle){
+  if(!c||!handle)return TC_COMPONENT_EDITOR_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(c);auto& r=*p.owner;
+  if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId)return TC_COMPONENT_EDITOR_ERR_THREAD;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),handle->custom_id)==p.componentIds.end())
+   return TC_COMPONENT_EDITOR_ERR_OWNERSHIP;
+  return tc::logic::storageAbortEdit(handle);
+ }
+int queryComponentEditorService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
+  if(!out)return TC_SERVICE_ERR_ARGUMENT;
+  if(version==TC_COMPONENT_EDITOR_API_VERSION_4){
+   if(outSize<sizeof(TCComponentEditorApiV4))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentEditorApiV4*>(out)=TCComponentEditorApiV4{
+       sizeof(TCComponentEditorApiV4),TC_COMPONENT_EDITOR_API_VERSION_4,&p,
+       &component_editor_set_fields_api,&component_editor_clear_fields_api,
+       &component_editor_set_fields_v2_v4_api,&component_editor_begin_edit_api,
+       &component_editor_commit_edit_api,&component_editor_abort_edit_api,
+       &component_editor_set_fields_v3_api};
+   return TC_SERVICE_OK;
+  }
+  if(version==TC_COMPONENT_EDITOR_API_VERSION_3){
+   if(outSize<sizeof(TCComponentEditorApiV3))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentEditorApiV3*>(out)=TCComponentEditorApiV3{
+       sizeof(TCComponentEditorApiV3),TC_COMPONENT_EDITOR_API_VERSION_3,&p,
+       &component_editor_set_fields_api,&component_editor_clear_fields_api,
+       &component_editor_set_fields_v2_api,&component_editor_begin_edit_api,
+       &component_editor_commit_edit_api,&component_editor_abort_edit_api};
+   return TC_SERVICE_OK;
+  }
+  if(version==TC_COMPONENT_EDITOR_API_VERSION_2){
+   if(outSize<sizeof(TCComponentEditorApiV2))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentEditorApiV2*>(out)=TCComponentEditorApiV2{
+       sizeof(TCComponentEditorApiV2),TC_COMPONENT_EDITOR_API_VERSION_2,&p,
+       &component_editor_set_fields_api,&component_editor_clear_fields_api};
+   return TC_SERVICE_OK;
+  }
+  if(version!=TC_COMPONENT_EDITOR_API_VERSION_1)return TC_SERVICE_ERR_VERSION;
+  if(outSize<sizeof(TCComponentEditorApiV1))return TC_SERVICE_ERR_SIZE;
+  *static_cast<TCComponentEditorApiV1*>(out)=TCComponentEditorApiV1{
+      sizeof(TCComponentEditorApiV1),TC_COMPONENT_EDITOR_API_VERSION_1,&p,
+      &component_editor_set_fields_api,&component_editor_clear_fields_api};
+  return TC_SERVICE_OK;
+ }
 /* The three checks every geometry declaration shares: the caller has to be the
    game thread, inside its tc_mod_load, and the type has to be its own. */
 int componentFootprintAllowed(const Loaded& p,uint64_t customId){
@@ -2428,6 +3799,9 @@ int setComponentInstanceFootprint(Loaded& p,const TCGameHandle* component,
   if(!instanceId)return TC_COMPONENT_GEOMETRY_ERR_UNKNOWN;
   if(gameHandles.valid(component)!=1||frame!=engineFrame())return TC_COMPONENT_GEOMETRY_ERR_STALE;
   instanceFootprints[instanceId]=InstanceFootprint{&p,customId,halfWidth,halfHeight};
+  /* The instance's own rectangle changed (the type's declared footprint is the
+     starting point), so the type's lifecycle hears TC_LOGIC_RESIZE. */
+  tc::logic::updateInstanceFootprint(customId,instanceId,halfWidth,halfHeight);
   return TC_COMPONENT_GEOMETRY_OK;
  }
 int readComponentFootprint(Loaded&,const TCGameHandle* component,float* halfWidth,float* halfHeight){
@@ -2859,8 +4233,9 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
  IgButton igButtonOriginal=nullptr;
  IgPushStyleColor igPushStyleColor=nullptr;IgPopStyleColor igPopStyleColor=nullptr;
  IgItemRect igGetItemRectMin=nullptr;IgItemRect igGetItemRectMax=nullptr;
- bool foundryTrace=false;
- std::set<uint64_t> hiddenFoundryIndices;int hiddenFoundryFrame=-1;int hiddenFoundryLoggedCount=-1;
+  bool foundryTrace=false;
+  std::set<uint64_t> hiddenFoundryIndices;int hiddenFoundryFrame=-1;int hiddenFoundryLoggedCount=-1;
+  bool keptFoundryButtonsLogged=false;
  uintptr_t gameRva(uintptr_t rva) const {
   const uintptr_t base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
   return base?base+rva:0;
@@ -2887,8 +4262,30 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
  /* True when the panel is describing only Mod-owned types that asked for the button
     to be gone.  The selection set is the game's own, and membership is asked through
     the game's own contains(), the same way tc_board_model.h does it. */
- bool foundryButtonHidden(){
-  if(hiddenFoundryIndices.empty())return false;
+  /* A Mod drops the foundry button because its type has no *hand-drawn*
+     schematic.  Every type the loader registers does have a generated inner
+     circuit though, and the loader writes that same definition into the
+     foundry's own entry (provideFoundrySchematicBytes), so the button opens a
+     real - if conservative - drawing of the part's pins and wiring.  A player
+     who wants to look at it can keep the button with this switch; the hide
+     requests become a no-op for the rest of the session. */
+  static bool keepModFoundryButtons(){
+   static const bool keep=[] {
+    const char* value=std::getenv("TC_FOUNDRY_SHOW_MOD_TYPES");
+    return value&&*value&&value[0]!='0';
+   }();
+   return keep;
+  }
+  bool foundryButtonHidden(){
+   if(keepModFoundryButtons()){
+    if(!hiddenFoundryIndices.empty()&&!keptFoundryButtonsLogged){
+     keptFoundryButtonsLogged=true;
+     logger("Component render: keeping the foundry edit button for Mod components "
+            "(TC_FOUNDRY_SHOW_MOD_TYPES)");
+    }
+    return false;
+   }
+   if(hiddenFoundryIndices.empty())return false;
   if(!selectionContains||!selectedComponentSet||!selectionLen)return false;
   const uint64_t selected=selectionLen(selectedComponentSet);
   if(!selected)return false;
@@ -2964,6 +4361,296 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
   if(const char* trace=std::getenv("TC_FOUNDRY_TRACE"))foundryTrace=*trace&&trace[0]!='0';
   resolveSelectionModel();
   logger("Component render: foundry button control armed");
+ }
+ /* ---- the picture the bottom panel draws (2026-09-28) ---------------------
+
+    build_component_description_panel paints the selected component's picture
+    twice with the engine's own igImage entry point (call sites 0x14039c916 and
+    0x14039d336; the two are the component's snapshot and a second, smaller one
+    under it - both are preceded by create_texture_unsafe / texture size / texture
+    id in that function).  A Mod-owned type has no schematic behind it, which is
+    the same fact that lets a Mod drop the foundry button (V4 above), so this hook
+    hides those two pictures for exactly the same selection: every selected
+    component belongs to a Mod that asked for the button to be gone.
+
+    The picture is still *submitted*, with a fully transparent tint (and border),
+    so the panel keeps its layout and nothing else moves - the same technique the
+    foundry button uses.  The palette card and the placement ghost are different
+    surfaces (V5 pixels, V6 callback) and are not touched. */
+ /* The return addresses of every igImage call that paints the selected component
+    in the bottom panel.  Measured on the pinned build (docs/research/…): the
+    custom-component preview plus the nine pictures the description panel and its
+    markup renderer draw for it - the schematic snapshot, the pin pictograms
+    ("— R") and the rest of that panel's inline art.
+
+       build_custom_component_preview                    @0x14038ed85
+       render_cached_elements…component95description     @0x14035b26e, @0x1403723ce
+       build_component_description_panel                 @0x14039c916, @0x14039d336,
+                                                        @0x14039e0d6, @0x14039eb73,
+                                                        @0x14039f5b1, @0x1403a4c25,
+                                                        @0x1403a5632, @0x1403aa032
+
+    All of them live in the executable (the module gameRva() reads) and all of
+    them are hidden only while the *whole* selection is Mod-owned types whose Mod
+    asked for the foundry button to be gone - the same "this type has no schematic
+    behind it" decision, which is what the preview picture and the pictograms
+    illustrate.  A stock component's panel is untouched. */
+ static constexpr uintptr_t kDescriptionImageCallRvas[]={
+     0x38ed8a,   /* build_custom_component_preview */
+     0x35b273,   /* render_cached_elements…component95description (markup image) */
+     0x3723d3,   /* ... the second markup image */
+     0x39c91b,   /* build_component_description_panel … */
+     0x39d33b,
+     0x39e0db,
+     0x39eb78,
+     0x39f5b6,
+     0x3a4c2a,
+     0x3a5637,
+     0x3aa037};
+ /* cimgui's igImage takes the two ImVec4 colours by value; under this ABI a
+    16-byte aggregate travels as a pointer to the caller's temporary (the
+    disassembly shows exactly that: the 5th and 6th slots hold a pointer to a
+    16-byte value, and the values themselves sit in the caller's frame).  Declared
+    the same way as the loader's own ImVec4 entry points (igPushStyleColor). */
+ /* (texture, image_size, uv0, uv1, tint_col, border_col) - the last two are the
+    16-byte ImVec4s described above. */
+ using IgImage=void(*)(uint64_t,RenderVec2,RenderVec2,RenderVec2,RenderVec4,RenderVec4);
+ IgImage igImageOriginal=nullptr;
+ int hiddenDescriptionPictureLoggedCount=0;
+ static void detourIgImage(uint64_t texture,RenderVec2 size,RenderVec2 uv_minimum,
+                           RenderVec2 uv_maximum,RenderVec4 tint,RenderVec4 border){
+  auto* self=activeInstance;
+  if(!self||!self->igImageOriginal)return;
+  const uintptr_t caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  bool known=false;
+  for(uintptr_t rva:kDescriptionImageCallRvas)
+   if(caller==self->gameRva(rva)){known=true;break;}
+  if(known){
+   const int64_t frame=self->engineFrame();
+   if(self->hiddenFoundryFrame!=frame){self->hiddenFoundryFrame=frame;
+                                       self->refreshHiddenFoundryIndices();}
+   if(self->foundryButtonHidden()){
+    self->igImageOriginal(texture,size,uv_minimum,uv_maximum,RenderVec4{0.f,0.f,0.f,0.f},
+                          RenderVec4{0.f,0.f,0.f,0.f});
+    if(self->hiddenDescriptionPictureLoggedCount!=1){
+     self->hiddenDescriptionPictureLoggedCount=1;
+     self->logger("Component render: the panel preview picture is hidden for the "
+                  "selected Mod component");
+    }
+    return;
+   }
+  }
+  self->igImageOriginal(texture,size,uv_minimum,uv_maximum,tint,border);
+ }
+ void armDescriptionPictureControl(){
+  if(!engine)return;
+  auto image=GetProcAddress(engine,"igImage");
+  if(!image){logger("Component render: the panel's preview picture entry is unavailable");return;}
+  if(MH_CreateHook(reinterpret_cast<void*>(image),
+                   reinterpret_cast<void*>(&NativeRuntime::detourIgImage),
+                   reinterpret_cast<void**>(&igImageOriginal))!=MH_OK)return;
+  if(MH_EnableHook(reinterpret_cast<void*>(image))!=MH_OK){
+   MH_RemoveHook(reinterpret_cast<void*>(image));igImageOriginal=nullptr;return;
+  }
+  ownedHooks.insert(reinterpret_cast<void*>(image));
+  loaderOwned[reinterpret_cast<void*>(image)]="component render panel preview control";
+  logger("Component render: panel preview control armed");
+ }
+ /* ---- the pin pictograms the description panel draws (2026-09-28) ----------
+
+    The player's second report: "中间这里还有引脚标识没删掉" - with the picture gone,
+    the panel still showed the component's pin pictograms ("- R").  They are
+    *markup box elements*: the description panel's cached markup calls
+    render_box__presenterZmarkupZmarkup_u924 for each of them, six call sites in
+    the two markup-cache functions of that panel (0x14035ac3b, 0x14035b13f,
+    0x1403632d1, 0x140371da3, 0x14037229f, 0x1403756f1).
+
+    The same gate as the picture and the foundry button decides: only while every
+    selected component belongs to a Mod that asked for the button to be gone is
+    the call skipped, so a stock component's panel keeps its pin pictograms.  The
+    description *text* next to them is untouched. */
+ static constexpr uintptr_t kDescriptionBoxCallRvas[]={
+     0x35ac40, 0x35b144,   /* render_cached_elements…component95description_u1929 */
+     0x3632d6,             /* render_bbcode_token…component95description_u1808 */
+     0x371da8, 0x3722a4,   /* render_cached_elements…component95description_u3856 */
+     0x3756f6};            /* render_bbcode_token…component95description_u3735 */
+ using RenderBoxFn=void(*)(void*,void*,void*,void*,void*,void*,void*,void*);
+ RenderBoxFn renderBoxOriginal=nullptr;
+ int hiddenBoxLoggedCount=0;
+ static void detourRenderBox(void* a,void* b,void* c,void* d,
+                             void* e,void* f,void* g,void* h){
+  auto* self=activeInstance;
+  if(!self||!self->renderBoxOriginal)return;
+  const uintptr_t caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  for(uintptr_t rva:kDescriptionBoxCallRvas)
+   if(caller==self->gameRva(rva)){
+    const int64_t frame=self->engineFrame();
+    if(self->hiddenFoundryFrame!=frame){self->hiddenFoundryFrame=frame;
+                                        self->refreshHiddenFoundryIndices();}
+    if(self->foundryButtonHidden()){
+     if(self->hiddenBoxLoggedCount!=1){
+      self->hiddenBoxLoggedCount=1;
+      self->logger("Component render: the panel pin pictograms are hidden for the "
+                   "selected Mod component");
+     }
+     return;
+    }
+    break;
+   }
+  self->renderBoxOriginal(a,b,c,d,e,f,g,h);
+ }
+ void armDescriptionBoxControl(){
+  if(!symbols)return;
+  auto found=symbols->values.find("render_box__presenterZmarkupZmarkup_u924");
+  if(found==symbols->values.end()||!found->second){
+   logger("Component render: the panel's pin pictograms were not found");return;}
+  if(MH_CreateHook(found->second,reinterpret_cast<void*>(&NativeRuntime::detourRenderBox),
+                   reinterpret_cast<void**>(&renderBoxOriginal))!=MH_OK)return;
+  if(MH_EnableHook(found->second)!=MH_OK){
+   MH_RemoveHook(found->second);renderBoxOriginal=nullptr;return;}
+  ownedHooks.insert(found->second);
+  loaderOwned[found->second]="component render panel pin control";
+  logger("Component render: panel pin control armed");
+ }
+ /* ---- who draws what in the panel (temporary diagnostic, 2026-09-28) -------
+
+    The preview picture and the markup boxes are hidden, but the player still
+    sees the component's pin pictogram ("- R") in the panel.  With
+    TC_PANEL_TRACE=1 this logs one line per *distinct draw call site* the game
+    uses while the panel describes a Mod component - the caller's RVA next to the
+    entry point it called - so the pictogram can be traced to an address instead
+    of guessed at. */
+ bool panelTrace=false;
+ struct PanelTraceState {
+  std::set<std::string> seen;
+  int lines=0;
+ };
+ PanelTraceState panelTraceState;
+ /* True while the drawer describes one of our components.  The trace only keeps
+    what is drawn in that state: the pin pictogram the player sees sits in the
+    panel's own preview block, which is submitted *after* our rows in the same
+    frame, so a per-frame flag from the panel hook covers it. */
+ bool panelShowsModComponent=false;
+ void notePanelDraw(const char* api,const uintptr_t caller){
+  if(!panelTrace||!panelShowsModComponent||panelTraceState.lines>=60)return;
+  /* The caller can be in the executable or in tc_game_engine.dll - the first run
+     of this trace subtracted the *executable's* base and produced nonsense for a
+     caller in the engine, which is how it was found that the pin pictogram is not
+     drawn by the game's own panel code.  So: ask Windows which module owns the
+     address, and log the RVA inside that module plus the module's name. */
+  MEMORY_BASIC_INFORMATION info{};
+  uintptr_t base=0;
+  if(VirtualQuery(reinterpret_cast<const void*>(caller),&info,sizeof(info))==sizeof(info))
+   base=reinterpret_cast<uintptr_t>(info.AllocationBase);
+  wchar_t path[MAX_PATH]={};
+  if(base)GetModuleFileNameW(reinterpret_cast<HMODULE>(base),path,MAX_PATH);
+  std::string module="?";
+  for(const wchar_t* p=path;*p;++p)module.push_back(*p<128?static_cast<char>(*p):'?');
+  const size_t cut=module.find_last_of("\\/");
+  if(cut!=std::string::npos)module=module.substr(cut+1);
+  char text[320]={};
+  std::snprintf(text,sizeof(text),"%s+0x%llx/%s",
+                module.c_str(),
+                static_cast<unsigned long long>(base?caller-base:caller),api);
+  if(!panelTraceState.seen.insert(text).second)return;
+  ++panelTraceState.lines;
+  logger(std::string("Component render panel trace: ")+text);
+ }
+ using TraceTextFn=void(*)(void*,RenderVec2,uint32_t,const char*,const char*);
+ using TraceLineFn=void(*)(void*,RenderVec2,RenderVec2,uint32_t,float,int,float);
+ TraceTextFn panelTraceTextOriginal=nullptr;
+ TraceLineFn panelTraceLineOriginal=nullptr;
+ static void detourPanelTraceText(void* list,RenderVec2 position,uint32_t colour,
+                                  const char* begin,const char* end){
+  auto* self=activeInstance;
+  if(!self||!self->panelTraceTextOriginal)return;
+  self->notePanelDraw("AddText",reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+  self->panelTraceTextOriginal(list,position,colour,begin,end);
+ }
+ static void detourPanelTraceLine(void* list,RenderVec2 from,RenderVec2 to,
+                                  uint32_t colour,float thickness,int flags,float rounding){
+  auto* self=activeInstance;
+  if(!self||!self->panelTraceLineOriginal)return;
+  self->notePanelDraw("AddLine",reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+  self->panelTraceLineOriginal(list,from,to,colour,thickness,flags,rounding);
+ }
+ void armPanelTrace(){
+  if(!engine)return;
+  if(const char* trace=std::getenv("TC_PANEL_TRACE"))panelTrace=*trace&&trace[0]!='0';
+  if(!panelTrace)return;
+  auto text=GetProcAddress(engine,"ImDrawList_AddText_Vec2");
+  if(!text)text=GetProcAddress(engine,"ImDrawList_AddText");
+  if(text&&MH_CreateHook(reinterpret_cast<void*>(text),
+                         reinterpret_cast<void*>(&NativeRuntime::detourPanelTraceText),
+                         reinterpret_cast<void**>(&panelTraceTextOriginal))==MH_OK&&
+     MH_EnableHook(reinterpret_cast<void*>(text))==MH_OK){
+   ownedHooks.insert(reinterpret_cast<void*>(text));
+   loaderOwned[reinterpret_cast<void*>(text)]="component render panel trace (text)";
+  }else panelTraceTextOriginal=nullptr;
+  auto line=GetProcAddress(engine,"ImDrawList_AddLine");
+  if(line&&MH_CreateHook(reinterpret_cast<void*>(line),
+                         reinterpret_cast<void*>(&NativeRuntime::detourPanelTraceLine),
+                         reinterpret_cast<void**>(&panelTraceLineOriginal))==MH_OK&&
+     MH_EnableHook(reinterpret_cast<void*>(line))==MH_OK){
+   ownedHooks.insert(reinterpret_cast<void*>(line));
+   loaderOwned[reinterpret_cast<void*>(line)]="component render panel trace (line)";
+  }else panelTraceLineOriginal=nullptr;
+  logger("Component render: panel draw trace armed");
+ }
+ /* ---- the preview block the description panel draws (2026-09-28) -----------
+
+    Third report on the same panel: "清掉引脚图示" - with the picture transparent
+    and the description text gone, the player still saw the component's pin
+    pictogram ("- R") beside the value rows.  The pictogram is not a markup box
+    and not one of the igImage call sites: it is artwork of the *preview block*
+    the panel builds through
+    build_custom_component_preview__presenterZboard95uiZbottom95panelZcommon_u486
+    (executable RVA 0x38e990).  That function paints the component's snapshot
+    picture, its pin stubs (ImDrawList_AddRectFilled @0x38efac) and the pin
+    labels (igText @0x38f0ea) - all of it art for a component that has no
+    schematic behind it.
+
+    The panel calls it exactly once, from 0x39dc09, so the detour only has to
+    answer for that call site: while every selected component belongs to a Mod
+    that asked for the foundry button to be gone, the call is dropped and the
+    panel keeps only its own header and the Mod's rows.  A stock component's
+    panel is untouched. */
+ using ComponentPreviewFn=void(*)(void*);
+ ComponentPreviewFn componentPreviewOriginal=nullptr;
+ int hiddenPreviewLoggedCount=0;
+ static void detourComponentPreview(void* component){
+  auto* self=activeInstance;
+  if(!self||!self->componentPreviewOriginal)return;
+  const uintptr_t caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  if(caller==self->gameRva(0x39dc0e)){
+   const int64_t frame=self->engineFrame();
+   if(self->hiddenFoundryFrame!=frame){self->hiddenFoundryFrame=frame;
+                                       self->refreshHiddenFoundryIndices();}
+   if(self->foundryButtonHidden()){
+    if(self->hiddenPreviewLoggedCount!=1){
+     self->hiddenPreviewLoggedCount=1;
+     self->logger("Component render: the panel preview block (pin pictogram) is "
+                  "hidden for the selected Mod component");
+    }
+    return;
+   }
+  }
+  self->componentPreviewOriginal(component);
+ }
+ void armComponentPreviewControl(){
+  if(!symbols)return;
+  auto found=symbols->values.find(
+      "build_custom_component_preview__presenterZboard95uiZbottom95panelZcommon_u486");
+  if(found==symbols->values.end()||!found->second){
+   logger("Component render: the panel preview block is unavailable");return;}
+  if(MH_CreateHook(found->second,
+                   reinterpret_cast<void*>(&NativeRuntime::detourComponentPreview),
+                   reinterpret_cast<void**>(&componentPreviewOriginal))!=MH_OK)return;
+  if(MH_EnableHook(found->second)!=MH_OK){
+   MH_RemoveHook(found->second);componentPreviewOriginal=nullptr;return;}
+  ownedHooks.insert(found->second);
+  loaderOwned[found->second]="component render panel preview block control";
+  logger("Component render: panel preview block control armed");
  }
  void armSelectionHintControl(){
   if(!symbols)return;
@@ -3077,9 +4764,53 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
   loaderOwned[found->second]="component panel slot host";
   logger("Component panel: the game's component drawer is hooked for Mod editor rows");
  }
+ static void detourBuildComponentMenu(void* model,void* context,void* a,void* b,
+                                      uint64_t scaleBits){
+  auto* self=activeInstance;
+  if(!self||!self->buildComponentMenuOriginal)return;
+  if(context&&self->componentMenuGeneration&&self->reloadComponentMenu&&
+     (self->componentMenuAppliedContext!=context||
+      self->componentMenuAppliedGeneration!=self->componentMenuGeneration)){
+   /* `true` also recomputes the component budget after replacing the tree.
+      This is the game's normal full-refresh path and is required for a newly
+      added custom leaf to be enabled rather than merely present. */
+   self->reloadComponentMenu(model,context,1);
+   self->componentMenuAppliedContext=context;
+   self->componentMenuAppliedGeneration=self->componentMenuGeneration;
+   self->logger("Component runtime: refreshed the visible component column at generation "+
+                std::to_string(self->componentMenuGeneration));
+  }
+  self->buildComponentMenuOriginal(model,context,a,b,scaleBits);
+ }
+ void armComponentMenuRefresh(){
+  if(!symbols)return;
+  auto build=symbols->values.find("build__presenterZboard95uiZcomponent95menu_u6");
+  auto reload=symbols->values.find("reload_component_menu__presenterZutilities_u14192");
+  if(build==symbols->values.end()||!build->second||reload==symbols->values.end()||!reload->second){
+   logger("Component runtime: visible component-column refresh is unavailable");
+   return;
+  }
+  reloadComponentMenu=reinterpret_cast<ReloadComponentMenu>(reload->second);
+  if(MH_CreateHook(build->second,reinterpret_cast<void*>(&NativeRuntime::detourBuildComponentMenu),
+                   reinterpret_cast<void**>(&buildComponentMenuOriginal))!=MH_OK||
+     MH_EnableHook(build->second)!=MH_OK){
+   MH_RemoveHook(build->second);buildComponentMenuOriginal=nullptr;reloadComponentMenu=nullptr;
+   logger("Component runtime: component-column refresh hook failed");
+   return;
+  }
+  buildComponentMenuTarget=build->second;ownedHooks.insert(build->second);
+  loaderOwned[build->second]="runtime component-column refresh";
+  logger("Component runtime: visible component-column refresh armed");
+ }
  bool hasComponentPanelSlots(){
   for(auto& p:loaded){if(!p->active)continue;
    for(auto& slot:p->slots)if(slot.kind==TC_UI_SLOT_BOARD_COMPONENT_PANEL&&!slot.failed)return true;}
+  return false;
+ }
+ /* True once any active Mod declared editable rows, so the drawer hook has a
+    reason to look for the selected component at all. */
+ bool hasComponentEditorRows(){
+  for(auto& p:loaded){if(!p||!p->active)continue;if(!p->editorFields.empty())return true;}
   return false;
  }
  /* ---- V5: the picture a Mod's type is shown with --------------------------
@@ -3354,25 +5085,78 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
  /* Called from inside the drawer, with that window's cursor sitting where the
     game's own rows ended: the slots draw ordinary widgets from there. */
  void drawComponentPanelSlots(){
-  if(!hasComponentPanelSlots())return;
   if(!gameThreadId||GetCurrentThreadId()!=gameThreadId)return;
+  const bool haveSlots=hasComponentPanelSlots();
+  /* The host's declarative editor rows are drawn for a type whose Mod declared
+     them, with or without a panel slot: a Mod that only ships a field table
+     gets an editor. */
+  if(!haveSlots&&!hasComponentEditorRows())return;
   uint64_t instance=0,customId=0;
   const bool shown=shownComponent(&instance,&customId);
-  /* Bounded diagnostic: the first few times the game draws the drawer, say
-     whether it was showing one of our components - the first thing to check
-     when a Mod's rows do not appear. */
+  /* The draw trace (TC_PANEL_TRACE=1) only keeps what is drawn while the drawer
+     describes one of our components. */
+  panelShowsModComponent=shown;
+  /* Bounded diagnostic: what the drawer is describing, logged when that changes
+     (and the first few times, so an empty board still says something).  This is
+     the first thing to check when a Mod's rows do not appear: no line for the
+     selected type means the drawer never showed it, and a line with the type but
+     no rows means the host decided not to draw them. */
   static int traced=0;
-  if(traced<3){
+  static uint64_t lastShown=~uint64_t(0);
+  /* `shown` is a bool and `lastShown` an id, so comparing them directly was
+     always true: the line below logged every frame (measured: 453 lines in one
+     test run, one file write per frame).  Compare the id. */
+  const uint64_t shownId=shown?customId:0;
+  if(traced<3||shownId!=lastShown){
    ++traced;
+   lastShown=shownId;
    logger(std::string("Component panel: the drawer drew, selected=")+
           std::to_string(selectedComponentSet&&selectionLen?selectionLen(selectedComponentSet):0)+
           " showing "+
-          (shown?("custom 0x"+hexValue(customId)+" instance 0x"+hexValue(instance)):
+          (shown?("custom "+hexValue(customId)+" instance "+hexValue(instance)):
                  std::string("no Mod component")));
   }
   if(!shown)return;
+  /* The game's own fold switch is the last item it submitted in the title row,
+     which is exactly where this hook runs.  Its rectangle is remembered so the
+     row trace can publish it and a playtest can click it like a player would -
+     the loader never guesses where the game put its own button. */
+  {
+   const EditorApi& editor=editorApi();
+   if(editor.itemRectMin&&editor.itemRectMax){
+    EditorApi::Vec2 low{},high{};
+    editor.itemRectMin(&low);editor.itemRectMax(&high);
+    panelToggleMin[0]=low.x;panelToggleMin[1]=low.y;
+    panelToggleMax[0]=high.x;panelToggleMax[1]=high.y;
+   }
+   /* Published here, not from the row window: this runs in *both* drawer states,
+      so a reader can find the unfold switch while the drawer is folded (its
+      position moves with the fold, and clicking the remembered one misses).
+      Throttled like the row trace. */
+   if(editorTraceEnabled()){
+    const DWORD now=GetTickCount64();
+    if(now-lastEditorPanelTrace>900){
+     lastEditorPanelTrace=now;
+     EditorApi::Vec2 pos{},size{};
+     if(editor.windowPos)editor.windowPos(&pos);
+     if(editor.windowSize)editor.windowSize(&size);
+     logger("Component panel: drawer geometry pos="+std::to_string((int)pos.x)+","+
+            std::to_string((int)pos.y)+" size="+std::to_string((int)size.x)+","+
+            std::to_string((int)size.y)+" toggle="+
+            std::to_string((int)panelToggleMin[0])+","+std::to_string((int)panelToggleMin[1])+
+            ","+std::to_string((int)panelToggleMax[0])+","+
+            std::to_string((int)panelToggleMax[1]));
+    }
+   }
+  }
   const SlotApi& api=slotApi();
   if(!api.available())return;
+  const float width=api.getWindowWidth?api.getWindowWidth():0.f;
+  const float height=api.getWindowHeight?api.getWindowHeight():0.f;
+  if(!haveSlots){
+   drawComponentEditorRows(instance,customId,width,height);
+   return;
+  }
   for(auto& p:loaded){
    if(!p->active)continue;
    if(std::find(p->componentIds.begin(),p->componentIds.end(),customId)==p->componentIds.end())continue;
@@ -3380,8 +5164,6 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
     if(slot.failed||slot.kind!=TC_UI_SLOT_BOARD_COMPONENT_PANEL)continue;
     api.pushId(p->id.c_str());
     api.pushId(slot.id.c_str());
-    const float width=api.getWindowWidth?api.getWindowWidth():0.f;
-    const float height=api.getWindowHeight?api.getWindowHeight():0.f;
     TCFrame tick{sizeof(TCFrame),api.getFrameCount?api.getFrameCount():0,
                  api.getTime?api.getTime():0.0};
     /* This is the one slot kind whose callback carries the instance the drawer
@@ -3404,6 +5186,1415 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
     api.popId();
    }
   }
+  /* After the Mod's own panel rows, so a custom editor keeps the top of the
+     panel and the declarative rows sit with the game's own fields. */
+  drawComponentEditorRows(instance,customId,width,height);
+ }
+ /* ---- tc.component.editor V1: host-drawn property rows ------------------
+
+    Plan §14 asks for a declarative property editor: a type declares its fields
+    once, the host edits them.  The reason the host owns the rows instead of
+    every Mod is measured, not stylistic - drawing widgets straight into the
+    game's own drawer leaves them visible but dead (`IsWindowHovered` is false
+    for the drawer while the pointer sits on a row drawn inside it, see
+    docs/sdk/ui.md), so today each Mod repeats the same "window layered over the
+    panel" recipe (examples/float-ops/components_ui.cpp).  The loader repeats it
+    once, for every Mod, and commits each edit through the same configuration
+    path tc.component.storage writes use - one committed field is one undo step
+    and the type's on_config_changed fires.
+
+    Layout is the working Mod's, unchanged: the row window is pinned to the
+    drawer's content origin (the cursor's screen position minus its window-local
+    one) at the fractions of the panel the game's own fields occupy.  The window
+    is emitted after the drawer, so it stays in front without taking focus - and
+    it must not call setNextWindowFocus, which would stop the game's top menu
+    from receiving input while such a component stays selected. */
+ struct EditorApi {
+  struct Vec2{float x,y;};
+  void (*cursorScreen)(Vec2*)=nullptr;
+  float (*cursorPosX)()=nullptr;
+  float (*cursorPosY)()=nullptr;
+  void (*setNextWindowPos)(Vec2,int,Vec2)=nullptr;
+  /* Bringing the row window to the front.  Without it the order is whatever
+     ImGui's window list says, and the game's own bottom panel is re-created when
+     a level is entered - measured 2026-09-28 from the player's report "re-enter
+     the sandbox and the input boxes disappear": the re-created panel was appended
+     after the row window and painted over it (the rows are NoBackground), so the
+     widgets were still submitted and traced but invisible. */
+  void (*setNextWindowFocus)()=nullptr;
+  /* The row window's own text scale: the game's UI font is menu-sized, and a
+     property row wants something closer to a form (see kEditorRowFontScale). */
+  void (*setWindowFontScale)(float)=nullptr;
+  void (*sizeConstraints)(Vec2,Vec2,void*,void*)=nullptr;
+  bool (*begin)(const char*,bool*,int)=nullptr;
+  void (*end)()=nullptr;
+  void (*pushId)(const char*)=nullptr;
+  void (*popId)()=nullptr;
+  void (*text)(const char*,const char*)=nullptr;
+  void (*textDisabled)(const char*,const char*)=nullptr;
+  void (*separator)()=nullptr;
+  void (*sameLine)(float,float)=nullptr;
+  void (*setNextItemWidth)(float)=nullptr;
+  bool (*checkbox)(const char*,bool*)=nullptr;
+  bool (*radioButton)(const char*,bool)=nullptr;
+  bool (*inputInt)(const char*,int*,int,int,int)=nullptr;
+  bool (*inputFloat)(const char*,float*,float,float,const char*,int)=nullptr;
+  bool (*inputText)(const char*,char*,unsigned long long,int,void*,void*)=nullptr;
+  bool (*button)(const char*,Vec2)=nullptr;
+  bool (*beginCombo)(const char*,const char*,int)=nullptr;
+  void (*endCombo)()=nullptr;
+  bool (*selectable)(const char*,bool,int,Vec2)=nullptr;
+  bool (*colorEdit4)(const char*,float*,int)=nullptr;
+  bool (*beginPopupContextItem)(const char*,int)=nullptr;
+  void (*endPopup)()=nullptr;
+  bool (*invisibleButton)(const char*,Vec2,int)=nullptr;
+  /* Marks the *next* submitted item as one a later item may overlap.  A custom
+     row's canvas is submitted before its resize grip, so without this the canvas
+     takes the ActiveId and the grip (a small item on top of it) can never be
+     clicked - measured on this build: the press reached the canvas every time. */
+  void (*setNextItemAllowOverlap)()=nullptr;
+  bool (*itemClicked)(int)=nullptr;
+  bool (*itemDeactivated)()=nullptr;
+  bool (*mouseDoubleClicked)(int)=nullptr;
+  bool (*mouseDragging)(int,float)=nullptr;
+  void (*mouseDragDelta)(Vec2*,int,float)=nullptr;
+  void (*mousePos)(Vec2*)=nullptr;
+  void (*setCursorScreen)(Vec2)=nullptr;
+  void* (*windowDrawList)()=nullptr;
+  bool (*deactivatedAfterEdit)()=nullptr;
+  bool (*itemHovered)(int)=nullptr;
+  bool (*itemActive)()=nullptr;
+  bool (*itemFocused)()=nullptr;
+  void (*itemRectMin)(Vec2*)=nullptr;
+  void (*itemRectMax)(Vec2*)=nullptr;
+  /* Text metrics: the label columns and the row's own text height are measured
+     with these two rather than read back from the last item's rectangle (see
+     drawComponentEditorRows). */
+  /* cimgui's `pOut` convention, the same shape as igGetItemRectMin above (the
+     executable's own call site passes the result buffer in the first slot). */
+  void (*calcTextSize)(Vec2*,const char*,const char*,bool,float)=nullptr;
+  float (*textLineHeight)()=nullptr;
+  void* (*getIo)()=nullptr;
+  void (*windowPos)(Vec2*)=nullptr;
+  void (*windowSize)(Vec2*)=nullptr;
+  float (*scrollMaxY)()=nullptr;
+  void (*beginTooltip)()=nullptr;
+  void (*endTooltip)()=nullptr;
+  bool available() const {
+   return cursorScreen&&cursorPosX&&cursorPosY&&setNextWindowPos&&begin&&end&&pushId&&popId&&
+          text&&textDisabled&&sameLine&&setNextItemWidth&&checkbox&&inputInt&&inputFloat&&
+          inputText&&button&&separator&&radioButton&&deactivatedAfterEdit&&itemRectMin&&
+          itemRectMax&&itemActive&&
+          itemFocused&&getIo&&windowPos&&windowSize&&scrollMaxY;
+  }
+ };
+ static EditorApi& editorApi(){
+  static EditorApi value;static bool bound=false;
+  if(!bound){bound=true;
+   HMODULE module=GetModuleHandleW(L"tc_game_engine.dll");if(!module)module=GetModuleHandleW(nullptr);
+   value.cursorScreen=(decltype(value.cursorScreen))proc(module,"igGetCursorScreenPos");
+   value.cursorPosX=(decltype(value.cursorPosX))proc(module,"igGetCursorPosX");
+   value.cursorPosY=(decltype(value.cursorPosY))proc(module,"igGetCursorPosY");
+   value.setNextWindowPos=(decltype(value.setNextWindowPos))proc(module,"igSetNextWindowPos");
+   value.setNextWindowFocus=(decltype(value.setNextWindowFocus))proc(module,"igSetNextWindowFocus");
+   value.setWindowFontScale=(decltype(value.setWindowFontScale))proc(module,"igSetWindowFontScale");
+   value.sizeConstraints=(decltype(value.sizeConstraints))proc(module,"igSetNextWindowSizeConstraints");
+   value.begin=(decltype(value.begin))proc(module,"igBegin");
+   value.end=(decltype(value.end))proc(module,"igEnd");
+   value.pushId=(decltype(value.pushId))proc(module,"igPushID_Str");
+   value.popId=(decltype(value.popId))proc(module,"igPopID");
+   value.text=(decltype(value.text))proc(module,"igTextUnformatted");
+   value.textDisabled=(decltype(value.textDisabled))proc(module,"igTextDisabled");
+   value.separator=(decltype(value.separator))proc(module,"igSeparator");
+   value.sameLine=(decltype(value.sameLine))proc(module,"igSameLine");
+   value.setNextItemWidth=(decltype(value.setNextItemWidth))proc(module,"igSetNextItemWidth");
+   value.checkbox=(decltype(value.checkbox))proc(module,"igCheckbox");
+   value.radioButton=(decltype(value.radioButton))proc(module,"igRadioButton_Bool");
+   value.inputInt=(decltype(value.inputInt))proc(module,"igInputInt");
+   value.inputFloat=(decltype(value.inputFloat))proc(module,"igInputFloat");
+   value.inputText=(decltype(value.inputText))proc(module,"igInputText");
+   value.button=(decltype(value.button))proc(module,"igButton");
+   value.beginCombo=(decltype(value.beginCombo))proc(module,"igBeginCombo");
+   value.endCombo=(decltype(value.endCombo))proc(module,"igEndCombo");
+   value.selectable=(decltype(value.selectable))proc(module,"igSelectable_Bool");
+   value.colorEdit4=(decltype(value.colorEdit4))proc(module,"igColorEdit4");
+   value.beginPopupContextItem=(decltype(value.beginPopupContextItem))proc(module,"igBeginPopupContextItem");
+   value.endPopup=(decltype(value.endPopup))proc(module,"igEndPopup");
+   value.invisibleButton=(decltype(value.invisibleButton))proc(module,"igInvisibleButton");
+   value.setNextItemAllowOverlap=(decltype(value.setNextItemAllowOverlap))proc(module,"igSetNextItemAllowOverlap");
+   value.itemClicked=(decltype(value.itemClicked))proc(module,"igIsItemClicked");
+   value.itemDeactivated=(decltype(value.itemDeactivated))proc(module,"igIsItemDeactivated");
+   value.mouseDoubleClicked=(decltype(value.mouseDoubleClicked))proc(module,"igIsMouseDoubleClicked_Nil");
+   value.mouseDragging=(decltype(value.mouseDragging))proc(module,"igIsMouseDragging");
+   value.mouseDragDelta=(decltype(value.mouseDragDelta))proc(module,"igGetMouseDragDelta");
+   value.mousePos=(decltype(value.mousePos))proc(module,"igGetMousePos");
+   value.setCursorScreen=(decltype(value.setCursorScreen))proc(module,"igSetCursorScreenPos");
+   value.windowDrawList=(decltype(value.windowDrawList))proc(module,"igGetWindowDrawList");
+   value.deactivatedAfterEdit=(decltype(value.deactivatedAfterEdit))proc(module,"igIsItemDeactivatedAfterEdit");
+   value.itemHovered=(decltype(value.itemHovered))proc(module,"igIsItemHovered");
+   value.itemActive=(decltype(value.itemActive))proc(module,"igIsItemActive");
+   value.itemFocused=(decltype(value.itemFocused))proc(module,"igIsItemFocused");
+   value.itemRectMin=(decltype(value.itemRectMin))proc(module,"igGetItemRectMin");
+   value.itemRectMax=(decltype(value.itemRectMax))proc(module,"igGetItemRectMax");
+   value.calcTextSize=(decltype(value.calcTextSize))proc(module,"igCalcTextSize");
+   value.textLineHeight=(decltype(value.textLineHeight))proc(module,"igGetTextLineHeight");
+   value.getIo=(decltype(value.getIo))proc(module,"igGetIO");
+   value.windowPos=(decltype(value.windowPos))proc(module,"igGetWindowPos");
+   value.windowSize=(decltype(value.windowSize))proc(module,"igGetWindowSize");
+   value.scrollMaxY=(decltype(value.scrollMaxY))proc(module,"igGetScrollMaxY");
+   value.beginTooltip=(decltype(value.beginTooltip))proc(module,"igBeginTooltip");
+   value.endTooltip=(decltype(value.endTooltip))proc(module,"igEndTooltip");
+  }
+  return value;
+ }
+ static void draw_settings_page_api(void* raw,const TCFrame*,float width,float){
+  static_cast<NativeRuntime*>(raw)->drawSettingsPage(width);
+ }
+ void drawSettingsPage(float width){
+  auto& api=editorApi();
+  if(!api.text||!api.textDisabled||!api.separator||!api.pushId||!api.popId||
+     !api.sameLine||!api.setNextItemWidth||!api.checkbox||!api.inputInt||
+     !api.inputFloat||!api.inputText||!api.radioButton||!api.button)return;
+  const float controlWidth=std::max(160.f,std::min(420.f,width*0.42f));
+  const auto drawScope=[&](uint32_t scope,const char* title){
+   bool any=false;for(auto& p:loaded)if(p->active)for(auto& field:p->settings)
+    if(field.scope==scope)any=true;
+   if(!any)return;
+   api.text(title,nullptr);api.separator();
+   for(auto& p:loaded){
+    if(!p->active)continue;
+    bool owns=false;for(auto& field:p->settings)if(field.scope==scope)owns=true;
+    if(!owns)continue;
+    api.pushId(p->id.c_str());api.text(p->id.c_str(),nullptr);
+    for(auto& field:p->settings){
+     if(field.scope!=scope)continue;
+     api.pushId(field.id.c_str());
+     api.text(field.label.c_str(),nullptr);api.sameLine(0.f,-1.f);
+     mod_settings::Value proposed=field.current;bool changed=false;
+     api.setNextItemWidth(controlWidth);
+     if(field.type==TC_MOD_SETTING_BOOL){
+      bool value=field.current.integer!=0;
+      if(api.checkbox("###value",&value)){proposed.integer=value?1:0;changed=true;}
+     }else if(field.type==TC_MOD_SETTING_INT){
+      int value=(int)field.current.integer;
+      const int step=(int)std::min<int64_t>(field.stepInteger,INT32_MAX);
+      const int fast=(int)std::min<int64_t>((int64_t)step*10,INT32_MAX);
+      if(api.inputInt("###value",&value,step,fast,0)){
+       proposed.integer=std::max<int64_t>(field.minimumInteger,
+                         std::min<int64_t>(field.maximumInteger,value));changed=true;}
+     }else if(field.type==TC_MOD_SETTING_FLOAT){
+      float value=(float)field.current.number;
+      if(api.inputFloat("###value",&value,(float)field.stepNumber,
+                        (float)(field.stepNumber*10.0),"%.6g",0)){
+       proposed.number=std::max(field.minimumNumber,
+                       std::min(field.maximumNumber,(double)value));changed=true;}
+     }else if(field.type==TC_MOD_SETTING_ENUM){
+      for(uint32_t i=0;i<field.choices.size();++i){
+       if(i)api.sameLine(0.f,-1.f);
+       const std::string choiceId=std::to_string(i);api.pushId(choiceId.c_str());
+       if(api.radioButton(field.choices[i].c_str(),field.current.enumIndex==i)){
+        proposed.enumIndex=i;proposed.integer=i;changed=true;}
+       api.popId();
+      }
+     }else if(field.type==TC_MOD_SETTING_TEXT){
+      std::array<char,TC_MOD_SETTING_MAX_TEXT_BYTES+1u> buffer{};
+      std::memcpy(buffer.data(),field.current.text.data(),
+                  std::min(field.current.text.size(),buffer.size()-1));
+      if(api.inputText("###value",buffer.data(),buffer.size(),0,nullptr,nullptr)){
+       proposed.text=buffer.data();changed=true;}
+     }
+     api.sameLine(0.f,-1.f);
+     if(api.button("Reset###reset",EditorApi::Vec2{0.f,0.f})){
+      proposed=field.defaultValue;changed=true;
+     }
+     if(changed){const int status=applySetting(*p,field,proposed);
+      if(status!=TC_MOD_SETTINGS_OK)logger("Mod setting change rejected: "+p->id+"/"+
+                                          field.id+" status="+std::to_string(status));}
+     if(!field.description.empty())api.textDisabled(field.description.c_str(),nullptr);
+     api.popId();
+    }
+    api.separator();api.popId();
+   }
+  };
+  drawScope(TC_MOD_STORAGE_SCOPE_GLOBAL,"Global settings");
+  drawScope(TC_MOD_STORAGE_SCOPE_PROFILE,"Current save settings");
+ }
+ /* ImGui window flags, spelled out because the loader does not include the
+    plugin-facing tc_ui.h: no title, no resize/move, no collapse, auto size, no
+    background, no saved settings and no focus on appearing.  A scrollbar is
+    deliberately *enabled*: a type with many rows is capped at the screen by
+    sizeConstraints below, and the rest of its table has to stay reachable. */
+ static constexpr int kEditorRowWindowFlags=1|2|4|32|64|128|256|4096;
+ /* The rows' text scale (`igSetWindowFontScale`, the entry the loader already
+    uses for its own small print).  The game's UI font is sized for menus; a
+    property row wants something closer to a form, and every widget in the row -
+    the label, the input box, its height - follows this one number. */
+ static constexpr float kEditorRowFontScale=0.78f;
+  /* The widest a row's input box may get, in multiples of the row's own text
+    height (`igGetTextLineHeight`, the metric the game draws its own rows with).
+    The drawer spans the screen, and a box that filled the row read as a bar
+    rather than a field (player report 2026-09-28: "这个输入框还是太大了，太宽了，
+    可以适当缩小") - twelve text heights is a little over twenty Latin characters,
+    which is what "0x40200000" and a decimal like "1.7976931348623157e+308" need
+    to stay readable. */
+  static constexpr float kEditorFieldMaxTextHeights=12.f;
+  static constexpr float kEditorFieldMinTextHeights=6.f;
+  /* How much room under the drawer's title a row needs to be worth drawing.
+     Below it the drawer counts as folded: a folded drawer is just its title row,
+     so the space under our own cursor is what tells the two apart. */
+  static constexpr float kEditorMinRowRoom=34.f;
+  /* The gap the rows keep from the game panel's own edges, so the editor never
+     touches (or spills past) the panel it belongs to. */
+  static constexpr float kEditorPanelMargin=6.f;
+ static bool editorTraceEnabled(){
+  static const bool enabled=[](){
+   char value[8]{};
+   return GetEnvironmentVariableA("TC_EDITOR_TRACE",value,sizeof(value))>0&&value[0]!='0';
+  }();
+  return enabled;
+ }
+ /* One instance's working copy of its configuration while the rows are on
+    screen, plus the text buffers the string widgets edit in place. */
+ struct EditorEditState {
+  uint64_t customId=0,instance=0,revision=0;
+  std::vector<uint8_t> bytes;
+  /* V4 staged tables (TC_COMPONENT_EDITOR_TABLE_CONFIRM): `committed` is what
+     the instance really holds and `pending` says the working copy has edits
+     that only Apply writes.  Every other table leaves both at their defaults. */
+  std::vector<uint8_t> committed;
+  bool pending=false;
+  bool valid=false;
+  std::array<std::array<char,component_editor::kMaxTextBytes+1>,
+             component_editor::kMaxFields> texts{};
+  std::array<std::string,component_editor::kMaxFields> validation{};
+  std::array<int,component_editor::kMaxFields> validationStatus{};
+  bool colorTransaction=false;
+  std::string colorField;
+  bool resizeTransaction=false;
+  std::string resizeField;
+ };
+ std::map<std::pair<uint64_t,uint64_t>,EditorEditState> editorEdits;
+ DWORD lastEditorTrace=0;
+ /* The row window's own height from the last frame, used to keep it on screen. */
+ float lastEditorWindowHeight=0.f;
+  /* The frame the rows were last drawn on, so "the panel just appeared" is a
+    frame gap rather than a per-frame flag (see the front-order note below). */
+  int64_t lastEditorRowFrame=-2;
+ /* ...and how much of its content that height was hiding, so the clamp below
+    works on the *content* size rather than on what the cap allowed to be shown:
+    capping first and clamping afterwards would shrink a seven-row editor to the
+    two rows that happen to fit above the screen's bottom edge. */
+ float lastEditorScrollMax=0.f;
+  /* Whether the game's drawer was open the last time the rows were drawn.  The
+    hook on the title row runs in *both* states, so a collapsed drawer has to be
+    recognised from the room it leaves under that title: while it is folded the
+    rows are not drawn at all, and nothing about them is touched, so opening the
+    drawer again brings back the same widgets, the same typed values and the
+    same screen position (player requirement 2026-09-28). */
+  bool lastEditorPanelOpen=true;
+  /* The game's own fold/unfold button in the drawer's title row, read from the
+    last item the game submitted.  Logged with the row trace so a playtest can
+    click it instead of guessing where the game put it. */
+  float panelToggleMin[2]={0.f,0.f},panelToggleMax[2]={0.f,0.f};
+  /* When the drawer geometry was last written to the trace. */
+  DWORD lastEditorPanelTrace=0;
+  /* The last combo popup's rectangle, published with the trace so a playtest can
+    click an entry without guessing where ImGui put the popup (the popup is only
+    as wide as its widest entry and it flips above the field when it has to). */
+  float lastComboPopup[4]={-1.f,-1.f,-1.f,-1.f};
+  /* ...and each entry's own rectangle: the entries are not the row's height, so
+    a reader that wants to pick one needs the entry, not an estimate. */
+  float comboItem[8][4]={{-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},
+                         {-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},
+                         {-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f}};
+  /* Whether the last frame had a dropdown popup open, so each fresh open
+    publishes its geometry even when it lands on the same rectangle. */
+  bool comboOpen=false;
+  /* The same for a custom row's context menu, so a playtest can click its
+    entries instead of guessing where the popup landed. */
+  float menuItem[8][4]={{-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},
+                        {-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f},
+                        {-1.f,-1.f,-1.f,-1.f},{-1.f,-1.f,-1.f,-1.f}};
+  bool menuOpen=false;
+  /* The resize grip's own rectangle, published for the same reason: the clip of
+    the row window can cut the bottom corner of the last row, so a reader must be
+    told where the grip actually ended up. */
+  float gripRect[4]={-1.f,-1.f,-1.f,-1.f};
+  std::string gripField;
+  /* V4: the swatch strip's rectangles, published so a playtest clicks the
+     swatch the host drew rather than a point it guessed - the strip's geometry
+     follows the row width, which follows the window. */
+  float swatchRect[TC_COMPONENT_EDITOR_MAX_PALETTE_SWATCHES][4]={};
+  std::string swatchField;
+  /* ...and the validation marker's own rectangle plus the message last shown
+     in its tooltip, for the same reason. */
+  float validationIconRect[4]={-1.f,-1.f,-1.f,-1.f};
+  std::string validationIconField,validationTipField;
+  /* A staged table's Apply / Cancel buttons, published so the confirm and
+     cancel cases can press them. */
+  float dialogApplyRect[4]={-1.f,-1.f,-1.f,-1.f};
+  float dialogCancelRect[4]={-1.f,-1.f,-1.f,-1.f};
+  int dialogPending=-1;
+ /* The Mod that declared rows for this type, or null.  Only an active plugin
+    can be selected on the board, so a rejected one is skipped. */
+ Loaded* editorOwner(uint64_t customId){
+  for(auto& p:loaded){
+   if(!p||!p->active)continue;
+   if(p->editorFields.find(customId)!=p->editorFields.end())return p.get();
+  }
+  return nullptr;
+ }
+ /* Draws the rows of one type over the game's drawer.  Called from inside the
+    drawer, after the Mod's own panel slots, so a Mod that draws a custom editor
+    keeps its rows above the host's. */
+ void drawComponentEditorRows(uint64_t instance,uint64_t customId,float width,float height){
+  /* Why the host drew no rows for the instance the drawer is showing - the first
+     question a Mod author asks when an editor does not appear.  Bounded, because
+     this runs per frame while the drawer is open. */
+  auto stop=[&](const char* why){
+   static int lines=0;
+   if(lines<6){++lines;
+    logger(std::string("Component editor: skipped (")+why+") instance "+
+           hexValue(instance)+" custom "+hexValue(customId));}
+  };
+  Loaded* owner=editorOwner(customId);
+  if(!owner){stop("no rows declared for this type");return;}
+  const auto found=owner->editorFields.find(customId);
+  if(found==owner->editorFields.end()||found->second.empty()){stop("empty table");return;}
+  const std::vector<component_editor::Field>& fields=found->second;
+  /* V4: a table declared with TC_COMPONENT_EDITOR_TABLE_CONFIRM keeps its edits
+     in the working copy and writes them with Apply. */
+  const auto flagsFound=owner->editorTableFlags.find(customId);
+  const uint32_t tableFlags=flagsFound==owner->editorTableFlags.end()?0u:flagsFound->second;
+  const bool staged=(tableFlags&TC_COMPONENT_EDITOR_TABLE_CONFIRM)!=0;
+  EditorApi& api=editorApi();
+  if(!api.available()){stop("the engine's editor primitives are missing");return;}
+  /* The drawer's own rectangle, read while the hook is still inside the game's
+     window (ours does not exist yet), and the first line under the title row,
+     which is where the game's own content starts.  Everything below stays inside
+     this rectangle: the player requirement is that the editor never covers the
+     board and never spills past the game's bottom panel. */
+  EditorApi::Vec2 panelPos{},panelSize{};
+  api.windowPos(&panelPos);api.windowSize(&panelSize);
+  const bool havePanel=panelSize.x>1.f&&panelSize.y>1.f;
+  const float panelLeft=havePanel?panelPos.x:0.f;
+  const float panelTop=havePanel?panelPos.y:0.f;
+  const float panelRight=havePanel?panelPos.x+panelSize.x:0.f;
+  const float panelBottom=havePanel?panelPos.y+panelSize.y:0.f;
+  EditorApi::Vec2 underTitle{};
+  api.cursorScreen(&underTitle);
+  /* A folded drawer is a title row and nothing else, and this hook runs in every
+     state - so a folded drawer would otherwise have the rows painted over the
+     board.  While it is folded nothing is drawn *and* nothing is touched, so
+     opening it again brings back the same widgets, the same typed values and the
+     same position (player requirement 2026-09-28). */
+  const float roomUnderTitle=havePanel?panelBottom-underTitle.y:1e9f;
+  if(havePanel&&roomUnderTitle<kEditorMinRowRoom){
+   if(lastEditorPanelOpen){
+    lastEditorPanelOpen=false;
+    logger("Component editor: the drawer is folded ("+
+           std::to_string((int)roomUnderTitle)+"px under its title); the rows are "
+           "not drawn until it opens again");
+   }
+   return;
+  }
+  if(!lastEditorPanelOpen){
+   lastEditorPanelOpen=true;
+   logger("Component editor: the drawer is open again; the rows return to the same place");
+  }
+  TCComponentInstanceHandle handle{};
+  if(!tc::logic::instanceHandleOf(customId,instance,&handle)){
+   editorEdits.erase(std::make_pair(customId,instance));
+   stop("the instance is not bound (no handle)");
+   return;
+  }
+  TCComponentStorageInfoV1 info{};
+  info.size=sizeof(info);info.version=TC_COMPONENT_STORAGE_INFO_VERSION_1;
+  if(tc::logic::storageInfo(&handle,&info)!=TC_COMPONENT_STORAGE_OK){stop("storage info refused");return;}
+  if(!info.config_size){stop("the type has no configuration");return;}
+  /* Entries outlive a board only until the rows are drawn again; the bound
+     keeps a long session from growing without limit. */
+  if(editorEdits.size()>64&&editorEdits.find(std::make_pair(customId,instance))==editorEdits.end())
+   editorEdits.clear();
+  EditorEditState& edit=editorEdits[std::make_pair(customId,instance)];
+  edit.customId=customId;edit.instance=instance;
+  /* The text buffers are derived from the bytes, so a refused edit or a Cancel
+     puts the box back to what the instance really holds: textual kinds each
+     have their own spelling, and every other kind has no buffer at all. */
+  auto fillTextBuffer=[&](const component_editor::Field& field,size_t index){
+   if(index>=edit.texts.size())return;
+   edit.texts[index].fill(0);
+   component_editor::Value value{};
+   if(!component_editor::read(field,edit.bytes.data(),
+                              static_cast<uint32_t>(edit.bytes.size()),value))
+    return;
+   std::string owned;
+   const char* text=nullptr;
+   switch(field.kind){
+    case TC_COMPONENT_FIELD_TEXT: text=value.text.c_str();break;
+    case TC_COMPONENT_FIELD_UINT:
+     if(field.hex){owned=component_editor::formatHex(field,value.integer);text=owned.c_str();}
+     break;
+    case TC_COMPONENT_FIELD_FLOAT_WIDTH:
+     owned=component_editor::formatFloatText(field,value.integer);text=owned.c_str();break;
+    case TC_COMPONENT_FIELD_COLOR_RGBA8:
+     if(field.colorHex){
+      owned=component_editor::formatColorHex(static_cast<uint32_t>(value.integer));
+      text=owned.c_str();
+     }
+     break;
+    default: break;
+   }
+   if(text)std::snprintf(edit.texts[index].data(),edit.texts[index].size(),"%s",text);
+  };
+  if(!edit.valid||edit.revision!=info.config_revision||edit.bytes.size()!=info.config_size){
+   edit.bytes.assign(info.config_size,0);
+   uint32_t written=0;
+   if(tc::logic::storageReadConfig(&handle,edit.bytes.data(),info.config_size,&written)!=
+      TC_COMPONENT_STORAGE_OK||written!=info.config_size){
+    edit.valid=false;
+    stop("reading the configuration failed");
+    return;
+   }
+   edit.revision=info.config_revision;
+   edit.valid=true;
+   /* A fresh read is the baseline a staged table compares against and the
+      bytes Cancel restores. */
+   edit.committed=edit.bytes;
+   edit.pending=false;
+   /* The bytes are the truth, so the text buffers start from them.  A buffer
+      left over from an earlier board would otherwise be committed back.  A
+      hexadecimal field edits text too, and its text is the padded form of the
+      stored bits. */
+   for(size_t index=0;index<fields.size()&&index<component_editor::kMaxFields;++index)
+    fillTextBuffer(fields[index],index);
+  }
+  /* Runs this Mod's validator against one proposed blob; ERROR also covers a
+     callback that threw.  The message lands on the row and in the log, so the
+     advisory marker has something to show and the text form has something to
+     print. */
+  auto runValidator=[&](const component_editor::Field& field,
+                        const std::vector<uint8_t>& bytes,size_t fieldIndex){
+   if(fieldIndex<edit.validation.size()){
+    edit.validation[fieldIndex].clear();edit.validationStatus[fieldIndex]=0;
+   }
+   if(!field.validateValue)return static_cast<int>(TC_COMPONENT_EDITOR_VALIDATION_OK);
+   std::array<char,TC_COMPONENT_EDITOR_MAX_VALIDATION_BYTES> message{};
+   int validation=TC_COMPONENT_EDITOR_VALIDATION_ERROR;
+   try{
+    validation=field.validateValue(field.user,&handle,field.id.c_str(),bytes.data(),
+                                   static_cast<uint32_t>(bytes.size()),message.data(),
+                                   static_cast<uint32_t>(message.size()));
+   }catch(...){
+    logger("Component editor: validator threw for field \""+field.id+"\"");
+   }
+   message.back()=0;
+   if(fieldIndex<edit.validation.size()){
+    edit.validation[fieldIndex]=message.data();
+    edit.validationStatus[fieldIndex]=validation;
+   }
+   return validation;
+  };
+  /* Writes one edited field back.  The record is written by the storage path
+     first, the undo step is recorded there, and on_config_changed follows with
+     the binding lock released - exactly like a Mod's own write_config.
+
+     A staged table (V4's CONFIRM) has the same shape up to the write: the value
+     lands in the working copy, the row shows it and the validator runs, but the
+     record is not touched until Apply writes the whole blob once. */
+  auto commit=[&](const component_editor::Field& field,const component_editor::Value& value){
+   const size_t fieldIndex=static_cast<size_t>(&field-fields.data());
+   if(staged){
+    const std::vector<uint8_t> previous=edit.bytes;
+    std::string note;
+    if(!component_editor::apply(field,edit.bytes.data(),
+                                static_cast<uint32_t>(edit.bytes.size()),value,&note))
+     return;
+    if(edit.bytes==previous)return;
+    const int validation=runValidator(field,edit.bytes,fieldIndex);
+    if(validation<0){
+     edit.bytes=previous;
+     fillTextBuffer(field,fieldIndex);
+     if(fieldIndex<edit.validation.size()&&edit.validation[fieldIndex].empty())
+      edit.validation[fieldIndex]="value rejected";
+     logger("Component editor: validator refused staged field \""+field.id+"\" on instance "+
+            hexValue(instance)+": "+edit.validation[fieldIndex]);
+     return;
+    }
+    if(validation>0)
+     logger("Component editor: validator warned for field \""+field.id+"\" on instance "+
+            hexValue(instance)+": "+edit.validation[fieldIndex]);
+    if(!note.empty())logger("Component editor: "+note);
+    edit.pending=true;
+    logger("Component editor: staged field \""+field.id+"\" on instance "+hexValue(instance)+
+           " value="+component_editor::display(field,value));
+    return;
+   }
+   std::vector<uint8_t> next=edit.bytes;
+   std::string note;
+   if(!component_editor::apply(field,next.data(),static_cast<uint32_t>(next.size()),value,&note))
+    return;
+   if(next==edit.bytes)return;
+   const int validation=runValidator(field,next,fieldIndex);
+   if(validation<0){
+    if(fieldIndex<edit.validation.size()&&edit.validation[fieldIndex].empty())
+     edit.validation[fieldIndex]="value rejected";
+    logger("Component editor: validator refused field \""+field.id+"\" on instance "+
+           hexValue(instance)+": "+edit.validation[fieldIndex]);
+    return;
+   }
+   if(validation>0)
+    logger("Component editor: validator warned for field \""+field.id+"\" on instance "+
+           hexValue(instance)+": "+edit.validation[fieldIndex]);
+   const int status=tc::logic::storageWriteConfig(&handle,info.config_schema,
+                                                next.data(),static_cast<uint32_t>(next.size()));
+   if(status!=TC_COMPONENT_STORAGE_OK){
+    logger("Component editor: the configuration write for field \""+field.id+
+           "\" on instance "+hexValue(instance)+" was refused ("+std::to_string(status)+
+           "); the field is unchanged");
+    return;
+   }
+   if(!note.empty())logger("Component editor: "+note);
+   edit.valid=false;   /* re-read next frame: the write bumped the revision */
+   logger("Component editor: committed field \""+field.id+"\" on instance "+
+          hexValue(instance)+" value="+component_editor::display(field,value));
+  };
+  auto sendAction=[&](const component_editor::Field& field,uint32_t kind,uint32_t actionId,
+                      float x,float y,float dx,float dy){
+   if(!field.action)return;
+   TCComponentEditorActionV1 action{};
+   action.size=sizeof(action);action.version=1;action.instance=handle;
+   action.field_id=field.id.c_str();action.kind=kind;action.action_id=actionId;
+   action.screen_x=x;action.screen_y=y;action.delta_x=dx;action.delta_y=dy;
+   action.config=edit.bytes.data();action.config_size=static_cast<uint32_t>(edit.bytes.size());
+   fault::Scope mark(owner->id.c_str(),"component editor action");
+   try{field.action(field.user,&action);}
+   catch(...){logger("Component editor: action callback threw for field \""+field.id+"\"");}
+  };
+  /* A context-menu entry's rectangle, published (on a fresh open and whenever it
+     changes) so a playtest can click the entry rather than guess where ImGui put
+     the popup. */
+  auto publishMenuEntry=[&](bool fresh,size_t slot,const std::string& fieldId,uint32_t actionId){
+   if(slot>=8||!api.itemRectMin||!api.itemRectMax)return;
+   EditorApi::Vec2 low{},high{};
+   api.itemRectMin(&low);api.itemRectMax(&high);
+   if(!fresh&&low.x==menuItem[slot][0]&&low.y==menuItem[slot][1])return;
+   menuItem[slot][0]=low.x;menuItem[slot][1]=low.y;
+   menuItem[slot][2]=high.x;menuItem[slot][3]=high.y;
+   logger("Component editor: menu item instance="+hexValue(instance)+" field=\""+fieldId+
+          "\" index="+std::to_string(slot)+" id="+std::to_string(actionId)+" rect="+
+          std::to_string((int)low.x)+","+std::to_string((int)low.y)+","+
+          std::to_string((int)high.x)+","+std::to_string((int)high.y));
+  };
+  EditorApi::Vec2 cursor{};api.cursorScreen(&cursor);
+  const float originX=cursor.x-api.cursorPosX();
+  const float originY=cursor.y-api.cursorPosY();
+  /* Where the drawer's own content starts.  The hook runs after the game has
+     drawn its title row, so the cursor sits under that title - and the row window
+     must never climb above it (player report 2026-09-28: the first input box
+     covered the component's name when the panel got shorter). */
+  const float contentTop=cursor.y;
+  /* The rows start at the panel's own middle, the way the game's description
+     block does, so the preview above them stays visible - but never above the
+     title row and never past the panel's bottom edge. */
+  float top=originY+height*0.52f;
+  if(contentTop>top)top=contentTop;
+  /* The row window's left edge, kept inside the panel: a window narrower than
+     the game's own buttons must shrink the editor, not push it off the drawer
+     (a resize has to be absorbed by the layout, not by the panel's edge). */
+  float windowLeft=originX+width*0.08f;
+  if(havePanel){
+   const float leftLimit=panelLeft+kEditorPanelMargin;
+   const float rightLimit=std::max(leftLimit,panelRight-kEditorPanelMargin-60.f);
+   if(windowLeft<leftLimit)windowLeft=leftLimit;
+   if(windowLeft>rightLimit)windowLeft=rightLimit;
+  }
+  float displayHeight=0.f;
+  if(api.getIo) {
+   const auto* io=static_cast<const unsigned char*>(api.getIo());
+   float display[2]={0.f,0.f};
+   if(io)std::memcpy(display,io+8,sizeof(display));
+   displayHeight=display[1];
+  }
+  /* The bottom the rows have to respect: the game panel's own edge, and the
+     screen's, whichever is higher.  What the table really needs (its height plus
+     whatever it was hiding) decides where it can start, so a table that does not
+     fit scrolls instead of spilling out of the panel. */
+  const float bottomLimit=havePanel
+      ?std::min(panelBottom-kEditorPanelMargin,
+                displayHeight>1.f?displayHeight-kEditorPanelMargin:panelBottom)
+      :(displayHeight>1.f?displayHeight-8.f:1e9f);
+  if(bottomLimit<1e8f){
+   if(lastEditorWindowHeight>1.f){
+    const float contentHeight=lastEditorWindowHeight+lastEditorScrollMax;
+    const float ceiling=bottomLimit-contentHeight;
+    if(ceiling>contentTop&&top>ceiling)top=ceiling;
+    /* ... and when the table does not fit under the game's own block at all, it
+       takes the whole panel below the title row instead of leaving a strip of it
+       to the game.  A player who opens a property table wants to see as many of
+       its rows as the panel can hold; the game's own preview is what the mod
+       draws over anyway once it hides the foundry button (V4/V5). */
+    if(bottomLimit-contentHeight<top)top=contentTop;
+   }
+   if(top>bottomLimit-kEditorMinRowRoom)top=bottomLimit-kEditorMinRowRoom;
+   if(top<contentTop)top=contentTop;
+   if(!havePanel&&top<8.f)top=8.f;
+  }
+  /* How big the row window may become: the panel's box is the outer limit, the
+     screen is the fallback for a loader whose engine reports no panel. */
+  const float maxWindowWidth=havePanel
+      ?std::max(60.f,panelRight-kEditorPanelMargin-windowLeft)
+      :100000.f;
+  const float maxWindowHeight=std::max(kEditorMinRowRoom,bottomLimit-top);
+  /* One decision per frame, not per field: the throttled trace has to report
+     *every* row of that frame, or a reader (and the playtest driver) only ever
+     sees the first field. */
+  bool traceFrame=false;
+  if(editorTraceEnabled()){
+   const DWORD now=GetTickCount64();
+   if(now-lastEditorTrace>900){lastEditorTrace=now;traceFrame=true;}
+  }
+  api.setNextWindowPos(EditorApi::Vec2{windowLeft,top},1,EditorApi::Vec2{0.f,0.f});
+  /* ... and it has to be the window ImGui paints last.  The rows sit over the
+     game's own panel with no background of their own, so whichever window comes
+     later in the frame wins; a re-entered level re-creates the panel, which was
+     enough to bury them.
+
+     Bringing it to the front is a *focus* operation, so it is done once per
+     appearance, not every frame: focusing every frame closed whatever popup the
+     player had just opened - the player's report "with the bottom panel open the
+     top menu bar does not work".  One call is enough, because ImGui keeps the
+     window order until something else is focused, and the panel is only
+     re-created while it is closed (entering a level), which is exactly when the
+     gap below is large. */
+  const int64_t editorFrame=engineFrame();
+  const bool panelJustAppeared=editorFrame!=lastEditorRowFrame+1;
+  lastEditorRowFrame=editorFrame;
+  if(api.setNextWindowFocus&&panelJustAppeared)api.setNextWindowFocus();
+  /* Cap the window at the space under its own top edge, and let ImGui scroll
+     what does not fit.  Without this a type with many rows would grow past the
+     screen and its lower rows could be drawn but never clicked; the clamp above
+     only moves the whole window, it cannot make it smaller. */
+  if(api.sizeConstraints)
+   api.sizeConstraints(EditorApi::Vec2{0.f,0.f},
+                       EditorApi::Vec2{maxWindowWidth,maxWindowHeight},nullptr,nullptr);
+  if(api.begin("###tc-editor-rows",nullptr,kEditorRowWindowFlags)){
+   api.pushId("tc-editor");
+   /* Smaller text than the game's UI: the drawer's rows are dense - a label, a
+      boxed value and often a third - and at the stock size they were tall enough
+      to cover the panel's own title (player report 2026-09-28: "这个输入框和对应
+      的文字明显太大了…排版要好看").  The scale belongs to this window, so the
+      game and every other Mod keep their own type size; ImGui's input boxes also
+      shrink with it, which is what makes the rows read as one block. */
+   if(api.setWindowFontScale)api.setWindowFontScale(kEditorRowFontScale);
+     /* The label columns are *measured*, not a fraction of the panel: the game's
+        bottom drawer spans the screen, so a fraction left the label and its field
+        a hand's width apart (player report 2026-09-28: "输入框和旁边的文字离得太远").
+
+        They are measured from the *text*, never from the previous item's
+        rectangle.  A rectangle says where the last submission landed, and an
+        inline field's label is submitted after the field beside it, so that
+        rectangle reported the pair's position instead of the label's width - and
+        feeding it back into the column moved the pair a little further right
+        every frame.  Measured on the editor-demo type (2026-09-28): the column
+        went 204 -> 11981 -> ... -> 1.6 million pixels in eight trace frames, its
+        fields left the screen and the host's own rows could no longer be clicked
+        (tests/component-editor-rows).  igCalcTextSize answers with the metrics
+        the game draws this very text with, including the row window's font
+        scale, and a type's labels never change, so the numbers are stable. */
+     float firstLabelWidth=0.f,secondLabelWidth=0.f;
+     for(const component_editor::Field& field:fields){
+      EditorApi::Vec2 extent{};
+      if(api.calcTextSize)api.calcTextSize(&extent,field.label.c_str(),nullptr,false,0.f);
+      if(field.inlineWithPrevious){
+       if(extent.x>secondLabelWidth)secondLabelWidth=extent.x;
+      }else if(extent.x>firstLabelWidth)firstLabelWidth=extent.x;
+     }
+     /* The row's own text height, which is what the field width is capped
+        against.  `width*0.02` is only a fallback for a loader whose ImGui has no
+        line-height entry at all. */
+     const float lineHeight=api.textLineHeight?api.textLineHeight():0.f;
+     const float ink=lineHeight>1.f?lineHeight:width*0.02f;
+     /* The column starts at a compact fixed share of the drawer (a measured
+        column alone is wrong on the first frame - measured while building this:
+        the field landed on top of its label) and grows when a label really is
+        wider than that. */
+     const float labelFloor=width*0.08f;
+     const float rowLeft=firstLabelWidth+10.f>labelFloor?firstLabelWidth+10.f:labelFloor;
+     const float rowRight=width*0.06f;   /* a margin, so the box never touches the edge */
+     float fieldWidth=width-rowLeft-rowRight;
+     /* ... but not the whole row: a form field, not a bar.  The cap is in text
+        heights because that is the metric the game's own rows are built from. */
+     const float fieldCap=ink*kEditorFieldMaxTextHeights;
+     const float fieldFloor=ink*kEditorFieldMinTextHeights;
+     if(fieldWidth>fieldCap)fieldWidth=fieldCap;
+     if(fieldWidth<fieldFloor)fieldWidth=fieldFloor;
+     if(fieldWidth<60.f)fieldWidth=60.f;
+     /* ... and never past the panel's right edge: a narrower game window has to
+        shrink the fields, not push them out of the drawer. */
+     if(havePanel){
+      const float room=panelRight-kEditorPanelMargin-(windowLeft+rowLeft);
+      if(room>60.f&&fieldWidth>room)fieldWidth=room;
+     }
+     /* A pair of fields sharing a line: both halves are the same width, the second
+        label starts after the first field and the second field after that label -
+        all three offsets computed here, so nothing has to be read back. */
+     const float pairFieldWidth=fieldWidth*0.5f;
+     const float pairLabelX=rowLeft+pairFieldWidth+10.f;
+     const float pairFieldX=pairLabelX+secondLabelWidth+10.f;
+  for(size_t index=0;index<fields.size();++index){
+   const component_editor::Field& field=fields[index];
+   component_editor::Value value{};
+   if(!component_editor::read(field,edit.bytes.data(),
+                              static_cast<uint32_t>(edit.bytes.size()),value))
+    continue;
+   /* A custom row's canvas rectangle.  The trace reports it instead of "the
+      last submitted item", because a custom row with a resize grip ends on the
+      tiny grip - and a reader (the playtest driver) needs the canvas it can
+      click and drag across, not the handle in its corner. */
+   EditorApi::Vec2 customMin{},customMax{};
+   if(field.separatorBefore)api.separator();
+    /* Sharing a line means going back to the row the previous field is on, at the
+       offset the pair's own layout asked for. */
+    if(field.inlineWithPrevious)api.sameLine(pairLabelX,-1.f);
+    api.pushId(field.id.c_str());
+    api.text(field.label.c_str(),nullptr);
+    if(api.itemHovered&&api.itemHovered(0)&&!field.tooltip.empty()&&api.beginTooltip){
+     api.beginTooltip();api.text(field.tooltip.c_str(),nullptr);
+     if(api.endTooltip)api.endTooltip();
+    }
+    if(field.kind==TC_COMPONENT_FIELD_CUSTOM){
+     api.sameLine(field.inlineWithPrevious?pairFieldX:rowLeft,-1.f);
+     const float customHeight=field.customHeight>0.f?field.customHeight:ink*2.f;
+     /* Let the resize grip (submitted after this canvas) win the hover where the
+        two overlap. */
+     if(field.resizeHandle&&api.setNextItemAllowOverlap)api.setNextItemAllowOverlap();
+     if(api.invisibleButton)api.invisibleButton("##custom",EditorApi::Vec2{fieldWidth,customHeight},0);
+     EditorApi::Vec2 low{},high{};api.itemRectMin(&low);api.itemRectMax(&high);
+     customMin=low;customMax=high;
+     /* Context and double-click belong to the whole custom canvas, before a
+        possible resize grip becomes the last submitted item. */
+     if(field.action&&api.itemHovered&&api.itemHovered(0)&&api.mouseDoubleClicked&&
+        api.mouseDoubleClicked(0)){
+      EditorApi::Vec2 mouse{};if(api.mousePos)api.mousePos(&mouse);
+      sendAction(field,TC_COMPONENT_EDITOR_ACTION_DOUBLE_CLICK,0,mouse.x,mouse.y,0.f,0.f);
+     }
+     if(field.action&&!field.contextActionIds.empty()&&api.beginPopupContextItem&&
+        api.selectable&&api.endPopup){
+      if(api.beginPopupContextItem("##context",1)){
+       const bool freshMenu=!menuOpen;menuOpen=true;
+       for(size_t actionIndex=0;actionIndex<field.contextActionIds.size();++actionIndex){
+        if(api.selectable(field.contextActionLabels[actionIndex].c_str(),false,0,
+                          EditorApi::Vec2{0.f,0.f})){
+         EditorApi::Vec2 mouse{};if(api.mousePos)api.mousePos(&mouse);
+         sendAction(field,TC_COMPONENT_EDITOR_ACTION_MENU,field.contextActionIds[actionIndex],
+                    mouse.x,mouse.y,0.f,0.f);
+        }
+        publishMenuEntry(freshMenu,actionIndex,field.id,field.contextActionIds[actionIndex]);
+       }
+       api.endPopup();
+      }else menuOpen=false;
+     }else menuOpen=false;
+     if(field.drawCustom&&api.windowDrawList){
+      void* list=api.windowDrawList();
+      RenderDrawContext drawContext{this,list,0,true,owner};
+      const TCComponentRenderDrawV2 draw{
+          sizeof(TCComponentRenderDrawV2),TC_COMPONENT_RENDER_DRAW_VERSION_2,&drawContext,
+          &component_render_line,&component_render_rect,&component_render_rect_filled,
+          &component_render_circle,&component_render_circle_filled,&component_render_text,
+          &component_render_text_sized,&component_render_measure_text};
+      TCComponentEditorCustomRowV1 row{};row.size=sizeof(row);row.version=1;
+      row.instance=handle;row.field_id=field.id.c_str();
+      row.min_x=low.x;row.min_y=low.y;row.max_x=high.x;row.max_y=high.y;
+      row.config=edit.bytes.data();row.config_size=static_cast<uint32_t>(edit.bytes.size());
+      row.draw=reinterpret_cast<const TCComponentRenderDrawV1*>(&draw);
+      if(renderPushClip)renderPushClip(list,{low.x,low.y},{high.x,high.y},true);
+      fault::Scope mark(owner->id.c_str(),"component editor custom row");
+      try{field.drawCustom(field.user,&row);}
+      catch(...){logger("Component editor: custom row callback threw for field \""+field.id+"\"");}
+      drawContext.active=false;
+      if(renderPopClip)renderPopClip(list);
+     }
+     if(field.resizeHandle&&field.action&&api.invisibleButton&&api.setCursorScreen){
+      EditorApi::Vec2 after{};api.cursorScreen(&after);
+      /* The grip has to be reachable even when its row is the last one and the
+         window is capped at the panel's bottom edge: it is sized generously and
+         then clamped inside the window's own rectangle. */
+      const float grip=std::max(14.f,ink*0.9f);
+      float gripTop=high.y-grip;
+      if(api.windowPos&&api.windowSize){
+       EditorApi::Vec2 winPos{},winSize{};
+       api.windowPos(&winPos);api.windowSize(&winSize);
+       /* The window's own padding sits inside its rectangle, so the grip is kept
+          above that line rather than at the bare edge - a clipped corner cannot
+          be pressed, by the player or by a playtest. */
+       const float innerBottom=winPos.y+winSize.y-10.f;
+       if(gripTop+grip>innerBottom)gripTop=innerBottom-grip;
+      }
+      api.setCursorScreen(EditorApi::Vec2{high.x-grip,gripTop});
+      api.invisibleButton("##resize",EditorApi::Vec2{grip,grip},0);
+      if(api.itemRectMin&&api.itemRectMax){
+       EditorApi::Vec2 gripMin{},gripMax{};
+       api.itemRectMin(&gripMin);api.itemRectMax(&gripMax);
+       if(gripMin.x!=gripRect[0]||gripMin.y!=gripRect[1]||field.id!=gripField){
+        gripRect[0]=gripMin.x;gripRect[1]=gripMin.y;
+        gripRect[2]=gripMax.x;gripRect[3]=gripMax.y;
+        gripField=field.id;
+        logger("Component editor: grip instance="+hexValue(instance)+" field=\""+field.id+
+               "\" rect="+std::to_string((int)gripMin.x)+","+std::to_string((int)gripMin.y)+
+               ","+std::to_string((int)gripMax.x)+","+std::to_string((int)gripMax.y));
+       }
+      }
+      EditorApi::Vec2 mouse{};if(api.mousePos)api.mousePos(&mouse);
+      if(api.itemClicked&&api.itemClicked(0))
+       logger("Component editor: the resize grip of field \""+field.id+"\" on instance "+
+              hexValue(instance)+" was pressed at "+std::to_string((int)mouse.x)+","+
+              std::to_string((int)mouse.y));
+      if(api.itemClicked&&api.itemClicked(0)&&!edit.resizeTransaction){
+       const int beginStatus=tc::logic::storageBeginEdit(&handle);
+       if(beginStatus==TC_COMPONENT_STORAGE_OK){
+        edit.resizeTransaction=true;edit.resizeField=field.id;
+        sendAction(field,TC_COMPONENT_EDITOR_ACTION_RESIZE_BEGIN,0,mouse.x,mouse.y,0.f,0.f);
+       }else logger("Component editor: the resize grip of field \""+field.id+"\" on instance "+
+                     hexValue(instance)+" could not open an edit transaction ("+
+                     std::to_string(beginStatus)+")");
+      }
+      if(edit.resizeTransaction&&edit.resizeField==field.id&&api.itemActive&&api.itemActive()&&
+         api.mouseDragging&&api.mouseDragging(0,0.f)){
+       EditorApi::Vec2 delta{};if(api.mouseDragDelta)api.mouseDragDelta(&delta,0,0.f);
+       sendAction(field,TC_COMPONENT_EDITOR_ACTION_RESIZE,0,mouse.x,mouse.y,delta.x,delta.y);
+      }
+      if(edit.resizeTransaction&&edit.resizeField==field.id&&api.itemDeactivated&&
+         api.itemDeactivated()){
+       sendAction(field,TC_COMPONENT_EDITOR_ACTION_RESIZE_END,0,mouse.x,mouse.y,0.f,0.f);
+       tc::logic::storageCommitEdit(&handle);edit.resizeTransaction=false;edit.resizeField.clear();
+       edit.valid=false;
+      }
+      api.setCursorScreen(after);
+     }
+    }else if(field.radio){
+     /* A radio group takes the line under its label: a handful of named choices
+        read better across the panel than stacked in a narrow column. */
+     int64_t current=value.integer;
+     for(size_t choice=0;choice<field.choices.size();++choice){
+      if(choice)api.sameLine(0.f,-1.f);
+      if(api.radioButton(field.choices[choice].c_str(),current==static_cast<int64_t>(choice))&&
+         current!=static_cast<int64_t>(choice)){
+       component_editor::Value next;
+       next.integer=static_cast<int64_t>(choice);
+       commit(field,next);
+      }
+     }
+    }else{
+      api.sameLine(field.inlineWithPrevious?pairFieldX:rowLeft,-1.f);
+      /* A "full row" field gets the same capped width as any other: the flag is
+         about the control taking its own line, not about it spanning the panel.
+         Both fields of a pair get the same half, which is what makes the two
+         controls on one line read as a pair. */
+      const bool pairedFirst=index+1<fields.size()&&fields[index+1].inlineWithPrevious;
+      api.setNextItemWidth(field.inlineWithPrevious||pairedFirst?pairFieldWidth:fieldWidth);
+     if(field.readOnly){
+      api.textDisabled(component_editor::display(field,value).c_str(),nullptr);
+     }else{
+      switch(field.kind){
+       case TC_COMPONENT_FIELD_BOOL:{
+        bool edited=value.boolean;
+        /* The checkbox flips on the click frame and commits there: waiting for
+           "deactivated after edit" would also work, but the click itself is the
+           unambiguous moment, and a player who clicks and never releases still
+           sees the value change. */
+        if(api.checkbox("##v",&edited)&&edited!=value.boolean){
+         component_editor::Value next;next.boolean=edited;commit(field,next);
+        }
+        break;
+       }
+       case TC_COMPONENT_FIELD_INT:{
+        int edited=static_cast<int>(value.integer);
+        api.inputInt("##v",&edited,0,0,0);
+        if(api.deactivatedAfterEdit()&&edited!=value.integer){
+         component_editor::Value next;next.integer=edited;commit(field,next);
+        }
+        break;
+       }
+       case TC_COMPONENT_FIELD_UINT:{
+        if(field.hex){
+         /* Hexadecimal text, so the whole 64-bit range is reachable without the
+            signed decimal box's 31-bit ceiling.  Text that is not a number is
+            refused: the configuration keeps its bytes and the box goes back to
+            the value the instance really holds. */
+         char* buffer=edit.texts[index].data();
+         api.inputText("##v",buffer,edit.texts[index].size(),0,nullptr,nullptr);
+         if(api.deactivatedAfterEdit()){
+          uint64_t parsed=0;
+          if(!component_editor::parseHex(buffer,&parsed)){
+           logger("Component editor: field \""+field.id+"\" on instance "+
+                  hexValue(instance)+" is not a hexadecimal number (\""+buffer+
+                  "\"); the configuration keeps its old value");
+           std::snprintf(buffer,edit.texts[index].size(),"%s",
+                         component_editor::formatHex(field,value.integer).c_str());
+          }else if(static_cast<uint64_t>(value.integer)!=parsed){
+           component_editor::Value next;
+           next.integer=static_cast<int64_t>(parsed);
+           commit(field,next);
+          }
+         }
+        }else{
+         int edited=static_cast<int>(value.integer);
+         api.inputInt("##v",&edited,0,0,0);
+         if(api.deactivatedAfterEdit()&&edited!=value.integer){
+          component_editor::Value next;next.integer=edited;commit(field,next);
+         }
+        }
+        break;
+       }
+       case TC_COMPONENT_FIELD_ENUM:{
+        const std::string current=component_editor::display(field,value);
+         if(field.dropdown&&api.beginCombo&&api.endCombo&&api.selectable){
+         if(api.beginCombo("##v",current.c_str(),0)){
+           const bool freshOpen=!comboOpen;
+           comboOpen=true;
+           /* Inside the branch the current ImGui window *is* the popup, so its
+              rectangle can be published for the trace. */
+           /* Published whenever the popup's rectangle changes (not only on the
+              slow trace frames): the popup is open for a couple of frames, and a
+              reader that wants to click an entry needs its rectangle before the
+              popup is gone.  The change check keeps the log bounded. */
+           if(api.windowPos&&api.windowSize){
+            EditorApi::Vec2 popupPos{},popupSize{};
+            api.windowPos(&popupPos);api.windowSize(&popupSize);
+            if(freshOpen||popupPos.x!=lastComboPopup[0]||popupPos.y!=lastComboPopup[1]||
+               popupSize.x!=lastComboPopup[2]||popupSize.y!=lastComboPopup[3]){
+             lastComboPopup[0]=popupPos.x;lastComboPopup[1]=popupPos.y;
+             lastComboPopup[2]=popupSize.x;lastComboPopup[3]=popupSize.y;
+             logger("Component editor: popup instance="+hexValue(instance)+" field=\""+field.id+
+                    "\" rect="+std::to_string((int)popupPos.x)+","+
+                    std::to_string((int)popupPos.y)+","+
+                    std::to_string((int)(popupPos.x+popupSize.x))+","+
+                    std::to_string((int)(popupPos.y+popupSize.y)));
+            }
+           }
+           for(size_t choice=0;choice<field.choices.size();++choice)
+           {
+            const bool selected=value.integer==static_cast<int64_t>(choice);
+            const bool clicked=api.selectable(field.choices[choice].c_str(),selected,0,
+                                              EditorApi::Vec2{0.f,0.f});
+            /* Publish the entry's rectangle (change-gated) so a playtest can
+               click exactly this entry - the popup flips above the field in the
+               bottom drawer and its entries are taller than the row. */
+            if(choice<8&&api.itemRectMin&&api.itemRectMax){
+             EditorApi::Vec2 low{},high{};
+             api.itemRectMin(&low);api.itemRectMax(&high);
+             if(freshOpen||low.x!=comboItem[choice][0]||low.y!=comboItem[choice][1]){
+              comboItem[choice][0]=low.x;comboItem[choice][1]=low.y;
+              comboItem[choice][2]=high.x;comboItem[choice][3]=high.y;
+              logger("Component editor: popup item instance="+hexValue(instance)+" field=\""+
+                     field.id+"\" index="+std::to_string(choice)+" rect="+
+                     std::to_string((int)low.x)+","+std::to_string((int)low.y)+","+
+                     std::to_string((int)high.x)+","+std::to_string((int)high.y));
+             }
+            }
+            if(clicked&&!selected){
+             component_editor::Value next;next.integer=static_cast<int64_t>(choice);commit(field,next);
+            }
+           }
+           api.endCombo();
+          }
+          else comboOpen=false;
+         }else if(api.button((current+"##v").c_str(),EditorApi::Vec2{0.f,0.f})){
+         component_editor::Value next;
+         next.integer=component_editor::nextChoice(field,value.integer);
+         commit(field,next);
+        }
+        break;
+       }
+       case TC_COMPONENT_FIELD_TEXT:{
+        char* buffer=edit.texts[index].data();
+        api.inputText("##v",buffer,edit.texts[index].size(),0,nullptr,nullptr);
+        if(api.deactivatedAfterEdit()&&value.text!=buffer){
+         component_editor::Value next;next.text=buffer;commit(field,next);
+        }
+        break;
+       }
+       case TC_COMPONENT_FIELD_FLOAT:{
+        float edited=static_cast<float>(value.real);
+        api.inputFloat("##v",&edited,0.f,0.f,"%.6g",0);
+        if(api.deactivatedAfterEdit()&&edited!=value.real){
+         component_editor::Value next;next.real=edited;commit(field,next);
+        }
+        break;
+       }
+       case TC_COMPONENT_FIELD_FLOAT_WIDTH:{
+        /* The width-aware decimal box: text in, pattern out.  Text that is not a
+           number is refused (the box goes back to the value the instance really
+           holds), which is the same contract the hexadecimal row next to it
+           keeps - and the same one the Mod's own FP32 decimal field had before
+           the rows moved into the host. */
+        char* buffer=edit.texts[index].data();
+        api.inputText("##v",buffer,edit.texts[index].size(),0,nullptr,nullptr);
+        if(api.deactivatedAfterEdit()){
+         uint64_t pattern=0;
+         std::string note;
+         if(!component_editor::parseFloatText(field,buffer,&pattern,&note)){
+          logger("Component editor: field \""+field.id+"\" on instance "+
+                 hexValue(instance)+" is not a decimal number (\""+buffer+
+                 "\"); the configuration keeps its old value");
+          std::snprintf(buffer,edit.texts[index].size(),"%s",
+                        component_editor::formatFloatText(field,value.integer).c_str());
+         }else{
+          if(!note.empty())logger("Component editor: "+note);
+          if(static_cast<uint64_t>(value.integer)!=pattern){
+           component_editor::Value next;next.integer=static_cast<int64_t>(pattern);
+           commit(field,next);
+          }
+         }
+        }
+        break;
+       }
+        case TC_COMPONENT_FIELD_COLOR_RGBA8:{
+         const uint32_t packed=static_cast<uint32_t>(value.integer);
+         /* V4's swatch strip: a palette is the same edit as the colour widget,
+            drawn as the presets the type declared - one click instead of a drag
+            to a remembered corner of the picker.  The strip comes first so the
+            two shapes compose into one row. */
+         if(field.colorPalette&&!field.swatches.empty()){
+          const float gap=4.f;
+          const float slots=static_cast<float>(field.swatches.size());
+          float swatchSize=(fieldWidth-gap*(slots-1.f))/slots;
+          const float swatchCap=ink*1.5f;
+          if(swatchSize>swatchCap)swatchSize=swatchCap;
+          if(swatchSize<6.f)swatchSize=6.f;
+          if(field.id!=swatchField){
+           swatchField=field.id;
+           for(auto& rect:swatchRect){rect[0]=rect[1]=rect[2]=rect[3]=-1.f;}
+          }
+          for(size_t choice=0;choice<field.swatches.size();++choice){
+           if(choice)api.sameLine(0.f,gap);
+           const std::string id="##sw"+std::to_string(choice);
+           if(api.invisibleButton)api.invisibleButton(id.c_str(),EditorApi::Vec2{swatchSize,swatchSize},0);
+           EditorApi::Vec2 low{},high{};
+           if(api.itemRectMin&&api.itemRectMax){api.itemRectMin(&low);api.itemRectMax(&high);}
+           if(high.x>low.x&&high.y>low.y){
+            if(api.windowDrawList){
+             void* list=api.windowDrawList();
+             renderRectFilled(list,{low.x,low.y},{high.x,high.y},field.swatches[choice],3.f,0);
+             renderRect(list,{low.x,low.y},{high.x,high.y},
+                        field.swatches[choice]==packed?0xffffffffu:0x50000000u,3.f,0,
+                        field.swatches[choice]==packed?2.f:1.f);
+            }
+            /* Published (change-gated) so a playtest clicks the swatch the host
+               drew: the strip's geometry follows the row width, which follows
+               the window the player happened to size. */
+            if(choice<TC_COMPONENT_EDITOR_MAX_PALETTE_SWATCHES&&
+               (low.x!=swatchRect[choice][0]||low.y!=swatchRect[choice][1])){
+             swatchRect[choice][0]=low.x;swatchRect[choice][1]=low.y;
+             swatchRect[choice][2]=high.x;swatchRect[choice][3]=high.y;
+             logger("Component editor: swatch instance="+hexValue(instance)+" field=\""+field.id+
+                    "\" index="+std::to_string(choice)+" rect="+
+                    std::to_string((int)low.x)+","+std::to_string((int)low.y)+","+
+                    std::to_string((int)high.x)+","+std::to_string((int)high.y));
+            }
+           }
+           if(api.itemHovered&&api.itemHovered(0)){
+            const std::string literal=component_editor::formatColorLiteral(field.swatches[choice]);
+            if(api.beginTooltip&&api.text&&api.endTooltip){
+             api.beginTooltip();api.text(literal.c_str(),nullptr);api.endTooltip();
+            }
+            if(api.itemClicked&&api.itemClicked(0)&&field.swatches[choice]!=packed){
+             component_editor::Value next;
+             next.integer=static_cast<int64_t>(field.swatches[choice]);
+             commit(field,next);
+            }
+           }
+          }
+         }else{
+          float color[4]={float(packed&0xffu)/255.f,float((packed>>8)&0xffu)/255.f,
+                          float((packed>>16)&0xffu)/255.f,float((packed>>24)&0xffu)/255.f};
+          const bool changed=api.colorEdit4&&api.colorEdit4("##v",color,0);
+          if(changed){
+           /* A drag is one gesture, so it is one undo step: the storage
+              transaction is opened on the first change and closed when the
+              widget goes inactive.  A staged table writes nothing at all here -
+              its whole batch is one write on Apply - so the transaction is
+              skipped rather than opened and left hanging. */
+           if(!staged&&!edit.colorTransaction&&
+              tc::logic::storageBeginEdit(&handle)==TC_COMPONENT_STORAGE_OK){
+            edit.colorTransaction=true;edit.colorField=field.id;
+           }
+           auto channel=[](float v){return static_cast<uint32_t>(std::lround(
+               std::max(0.f,std::min(1.f,v))*255.f));};
+           component_editor::Value next;
+           next.integer=static_cast<int64_t>(channel(color[0])|(channel(color[1])<<8)|
+                        (channel(color[2])<<16)|(channel(color[3])<<24));
+           commit(field,next);
+          }
+          if(!staged&&edit.colorTransaction&&edit.colorField==field.id&&api.itemActive&&
+             !api.itemActive()){
+           tc::logic::storageCommitEdit(&handle);edit.colorTransaction=false;edit.colorField.clear();
+          }
+         }
+         /* V4's mixed row: the exact four bytes, typed the way the log prints
+            them.  Text the parser cannot read is refused and the box goes back
+            to what the instance holds, the same contract the UINT hex row and
+            the width-aware float rows keep. */
+         if(field.colorHex){
+          api.sameLine(0.f,8.f);
+          const float hexWidth=std::min(fieldWidth,ink*9.5f);
+          api.setNextItemWidth(hexWidth>60.f?hexWidth:60.f);
+          char* buffer=edit.texts[index].data();
+          api.inputText("##c",buffer,edit.texts[index].size(),0,nullptr,nullptr);
+          if(api.deactivatedAfterEdit()){
+           uint32_t parsed=0;
+           if(!component_editor::parseColorHex(buffer,&parsed)){
+            logger("Component editor: field \""+field.id+"\" on instance "+
+                   hexValue(instance)+" is not a colour (\""+buffer+
+                   "\"); the configuration keeps its old value");
+            fillTextBuffer(field,index);
+           }else if(parsed!=packed){
+            component_editor::Value next;
+            next.integer=static_cast<int64_t>(parsed);
+            commit(field,next);
+           }
+          }
+         }
+         break;
+        }
+       default:break;
+      }
+     }
+    }
+     if(field.kind!=TC_COMPONENT_FIELD_CUSTOM&&field.action&&api.itemHovered&&
+        api.itemHovered(0)&&api.mouseDoubleClicked&&api.mouseDoubleClicked(0)){
+      EditorApi::Vec2 mouse{};if(api.mousePos)api.mousePos(&mouse);
+      sendAction(field,TC_COMPONENT_EDITOR_ACTION_DOUBLE_CLICK,0,mouse.x,mouse.y,0.f,0.f);
+     }
+     if(field.kind!=TC_COMPONENT_FIELD_CUSTOM&&field.action&&!field.contextActionIds.empty()&&
+        api.beginPopupContextItem&&api.selectable&&api.endPopup){
+      if(api.beginPopupContextItem("##context",1)){
+       const bool freshMenu=!menuOpen;menuOpen=true;
+       for(size_t actionIndex=0;actionIndex<field.contextActionIds.size();++actionIndex){
+        if(api.selectable(field.contextActionLabels[actionIndex].c_str(),false,0,
+                          EditorApi::Vec2{0.f,0.f})){
+         EditorApi::Vec2 mouse{};if(api.mousePos)api.mousePos(&mouse);
+         sendAction(field,TC_COMPONENT_EDITOR_ACTION_MENU,field.contextActionIds[actionIndex],
+                    mouse.x,mouse.y,0.f,0.f);
+        }
+        publishMenuEntry(freshMenu,actionIndex,field.id,field.contextActionIds[actionIndex]);
+       }
+       api.endPopup();
+      }else menuOpen=false;
+     }else menuOpen=false;
+     if(index<edit.validation.size()&&!edit.validation[index].empty()){
+      const int status=edit.validationStatus[index];
+      if(field.validationIcon){
+       /* V4: the message costs the row nothing - it is a small marker at the end
+          of the control, with the text on hover and in the log.  Drawing it with
+          the window's own draw list instead of an ImGui item is deliberate: the
+          marker must not move the cursor, or the next row would start beside it
+          instead of under it. */
+       EditorApi::Vec2 low{},high{};
+       if(field.kind==TC_COMPONENT_FIELD_CUSTOM&&customMax.x>customMin.x){
+        low=customMin;high=customMax;
+       }else if(api.itemRectMin&&api.itemRectMax){
+        api.itemRectMin(&low);api.itemRectMax(&high);
+       }
+       if(high.x>low.x&&high.y>low.y&&api.windowDrawList){
+        const float size=std::max(8.f,ink*0.95f);
+        float x=high.x+6.f;
+        const float limit=havePanel?panelRight-kEditorPanelMargin:1e9f;
+        if(x+size>limit)x=std::max(low.x,limit-size-2.f);
+        if(x<low.x)x=low.x;
+        const float y=low.y+std::max(0.f,(high.y-low.y-size)*0.5f);
+        void* list=api.windowDrawList();
+        const uint32_t marker=status<0?0xff3030ffu:0xff20b0ffu;
+        renderRectFilled(list,{x,y},{x+size,y+size},marker,2.f,0);
+        renderRect(list,{x,y},{x+size,y+size},0x80000000u,2.f,0,1.f);
+        if(validationIconField!=field.id||x!=validationIconRect[0]||y!=validationIconRect[1]){
+         validationIconField=field.id;
+         validationIconRect[0]=x;validationIconRect[1]=y;
+         validationIconRect[2]=x+size;validationIconRect[3]=y+size;
+         logger("Component editor: validation icon instance="+hexValue(instance)+
+                " field=\""+field.id+"\" status="+std::to_string(status)+" rect="+
+                std::to_string((int)x)+","+std::to_string((int)y)+","+
+                std::to_string((int)(x+size))+","+std::to_string((int)(y+size)));
+        }
+        EditorApi::Vec2 mouse{};
+        if(api.mousePos)api.mousePos(&mouse);
+        if(mouse.x>=x&&mouse.x<=x+size&&mouse.y>=y&&mouse.y<=y+size){
+         if(api.beginTooltip&&api.text&&api.endTooltip){
+          api.beginTooltip();
+          api.text(status<0?"Error":"Warning",nullptr);
+          api.text(edit.validation[index].c_str(),nullptr);
+          api.endTooltip();
+         }
+         if(validationTipField!=field.id+"|"+edit.validation[index]){
+          validationTipField=field.id+"|"+edit.validation[index];
+          logger("Component editor: validation tip instance="+hexValue(instance)+
+                 " field=\""+field.id+"\" status="+std::to_string(status)+
+                 " message=\""+edit.validation[index]+"\"");
+         }
+        }
+       }
+      }else{
+       const std::string hint=(status<0?"Error: ":"Warning: ")+edit.validation[index];
+       api.textDisabled(hint.c_str(),nullptr);
+      }
+     }
+    /* The row rectangle a playtest clicks by; only when asked for, because it
+       is one log line per row per second. */
+    if(traceFrame){
+     EditorApi::Vec2 low{},high{};
+     if(field.kind==TC_COMPONENT_FIELD_CUSTOM&&customMax.x>customMin.x){
+      low=customMin;high=customMax;
+     }else{
+      api.itemRectMin(&low);api.itemRectMax(&high);
+     }
+     std::string line="Component editor: row instance="+hexValue(instance)+" field=\""+field.id+
+                      "\" rect="+std::to_string((int)low.x)+","+std::to_string((int)low.y)+","+
+                      std::to_string((int)high.x)+","+std::to_string((int)high.y)+
+                      " value=\""+component_editor::display(field,value)+"\""+
+                      " active="+std::to_string(api.itemActive()?1:0)+
+                      " focused="+std::to_string(api.itemFocused()?1:0);
+     if(field.kind==TC_COMPONENT_FIELD_TEXT||field.kind==TC_COMPONENT_FIELD_FLOAT_WIDTH)
+      line+=" buffer=\""+std::string(edit.texts[index].data())+"\"";
+     logger(line);
+    }
+   api.popId();
+  }
+   /* V4: a table declared with TC_COMPONENT_EDITOR_TABLE_CONFIRM ends with the
+      two buttons that decide what happens to its staged edits.  Apply is one
+      configuration write, so however many fields were touched the batch is one
+      undo step and one on_config_changed; Cancel re-reads the instance and
+      throws the staged bytes away. */
+   if(staged){
+    int changed=0;
+    for(size_t index=0;index<fields.size();++index){
+     const component_editor::Field& field=fields[index];
+     if(!field.bytes||static_cast<uint64_t>(field.offset)+field.bytes>edit.committed.size())
+      continue;
+     if(std::memcmp(edit.committed.data()+field.offset,edit.bytes.data()+field.offset,
+                    field.bytes)!=0)
+      ++changed;
+    }
+    api.separator();
+    const bool applyPressed=api.button("Apply###tc-editor-apply",EditorApi::Vec2{0.f,0.f});
+    EditorApi::Vec2 applyMin{},applyMax{};
+    if(api.itemRectMin&&api.itemRectMax){api.itemRectMin(&applyMin);api.itemRectMax(&applyMax);}
+    api.sameLine(0.f,-1.f);
+    const bool cancelPressed=api.button("Cancel###tc-editor-cancel",EditorApi::Vec2{0.f,0.f});
+    EditorApi::Vec2 cancelMin{},cancelMax{};
+    if(api.itemRectMin&&api.itemRectMax){api.itemRectMin(&cancelMin);api.itemRectMax(&cancelMax);}
+    if(applyMax.x>applyMin.x&&
+       (applyMin.x!=dialogApplyRect[0]||applyMin.y!=dialogApplyRect[1]||
+        cancelMin.x!=dialogCancelRect[0]||dialogPending!=changed)){
+     dialogApplyRect[0]=applyMin.x;dialogApplyRect[1]=applyMin.y;
+     dialogApplyRect[2]=applyMax.x;dialogApplyRect[3]=applyMax.y;
+     dialogCancelRect[0]=cancelMin.x;dialogCancelRect[1]=cancelMin.y;
+     dialogCancelRect[2]=cancelMax.x;dialogCancelRect[3]=cancelMax.y;
+     dialogPending=changed;
+     logger("Component editor: dialog instance="+hexValue(instance)+" apply="+
+            std::to_string((int)applyMin.x)+","+std::to_string((int)applyMin.y)+","+
+            std::to_string((int)applyMax.x)+","+std::to_string((int)applyMax.y)+
+            " cancel="+std::to_string((int)cancelMin.x)+","+std::to_string((int)cancelMin.y)+
+            ","+std::to_string((int)cancelMax.x)+","+std::to_string((int)cancelMax.y)+
+            " pending="+std::to_string(changed));
+    }
+    if(applyPressed){
+     std::vector<size_t> touched;
+     for(size_t index=0;index<fields.size();++index){
+      const component_editor::Field& field=fields[index];
+      if(!field.bytes||static_cast<uint64_t>(field.offset)+field.bytes>edit.committed.size())
+       continue;
+      if(std::memcmp(edit.committed.data()+field.offset,edit.bytes.data()+field.offset,
+                     field.bytes)!=0)
+       touched.push_back(index);
+     }
+     if(touched.empty()){
+      logger("Component editor: Apply on instance "+hexValue(instance)+
+             " had nothing staged");
+     }else{
+      bool rejected=false;
+      for(size_t index:touched){
+       const component_editor::Field& field=fields[index];
+       const int validation=runValidator(field,edit.bytes,index);
+       if(validation>0){
+        logger("Component editor: validator warned for field \""+field.id+"\" on instance "+
+               hexValue(instance)+": "+edit.validation[index]);
+        continue;
+       }
+       if(validation<0){
+        if(edit.validation[index].empty())edit.validation[index]="value rejected";
+        logger("Component editor: validator refused field \""+field.id+"\" on instance "+
+               hexValue(instance)+": "+edit.validation[index]);
+        rejected=true;
+        break;
+       }
+      }
+      if(rejected){
+       logger("Component editor: the staged edits of instance "+hexValue(instance)+
+              " were not applied");
+      }else{
+       const int status=tc::logic::storageWriteConfig(&handle,info.config_schema,
+                                                      edit.bytes.data(),
+                                                      static_cast<uint32_t>(edit.bytes.size()));
+       if(status!=TC_COMPONENT_STORAGE_OK){
+        logger("Component editor: the configuration write for instance "+hexValue(instance)+
+               " was refused ("+std::to_string(status)+"); the staged edits are kept");
+       }else{
+        logger("Component editor: applied "+std::to_string(touched.size())+
+               " staged field(s) on instance "+hexValue(instance)+" in one step");
+        edit.valid=false;edit.pending=false;
+       }
+      }
+     }
+    }
+    if(cancelPressed){
+     int dropped=0;
+     for(size_t index=0;index<fields.size();++index){
+      const component_editor::Field& field=fields[index];
+      if(!field.bytes||static_cast<uint64_t>(field.offset)+field.bytes>edit.committed.size())
+       continue;
+      if(std::memcmp(edit.committed.data()+field.offset,edit.bytes.data()+field.offset,
+                     field.bytes)!=0)
+       ++dropped;
+     }
+     uint32_t written=0;
+     if(tc::logic::storageReadConfig(&handle,edit.bytes.data(),info.config_size,&written)==
+        TC_COMPONENT_STORAGE_OK&&written==info.config_size){
+      edit.committed=edit.bytes;edit.pending=false;edit.revision=info.config_revision;
+      for(size_t index=0;index<fields.size()&&index<component_editor::kMaxFields;++index)
+       fillTextBuffer(fields[index],index);
+      for(auto& message:edit.validation)message.clear();
+      for(auto& status:edit.validationStatus)status=0;
+      logger("Component editor: cancelled "+std::to_string(dropped)+
+             " staged field(s) on instance "+hexValue(instance));
+     }else{
+      logger("Component editor: the configuration of instance "+hexValue(instance)+
+             " could not be re-read, so Cancel left the staged edits alone");
+     }
+    }
+   }
+   /* The window's own size, read while it is the current one. */
+   {
+    EditorApi::Vec2 origin{},size{};
+    api.windowPos(&origin);api.windowSize(&size);
+    lastEditorWindowHeight=size.y;
+    lastEditorScrollMax=api.scrollMaxY?api.scrollMaxY():0.f;
+    if(traceFrame)
+     logger("Component editor: window instance="+hexValue(instance)+" pos="+
+            std::to_string((int)origin.x)+","+std::to_string((int)origin.y)+" size="+
+            std::to_string((int)size.x)+","+std::to_string((int)size.y)+" rows="+
+            std::to_string(fields.size())+" scrollmax="+
+            std::to_string((int)(api.scrollMaxY?api.scrollMaxY():0.f))+
+            " panel="+std::to_string((int)panelLeft)+","+std::to_string((int)panelTop)+","+
+            std::to_string((int)panelRight)+","+std::to_string((int)panelBottom)+
+            " toggle="+std::to_string((int)panelToggleMin[0])+","+
+            std::to_string((int)panelToggleMin[1])+","+
+            std::to_string((int)panelToggleMax[0])+","+
+            std::to_string((int)panelToggleMax[1]));
+   }
+   api.popId();
+  }
+  api.end();
  }
  static bool renderFinite(float value){return std::isfinite(value)&&std::abs(value)<10000000.f;}
  static RenderDrawContext* renderContext(void* context){
@@ -3503,7 +6694,7 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
  }
  /* The same measurement the game takes before it lays a label out, so a Mod can
     right-align a name or shrink a value that would not fit its own body. */
- static int component_render_measure_text(void* context,float size,int bold,const char* utf8,
+static int component_render_measure_text(void* context,float size,int bold,const char* utf8,
                                           float* width,float* height){
   auto* draw=renderContext(context);
   if(!draw||!renderFinite(size)||!(size>0.f)||size>4096.f||!utf8||!width||!height)
@@ -3524,6 +6715,110 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
   if(!renderFinite(measured.x)||!renderFinite(measured.y)||measured.x<=0.f||measured.y<=0.f)
    return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
   *width=measured.x;*height=measured.y;
+  return TC_COMPONENT_RENDER_OK;
+ }
+ static ComponentFont* componentFont(Loaded* plugin,uint64_t handle){
+  if(!plugin||!handle)return nullptr;
+  for(auto& item:plugin->fonts)if(item.second.handle==handle)return &item.second;
+  return nullptr;
+ }
+ static int component_render_text_font(void* context,uint64_t fontHandle,float x,float y,float size,
+                                       uint32_t color,uint32_t style,const char* utf8){
+  auto* draw=renderContext(context);
+  if(!draw||!renderFinite(x)||!renderFinite(y)||!renderFinite(size)||!(size>0.f)||
+     size>4096.f||!utf8||(style&~TC_COMPONENT_TEXT_KNOWN_FLAGS))
+   return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  const size_t length=strnlen(utf8,4097);if(length>4096)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  if(!length)return TC_COMPONENT_RENDER_OK;
+  void* font=nullptr;uint64_t renderer=0;ComponentFont* custom=nullptr;
+  if(fontHandle){
+   custom=componentFont(draw->plugin,fontHandle);if(!custom)return TC_COMPONENT_RENDER_ERR_FONT;
+   if(!draw->owner->textures.resolve(draw->plugin,custom->texture,&renderer))
+    return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+   font=custom->font;
+   auto setTex=reinterpret_cast<void(*)(void*,uint64_t)>(
+       GetProcAddress(draw->owner->engine,"ImFontAtlas_SetTexID"));
+   if(setTex)setTex(custom->atlas,renderer);
+   if(!draw->owner->renderPushTexture||!draw->owner->renderPopTexture)
+    return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  }else if(style&TC_COMPONENT_TEXT_BOLD){
+   if(!draw->owner->boldTextFont)draw->owner->resolveToolTextFont();
+   font=draw->owner->boldTextFont;
+  }
+  if(!renderCommand(draw))return TC_COMPONENT_RENDER_ERR_CAPACITY;
+  if(custom)draw->owner->renderPushTexture(draw->list,renderer);
+  const auto paint=[&](float px,float py){
+   draw->owner->sizedText(draw->list,{px,py},color,utf8,utf8+length,size,font);
+   if(custom&&(style&TC_COMPONENT_TEXT_BOLD))
+    draw->owner->sizedText(draw->list,{px+std::max(0.5f,size*0.025f),py},color,
+                           utf8,utf8+length,size,font);
+  };
+  if(style&TC_COMPONENT_TEXT_ITALIC){
+   RenderVec2 measured{size,size};
+   if(font&&draw->owner->renderCalcTextSize)
+    draw->owner->renderCalcTextSize(&measured,font,size,4096.f,0.f,utf8,utf8+length,nullptr);
+   const float height=std::max(4.f,measured.y);
+   const float reach=height*0.12f+2.f;
+   for(float offset=0.f;offset<height;offset+=1.f){
+    const float shift=0.22f*(height*0.5f-(offset+0.5f));
+    draw->owner->renderPushClip(draw->list,{x-reach+shift,y+offset},
+                                {x+measured.x+reach+shift,y+offset+1.f},true);
+    paint(x+shift,y);draw->owner->renderPopClip(draw->list);
+   }
+  }else paint(x,y);
+  if(custom)draw->owner->renderPopTexture(draw->list);
+  return TC_COMPONENT_RENDER_OK;
+ }
+ static int component_render_measure_font(void* context,uint64_t fontHandle,float size,
+                                          uint32_t style,const char* utf8,float* width,
+                                          float* height){
+  auto* draw=renderContext(context);
+  if(!draw||!renderFinite(size)||!(size>0.f)||size>4096.f||!utf8||!width||!height||
+     (style&~TC_COMPONENT_TEXT_KNOWN_FLAGS))return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  const size_t length=strnlen(utf8,4097);if(length>4096)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  void* font=nullptr;
+  if(fontHandle){auto* custom=componentFont(draw->plugin,fontHandle);
+   if(!custom)return TC_COMPONENT_RENDER_ERR_FONT;font=custom->font;
+  }else if(style&TC_COMPONENT_TEXT_BOLD){
+   if(!draw->owner->boldTextFont)draw->owner->resolveToolTextFont();font=draw->owner->boldTextFont;
+  }
+  if(!font){
+   auto* bytes=static_cast<unsigned char*>(draw->list);unsigned char* shared=nullptr;
+   std::memcpy(&shared,bytes+0x38,sizeof(shared));if(shared)std::memcpy(&font,shared+0x18,sizeof(font));
+  }
+  if(!font||!draw->owner->renderCalcTextSize)return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  RenderVec2 measured{};draw->owner->renderCalcTextSize(&measured,font,size,4096.f,0.f,
+                                                        utf8,utf8+length,nullptr);
+  if(!renderFinite(measured.x)||!renderFinite(measured.y))return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  if(style&TC_COMPONENT_TEXT_ITALIC)measured.x+=measured.y*0.22f;
+  if(fontHandle&&(style&TC_COMPONENT_TEXT_BOLD))measured.x+=std::max(0.5f,size*0.025f);
+  *width=measured.x;*height=measured.y;return TC_COMPONENT_RENDER_OK;
+ }
+ /* V3: one quad of a loader-owned image.  The handle is looked up in the calling
+    Mod's own table, so another Mod's image is simply unknown here; the pixels,
+    the GL object and its lifetime never leave the loader. */
+ static int component_render_image(void* context,uint64_t image,
+                                   const TCComponentRenderQuadV1* quad){
+  auto* draw=renderContext(context);
+  if(!draw||!quad)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  const float values[16]={quad->x0,quad->y0,quad->x1,quad->y1,
+                          quad->x2,quad->y2,quad->x3,quad->y3,
+                          quad->u0,quad->v0,quad->u1,quad->v1,
+                          quad->u2,quad->v2,quad->u3,quad->v3};
+  for(float value:values)if(!renderFinite(value))return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  if(!draw->plugin||!draw->owner->renderImageQuad)return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  const auto* entry=draw->plugin->images.find(image,
+      draw->instance.instance_id?&draw->instance:nullptr);
+  if(!entry)return TC_COMPONENT_RENDER_ERR_IMAGE;
+  uint64_t renderer=0;
+  if(!draw->owner->textures.resolve(draw->plugin,entry->texture,&renderer))
+   return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  if(!renderCommand(draw))return TC_COMPONENT_RENDER_ERR_CAPACITY;
+  draw->owner->renderImageQuad(draw->list,renderer,
+                               {quad->x0,quad->y0},{quad->x1,quad->y1},
+                               {quad->x2,quad->y2},{quad->x3,quad->y3},
+                               {quad->u0,quad->v0},{quad->u1,quad->v1},
+                               {quad->u2,quad->v2},{quad->u3,quad->v3},quad->tint);
   return TC_COMPONENT_RENDER_OK;
  }
  static int component_render_set_callback_api(void* context,uint64_t customId,TCComponentRenderCallbackV1 callback,void* user){
@@ -3615,12 +6910,240 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
   }
   return TC_COMPONENT_RENDER_OK;
  }
+ /* tc.component.render V7: load an image for this Mod's own draw callbacks.
+    The loader reads the PNG once, decodes it with the same WIC path it uses for
+    plugin textures, creates the GL object in its texture manager (owner = this
+    Mod, so unload/reject frees it) and remembers only the name -> handle pair. */
+ int loadComponentImage(Loaded& plugin,const char* key,const char* path,
+                         TCComponentRenderImageV1* out,
+                         const TCComponentInstanceHandle* scope=nullptr){
+  if(!out||out->size<sizeof(*out)||!key||!path)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  if(!textures.onThread())return TC_COMPONENT_RENDER_ERR_THREAD;
+  if(!plugin.accepting&&!plugin.active)return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+   if(scope){
+    if(std::find(plugin.componentIds.begin(),plugin.componentIds.end(),scope->custom_id)==
+       plugin.componentIds.end())return TC_COMPONENT_RENDER_ERR_OWNERSHIP;
+    TCComponentStorageInfoV1 scopeInfo{};scopeInfo.size=sizeof(scopeInfo);
+    if(tc::logic::storageInfo(scope,&scopeInfo)!=TC_COMPONENT_STORAGE_OK)
+     return TC_COMPONENT_RENDER_ERR_IMAGE;
+   }
+  const std::string name(key);
+  if(!component_images::validKey(name))return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  try{
+   const fs::path file=fs::u8path(path);
+   if(!file.is_absolute())return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+   const DWORD attributes=GetFileAttributesW(file.c_str());
+   if(attributes==INVALID_FILE_ATTRIBUTES||(attributes&FILE_ATTRIBUTE_DIRECTORY)||
+      (attributes&FILE_ATTRIBUTE_REPARSE_POINT))
+    return TC_COMPONENT_RENDER_ERR_IMAGE;
+   std::error_code error;
+   const auto length=fs::file_size(file,error);
+   if(error||!length||length>TC_COMPONENT_RENDER_MAX_IMAGE_FILE_BYTES)
+    return TC_COMPONENT_RENDER_ERR_IMAGE;
+   const auto bytes=read(file);
+   std::vector<unsigned char> pixels;
+   uint32_t width=0,height=0;
+   if(!ui_texture::decode(bytes.data(),bytes.size(),pixels,width,height))
+    return TC_COMPONENT_RENDER_ERR_IMAGE;
+   TCUiTexturePixels definition{sizeof(TCUiTexturePixels),width,height,0,pixels.data(),
+                                pixels.size()};
+   TCUiTexture texture{};
+   texture.size=sizeof(texture);
+   if(textures.create(&plugin,&definition,&texture)!=0)return TC_COMPONENT_RENDER_ERR_IMAGE;
+   const auto retire=[this,&plugin](uint64_t handle){textures.release(&plugin,handle);};
+   component_images::Image stored{};
+    const int status=plugin.images.loadScoped(scope,name,texture.handle,texture.renderer_id,width,height,
+                                       static_cast<uint64_t>(pixels.size()),
+                                       &nextImageHandle,retire,&stored);
+   if(status!=TC_COMPONENT_RENDER_OK){
+    /* The table refused (quota, key, size): the texture created above has no
+       owner left, so retire it rather than leak it. */
+    textures.release(&plugin,texture.handle);
+    return status;
+   }
+   out->image=stored.image;
+   out->width=stored.width;
+   out->height=stored.height;
+   out->revision=stored.revision;
+   logger("Component render: image \""+name+"\" for "+plugin.id+" is "+
+          std::to_string(width)+"x"+std::to_string(height)+" (revision "+
+          std::to_string(stored.revision)+")");
+   return TC_COMPONENT_RENDER_OK;
+  }catch(...){return TC_COMPONENT_RENDER_ERR_IMAGE;}
+ }
+ static int component_render_load_image_api(void* context,const char* key,const char* path,
+                                            TCComponentRenderImageV1* out){
+  auto& p=*static_cast<Loaded*>(context);
+  return p.owner->loadComponentImage(p,key,path,out);
+ }
+ static int component_render_load_instance_image_api(
+     void* context,const TCComponentInstanceHandle* instance,const char* key,const char* path,
+     TCComponentRenderImageV1* out){
+  if(!context||!instance)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(context);
+  return p.owner->loadComponentImage(p,key,path,out,instance);
+ }
+ static int component_render_release_image_api(void* context,const char* key){
+  auto& p=*static_cast<Loaded*>(context);
+  return p.owner->releaseComponentImage(p,key);
+ }
+ int releaseComponentImage(Loaded& plugin,const char* key){
+  if(!textures.onThread())return TC_COMPONENT_RENDER_ERR_THREAD;
+  if(!plugin.accepting&&!plugin.active)return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  const auto retire=[this,&plugin](uint64_t handle){textures.release(&plugin,handle);};
+  return plugin.images.clear(key?std::string(key):std::string(),retire);
+ }
+ static int component_render_release_instance_image_api(
+     void* context,const TCComponentInstanceHandle* instance,const char* key){
+  if(!context||!instance)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(context);auto& r=*p.owner;
+  if(!r.textures.onThread())return TC_COMPONENT_RENDER_ERR_THREAD;
+  if(std::find(p.componentIds.begin(),p.componentIds.end(),instance->custom_id)==p.componentIds.end())
+   return TC_COMPONENT_RENDER_ERR_OWNERSHIP;
+  const auto retire=[&r,&p](uint64_t handle){r.textures.release(&p,handle);};
+  return p.images.clearScoped(instance,key?std::string(key):std::string(),retire);
+ }
+ void destroyComponentFont(Loaded& plugin,ComponentFont& font){
+  if(font.texture)textures.release(&plugin,font.texture);
+  auto destroy=reinterpret_cast<void(*)(void*)>(GetProcAddress(engine,"ImFontAtlas_destroy"));
+  if(font.atlas&&destroy)destroy(font.atlas);
+  font=ComponentFont{};
+ }
+ int loadComponentFont(Loaded& plugin,const char* key,const char* path,float nativeSize,
+                       const TCComponentRenderFontRangeV1* ranges,uint32_t rangeCount,
+                       TCComponentRenderFontV1* out){
+  if(!out||out->size<sizeof(*out)||!key||!path||!renderCalcTextSize||
+     !renderPushTexture||!renderPopTexture||!std::isfinite(nativeSize)||nativeSize<4.f||
+     nativeSize>512.f||rangeCount>TC_COMPONENT_RENDER_MAX_FONT_RANGES||
+     (rangeCount&&!ranges))return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  if(!textures.onThread())return TC_COMPONENT_RENDER_ERR_THREAD;
+  if(!plugin.accepting&&!plugin.active)return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  const std::string name(key);if(!component_images::validKey(name))return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  auto atlasNew=reinterpret_cast<void*(*)()>(GetProcAddress(engine,"ImFontAtlas_ImFontAtlas"));
+  auto atlasDestroy=reinterpret_cast<void(*)(void*)>(GetProcAddress(engine,"ImFontAtlas_destroy"));
+  auto memAlloc=reinterpret_cast<void*(*)(size_t)>(GetProcAddress(engine,"igMemAlloc"));
+  auto memFree=reinterpret_cast<void(*)(void*)>(GetProcAddress(engine,"igMemFree"));
+  /* `ImWchar` is 32 bits in this build (see the glyph-range note below), so the
+     range table is a `uint32_t` pair list terminated by zero. */
+  auto addFont=reinterpret_cast<void*(*)(void*,void*,int,float,const void*,const uint32_t*)>(
+      GetProcAddress(engine,"ImFontAtlas_AddFontFromMemoryTTF"));
+  auto build=reinterpret_cast<bool(*)(void*)>(GetProcAddress(engine,"ImFontAtlas_Build"));
+  auto texData=reinterpret_cast<void(*)(void*,unsigned char**,int*,int*,int*)>(
+      GetProcAddress(engine,"ImFontAtlas_GetTexDataAsRGBA32"));
+  auto setTex=reinterpret_cast<void(*)(void*,uint64_t)>(GetProcAddress(engine,"ImFontAtlas_SetTexID"));
+  if(!atlasNew||!atlasDestroy||!memAlloc||!memFree||!addFont||!build||!texData||!setTex)
+   return TC_COMPONENT_RENDER_ERR_UNAVAILABLE;
+  try{
+   const fs::path file=fs::u8path(path);if(!file.is_absolute())return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+   const DWORD attributes=GetFileAttributesW(file.c_str());
+   if(attributes==INVALID_FILE_ATTRIBUTES||(attributes&FILE_ATTRIBUTE_DIRECTORY)||
+      (attributes&FILE_ATTRIBUTE_REPARSE_POINT))return TC_COMPONENT_RENDER_ERR_FONT;
+   std::error_code error;const auto length=fs::file_size(file,error);
+   if(error||!length||length>TC_COMPONENT_RENDER_MAX_FONT_FILE_BYTES||length>INT_MAX)
+    return TC_COMPONENT_RENDER_ERR_FONT;
+   const auto found=plugin.fonts.find(name);
+   if(found==plugin.fonts.end()&&plugin.fonts.size()>=TC_COMPONENT_RENDER_MAX_FONTS)
+    return TC_COMPONENT_RENDER_ERR_FONT;
+   /* The glyph ranges this build's ImGui wants are 32-bit `ImWchar` pairs: its
+      own default table is `20 00 00 00 / ff 00 00 00 / 0` (IMGUI_USE_WCHAR32),
+      so a 16-bit pair table is read as a different - wrong - set and the face
+      ends up with glyphs the drawn text never asks for.  Measured 2026-09-28:
+      the text with such a face produced no vertices at all, while the atlas and
+      its texture were fine. */
+   std::vector<uint32_t> glyphs;
+   if(rangeCount){glyphs.reserve(rangeCount*2+1);
+    for(uint32_t index=0;index<rangeCount;++index){
+     if(ranges[index].first<1||ranges[index].first>ranges[index].last||
+        ranges[index].last>0xffffu)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+     glyphs.push_back(ranges[index].first);
+     glyphs.push_back(ranges[index].last);
+    }
+    glyphs.push_back(0);
+   }
+   const auto bytes=read(file);void* atlas=atlasNew();if(!atlas)return TC_COMPONENT_RENDER_ERR_FONT;
+   void* owned=memAlloc(bytes.size());
+   if(!owned){atlasDestroy(atlas);return TC_COMPONENT_RENDER_ERR_FONT;}
+   std::memcpy(owned,bytes.data(),bytes.size());
+   void* face=addFont(atlas,owned,static_cast<int>(bytes.size()),nativeSize,nullptr,
+                      glyphs.empty()?nullptr:glyphs.data());
+   if(!face){memFree(owned);atlasDestroy(atlas);return TC_COMPONENT_RENDER_ERR_FONT;}
+   if(!build(atlas)){atlasDestroy(atlas);return TC_COMPONENT_RENDER_ERR_FONT;}
+   unsigned char* rgba=nullptr;int width=0,height=0,bpp=0;
+   texData(atlas,&rgba,&width,&height,&bpp);
+   uint64_t pixelBytes=0;
+   if(!rgba||bpp!=4||width<=0||height<=0||
+      !ui_texture::pixelBytes(static_cast<uint32_t>(width),static_cast<uint32_t>(height),pixelBytes)){
+    atlasDestroy(atlas);return TC_COMPONENT_RENDER_ERR_FONT;
+   }
+   TCUiTexturePixels pixels{sizeof(TCUiTexturePixels),static_cast<uint32_t>(width),
+                            static_cast<uint32_t>(height),0,rgba,pixelBytes};
+   TCUiTexture texture{};texture.size=sizeof(texture);
+   if(textures.create(&plugin,&pixels,&texture)!=0){atlasDestroy(atlas);return TC_COMPONENT_RENDER_ERR_FONT;}
+   setTex(atlas,texture.renderer_id);
+   ComponentFont replacement;replacement.texture=texture.handle;replacement.nativeSize=nativeSize;
+   replacement.atlas=atlas;replacement.font=face;
+   if(found==plugin.fonts.end()){replacement.handle=nextFontHandle++;plugin.fonts.emplace(name,replacement);}
+   else {replacement.handle=found->second.handle;replacement.revision=found->second.revision+1;
+    ComponentFont old=found->second;found->second=replacement;destroyComponentFont(plugin,old);
+   }
+   const ComponentFont& stored=plugin.fonts.find(name)->second;
+   out->font=stored.handle;out->native_size=stored.nativeSize;out->revision=stored.revision;
+   logger("Component render: font \""+name+"\" for "+plugin.id+" loaded (revision "+
+          std::to_string(stored.revision)+")");
+   return TC_COMPONENT_RENDER_OK;
+  }catch(...){return TC_COMPONENT_RENDER_ERR_FONT;}
+ }
+ static int component_render_load_font_api(void* context,const char* key,const char* path,
+                                           float nativeSize,
+                                           const TCComponentRenderFontRangeV1* ranges,
+                                           uint32_t rangeCount,TCComponentRenderFontV1* out){
+  if(!context)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(context);
+  return p.owner->loadComponentFont(p,key,path,nativeSize,ranges,rangeCount,out);
+ }
+ static int component_render_release_font_api(void* context,const char* key){
+  if(!context)return TC_COMPONENT_RENDER_ERR_ARGUMENT;auto& p=*static_cast<Loaded*>(context);
+  auto& r=*p.owner;if(!r.textures.onThread())return TC_COMPONENT_RENDER_ERR_THREAD;
+  if(!key){for(auto& item:p.fonts)r.destroyComponentFont(p,item.second);p.fonts.clear();return TC_COMPONENT_RENDER_OK;}
+  auto found=p.fonts.find(key);if(found==p.fonts.end())return TC_COMPONENT_RENDER_ERR_FONT;
+  r.destroyComponentFont(p,found->second);p.fonts.erase(found);return TC_COMPONENT_RENDER_OK;
+ }
+ static int component_render_set_device_callback_api(void* context,
+     TCComponentRenderDeviceCallbackV1 callback,void* user){
+  if(!context)return TC_COMPONENT_RENDER_ERR_ARGUMENT;auto& p=*static_cast<Loaded*>(context);
+  auto& r=*p.owner;if(!r.gameThreadId||GetCurrentThreadId()!=r.gameThreadId)
+   return TC_COMPONENT_RENDER_ERR_THREAD;
+  p.deviceCallback=callback;p.deviceUser=user;p.deviceGeneration=r.textures.generation();
+  return TC_COMPONENT_RENDER_OK;
+ }
+ static int component_render_device_generation_api(void* context,uint64_t* generation){
+  if(!context||!generation)return TC_COMPONENT_RENDER_ERR_ARGUMENT;
+  auto& p=*static_cast<Loaded*>(context);*generation=p.owner->textures.generation();
+  return TC_COMPONENT_RENDER_OK;
+ }
  int queryComponentRenderService(Loaded& p,uint32_t version,void* out,uint32_t outSize){
   if(!out)return TC_SERVICE_ERR_ARGUMENT;
   if(!renderWorldToScreen||!renderGetIo||!renderGetMainViewport||!renderGetBackgroundDrawList||
      !renderLine||!renderRect||!renderRectFilled||!renderCircle||!renderCircleFilled||!renderText||
      !renderPushClip||!renderPopClip)return TC_SERVICE_ERR_UNAVAILABLE;
-  if(version==TC_COMPONENT_RENDER_API_VERSION_1){
+   if(version==TC_COMPONENT_RENDER_API_VERSION_8){
+    if(!renderImageQuad||!renderCalcTextSize||!renderPushTexture||!renderPopTexture||
+       !redrawComponentOriginal||!redrawSelectionOriginal||!igButtonOriginal||
+       !createTextureUnsafeOriginal||!redrawClipboardComponentOriginal||
+       !updateStateClipboardOriginal)return TC_SERVICE_ERR_UNAVAILABLE;
+    if(outSize<sizeof(TCComponentRenderApiV8))return TC_SERVICE_ERR_SIZE;
+    *static_cast<TCComponentRenderApiV8*>(out)=TCComponentRenderApiV8{
+        sizeof(TCComponentRenderApiV8),TC_COMPONENT_RENDER_API_VERSION_8,&p,
+        &component_render_set_callback_api,&component_render_set_default_drawing_api,
+        &component_render_set_selection_hint_api,&component_render_set_foundry_button_api,
+        &component_render_set_picture_api,&component_render_set_placement_preview_api,
+        &component_render_load_image_api,&component_render_release_image_api,
+        &component_render_load_font_api,&component_render_release_font_api,
+        &component_render_load_instance_image_api,&component_render_release_instance_image_api,
+        &component_render_set_device_callback_api,&component_render_device_generation_api};
+    return TC_SERVICE_OK;
+   }
+   if(version==TC_COMPONENT_RENDER_API_VERSION_1){
    if(outSize<sizeof(TCComponentRenderApiV1))return TC_SERVICE_ERR_SIZE;
    *static_cast<TCComponentRenderApiV1*>(out)=TCComponentRenderApiV1{
        sizeof(TCComponentRenderApiV1),TC_COMPONENT_RENDER_API_VERSION_1,&p,
@@ -3679,9 +7202,25 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
        &component_render_set_picture_api,&component_render_set_placement_preview_api};
    return TC_SERVICE_OK;
   }
+  if(version==TC_COMPONENT_RENDER_API_VERSION_7){
+   /* The image path needs the ImGui image entry point on top of everything V6
+      already required; without it there is nothing to draw the handle with. */
+   if(!renderImageQuad||!redrawComponentOriginal||!redrawSelectionOriginal||
+      !igButtonOriginal||!createTextureUnsafeOriginal||
+      !redrawClipboardComponentOriginal||!updateStateClipboardOriginal)
+    return TC_SERVICE_ERR_UNAVAILABLE;
+   if(outSize<sizeof(TCComponentRenderApiV7))return TC_SERVICE_ERR_SIZE;
+   *static_cast<TCComponentRenderApiV7*>(out)=TCComponentRenderApiV7{
+       sizeof(TCComponentRenderApiV7),TC_COMPONENT_RENDER_API_VERSION_7,&p,
+       &component_render_set_callback_api,&component_render_set_default_drawing_api,
+       &component_render_set_selection_hint_api,&component_render_set_foundry_button_api,
+       &component_render_set_picture_api,&component_render_set_placement_preview_api,
+       &component_render_load_image_api,&component_render_release_image_api};
+   return TC_SERVICE_OK;
+  }
   return TC_SERVICE_ERR_VERSION;
  }
- void invokeComponentRenderer(Loaded& plugin,ComponentRenderer& renderer,
+void invokeComponentRenderer(Loaded& plugin,ComponentRenderer& renderer,
                               const TCGameHandle& component,uint64_t customId,
                               uint64_t instanceId,uint32_t rotation,
                               const RenderVec2& centre,const RenderVec2& axisX,
@@ -3689,17 +7228,39 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
                               const RenderVec2& clipMax,void* list,
                               const uint8_t* config,uint32_t configSize,
                               uint32_t configSchema){
-  RenderDrawContext drawContext{this,list,0,true};
-  /* The newest draw table: its V1 prefix is what every existing Mod reads,
-     and the appended sized-text pair is what a Mod uses to match the board's
-     own text (a Mod checks draw->version/size, see sdk/tc_component_render.h). */
-  const TCComponentRenderDrawV2 drawStorage{
+  /* `plugin` here is the Mod whose callback is about to run: the image lookup in
+     the V3 primitive resolves in that Mod's own table. */
+  RenderDrawContext drawContext{this,list,0,true,&plugin,{}};
+  if(instanceId)tc::logic::instanceHandleOf(customId,instanceId,&drawContext.instance);
+  /* The newest draw table this build can offer: its V1 prefix is what every
+     existing Mod reads, the appended sized-text pair matches the board's own
+     text, and the image quad needs the ImGui entry point to be resolvable (a
+     build without it keeps handing out V2, so a Mod asking for >= 3 sees the
+     version it really gets).  A Mod checks draw->version/size, see
+     sdk/tc_component_render.h. */
+  const TCComponentRenderDrawV4 drawStorageV4{
+      sizeof(TCComponentRenderDrawV4),TC_COMPONENT_RENDER_DRAW_VERSION_4,&drawContext,
+      &component_render_line,&component_render_rect,&component_render_rect_filled,
+      &component_render_circle,&component_render_circle_filled,&component_render_text,
+      &component_render_text_sized,&component_render_measure_text,
+      renderImageQuad?&component_render_image:nullptr,
+      &component_render_text_font,&component_render_measure_font};
+  const TCComponentRenderDrawV3 drawStorageV3{
+      sizeof(TCComponentRenderDrawV3),TC_COMPONENT_RENDER_DRAW_VERSION_3,&drawContext,
+      &component_render_line,&component_render_rect,&component_render_rect_filled,
+      &component_render_circle,&component_render_circle_filled,&component_render_text,
+      &component_render_text_sized,&component_render_measure_text,
+      renderImageQuad?&component_render_image:nullptr};
+  const TCComponentRenderDrawV2 drawStorageV2{
       sizeof(TCComponentRenderDrawV2),TC_COMPONENT_RENDER_DRAW_VERSION_2,&drawContext,
       &component_render_line,&component_render_rect,&component_render_rect_filled,
       &component_render_circle,&component_render_circle_filled,&component_render_text,
       &component_render_text_sized,&component_render_measure_text};
+  const bool haveV4=renderImageQuad&&renderCalcTextSize&&renderPushTexture&&renderPopTexture;
+  const void* drawStorage=haveV4?static_cast<const void*>(&drawStorageV4):
+      (renderImageQuad?static_cast<const void*>(&drawStorageV3):static_cast<const void*>(&drawStorageV2));
   const TCComponentRenderDrawV1* drawApi=
-      static_cast<const TCComponentRenderDrawV1*>(static_cast<const void*>(&drawStorage));
+      static_cast<const TCComponentRenderDrawV1*>(drawStorage);
   TCComponentRenderFrameV1 renderFrame{};
   renderFrame.size=sizeof(renderFrame);renderFrame.version=TC_COMPONENT_RENDER_FRAME_VERSION_1;
   renderFrame.component=component;renderFrame.custom_id=customId;
@@ -3719,8 +7280,8 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
   drawContext.active=false;renderPopClip(list);
  }
  void dispatchComponentRender(){
-  bool any=false;for(auto& plugin:loaded)if(plugin->active)for(auto& item:plugin->renderers)if(item.draw&&!item.failed){any=true;break;}
-  if(!any)return;
+  bool anyRender=false;for(auto& plugin:loaded)if(plugin->active)for(auto& item:plugin->renderers)if(item.draw&&!item.failed){anyRender=true;break;}
+  if(!anyRender&&!componentInputs.hasHandlers())return;
   TCGameHandle board{};if(gameHandles.current(TC_GAME_OBJECT_BOARD,&board)!=TC_HANDLE_OK)return;
   void* io=renderGetIo();void* viewport=renderGetMainViewport();
   if(!io||!viewport)return;
@@ -3762,6 +7323,7 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
   const RenderVec2 ex{worldX.x*display.x-baseOrigin.x,worldX.y*display.y-baseOrigin.y};
   const RenderVec2 ey{worldY.x*display.x-baseOrigin.x,worldY.y*display.y-baseOrigin.y};
   if(!renderFinite(ex.x)||!renderFinite(ex.y)||!renderFinite(ey.x)||!renderFinite(ey.y))return;
+  std::vector<component_input::Target> inputTargets;
   for(uint64_t index=0;index<arrays.components;++index){
    const unsigned char* record=arrays.componentData+board_objects::kRecordHeader+
                                index*board_objects::kComponentStride;
@@ -3783,6 +7345,20 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
     }
     const RenderVec2 centre{baseOrigin.x+static_cast<float>(info.x)*ex.x+static_cast<float>(info.y)*ey.x,
                             baseOrigin.y+static_cast<float>(info.x)*ex.y+static_cast<float>(info.y)*ey.y};
+    TCComponentInstanceHandle inputHandle{};
+    if(tc::logic::instanceHandleOf(info.custom_prototype_id,info.id,&inputHandle)){
+     component_input::Target target{};target.handle=inputHandle;
+     target.originX=centre.x;target.originY=centre.y;
+     target.axisXX=axisX.x;target.axisXY=axisX.y;target.axisYX=axisY.x;target.axisYY=axisY.y;
+     target.boardX=static_cast<float>(info.x);target.boardY=static_cast<float>(info.y);
+     switch(info.rotation&3u){
+     case 1:target.boardAxisXX=0;target.boardAxisXY=1;target.boardAxisYX=-1;target.boardAxisYY=0;break;
+     case 2:target.boardAxisXX=-1;target.boardAxisXY=0;target.boardAxisYX=0;target.boardAxisYY=-1;break;
+     case 3:target.boardAxisXX=0;target.boardAxisXY=-1;target.boardAxisYX=1;target.boardAxisYY=0;break;
+     default:break;
+     }
+     target.order=index;inputTargets.push_back(target);
+    }
     std::vector<uint8_t> config=tc::logic::configOfInstance(info.custom_prototype_id,info.id);
     invokeComponentRenderer(*plugin,*renderer,component,info.custom_prototype_id,
                             info.id,info.rotation,centre,axisX,axisY,clipMin,clipMax,
@@ -3791,6 +7367,7 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
                             tc::logic::configSchemaOfInstance(info.custom_prototype_id,info.id));
    }
   }
+  componentInputs.setTargets(std::move(inputTargets));
   /* The placement record is deliberately not part of the Board snapshot: it is
      an id-less temporary object.  A clipboard redraw captures its type and
      snapped position, and the clipboard's own update (observeClipboardRecord)
@@ -3966,6 +7543,53 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
     return TC_COMMAND_ERR_STATE;
    return TC_COMMAND_OK;
   }
+  if(command.type==TC_COMMAND_BOARD_DELETE_COMPONENT){
+   /* The undo-aware entry, not the low-level tombstone: `try_delete` copies what
+      it removes and pushes the change list onto the game's undo stack, so one
+      BOARD_UNDO brings the component (and its wires) back. */
+   if(!tryDelete||!sequenceNew||!sequenceDestroy)return TC_COMMAND_ERR_UNAVAILABLE;
+   if(!command.custom_prototype_id||!command.argument)return TC_COMMAND_ERR_ARGUMENT;
+   int64_t index=-1;
+   {
+    board_objects::Arrays arrays{};
+    if(!board_objects::readArrays(model,arrays))return TC_COMMAND_ERR_STATE;
+    for(uint64_t i=0;i<arrays.components;++i){
+     const unsigned char* record=arrays.componentData+board_objects::kRecordHeader+
+                                 i*board_objects::kComponentStride;
+     if(record[0]!=board_objects::kCustomComponentKind)continue;
+     if(board_objects::readU64(record,8)!=static_cast<uint64_t>(command.argument))continue;
+     if(board_objects::readU64(record,0x188)!=command.custom_prototype_id)continue;
+     index=static_cast<int64_t>(i);
+     break;
+    }
+   }
+   if(index<0)return TC_COMMAND_ERR_NOT_FOUND;
+   /* Two Nim sequences built with the game's own allocator: the one component to
+      delete, and an empty wire list (the wrapper removes the wires that hang off
+      the component itself).  A sequence variable is a two-word header - count
+      then payload pointer - and the game's payload carries an 8-byte prefix, so
+      the elements live at payload + 8 (verified against the game's own
+      `newSeq` instantiation and its `add` helper, both of which write element i
+      at data + i*8 + 8). */
+   unsigned char indices[16]{},wires[16]{};
+   bool removed=false;
+   try{
+    sequenceNew(indices,1);
+    sequenceNew(wires,0);
+    unsigned char* payload=nullptr;
+    std::memcpy(&payload,indices+8,sizeof(payload));
+    if(!payload)return TC_COMMAND_ERR_UNAVAILABLE;
+    std::memcpy(payload+8,&index,sizeof(index));
+    removed=tryDelete(const_cast<void*>(model),indices,wires);
+   }catch(...){
+    sequenceDestroy(indices);
+    sequenceDestroy(wires);
+    return TC_COMMAND_ERR_EXECUTION;
+   }
+   sequenceDestroy(indices);
+   sequenceDestroy(wires);
+   return removed?TC_COMMAND_OK:TC_COMMAND_ERR_STATE;
+  }
   if(command.type==TC_COMMAND_SAVE)return saveCurrentCircuit(model);
   const char* alias=command.type<=TC_COMMAND_SIM_RESET?"sim.do":(command.type==TC_COMMAND_BOARD_UNDO?"board.undo":"board.redo");
   auto target=aliases.find(alias);if(target==aliases.end()||!target->second)return TC_COMMAND_ERR_UNAVAILABLE;
@@ -4005,9 +7629,9 @@ static void detourRedrawComponent(void* a1,void* a2,void* a3,void* a4,uint64_t a
    tx.status.result=result;tx.status.state=result==TC_COMMAND_OK?TC_TRANSACTION_STATE_COMMITTED:TC_TRANSACTION_STATE_FAILED;tx.status.completed_frame=frame;
   }
  }
- static int register_component_api(void* c,const TCNativeComponentDefinition* d){auto& p=*(Loaded*)c;if(!p.accepting)return -1;try {int result=registerNativeComponent(&p.host,d);if(!result){p.logicIds.push_back(d->custom_id);p.componentIds.push_back(d->custom_id);p.owner->noteComponentType(p,d->custom_id,d->name,-1);}else log_api(c,("Component registration rejected: "+std::to_string(result)).c_str());return result;}catch(const std::exception& e){log_api(c,e.what());return -4;}catch(...){return -4;}}
+ static int register_component_api(void* c,const TCNativeComponentDefinition* d){auto& p=*(Loaded*)c;if(!p.accepting)return -1;try {std::vector<uint8_t> encoded;const bool adopt=p.owner->foundryEntryCarriesId(d&&d->name?d->name:"",d?d->custom_id:0);int result=registerNativeComponent(&p.host,d,&encoded,adopt);if(!result){p.logicIds.push_back(d->custom_id);p.componentIds.push_back(d->custom_id);p.owner->noteComponentType(p,d->custom_id,d->name,-1);provideFoundrySchematicBytes(*p.owner,p.host,d->name?d->name:"",d->custom_id,encoded);}else log_api(c,("Component registration rejected: "+std::to_string(result)).c_str());return result;}catch(const std::exception& e){log_api(c,e.what());return -4;}catch(...){return -4;}}
  static int register_ui_page_api(void* c,const TCUiPageDefinition* d){auto& p=*(Loaded*)c;if(!p.accepting)return -1;if(!d||d->size<sizeof(TCUiPageDefinition)||!d->page_id||!d->page_id[0]||!d->draw)return -2;std::string id=d->page_id;if(id.size()>=64||id.find("###")!=std::string::npos)return -2;if(p.pages.size()>=kMaxPagesPerPlugin)return -4;for(auto& page:p.pages)if(page.id==id)return -3;p.pages.push_back(UiPage{id,d->title?d->title:"",d->draw,d->user,false});log_api(c,("UI page registered: "+id).c_str());return 0;}
- void reject(Loaded& p){logic::finish(p.logicIds,false);component_registry::dropMod(p.id);for(auto it=instanceFootprints.begin();it!=instanceFootprints.end();)if(it->second.owner==&p)it=instanceFootprints.erase(it);else ++it;if(!p.componentIds.empty()){TCGameModel game;if(game.load(&p.host))for(auto id:p.componentIds)game.removeCustomPrototype(id);p.componentIds.clear();}for(auto target:p.hooks){MH_DisableHook(target);MH_RemoveHook(target);ownedHooks.erase(target);}p.hooks.clear();dropHookLinks(p.id);dropEventListeners(p.id);dropLifecycleListeners(p);dropCommands(p);dropTransactions(p);if(p.plugin.on_unload){try{p.plugin.on_unload(p.plugin.user);}catch(...) {}}textures.reject(&p);p.plugin={};p.accepting=false;p.active=false;/* Keep rejected DLL mapped: it may have static destructors/threads. */}
+  void reject(Loaded& p){componentInputs.clearOwner(&p);componentChannels.clearOwner(&p);logic::finish(p.logicIds,false);component_registry::dropMod(p.id);p.editorFields.clear();p.settings.clear();p.settingChanged=nullptr;p.settingUser=nullptr;for(auto it=instanceFootprints.begin();it!=instanceFootprints.end();)if(it->second.owner==&p)it=instanceFootprints.erase(it);else ++it;if(!p.componentIds.empty()){TCGameModel game;if(game.load(&p.host))for(auto id:p.componentIds)game.removeCustomPrototype(id);p.componentIds.clear();}for(auto target:p.hooks){MH_DisableHook(target);MH_RemoveHook(target);ownedHooks.erase(target);}p.hooks.clear();dropHookLinks(p.id);dropEventListeners(p.id);dropLifecycleListeners(p);dropCommands(p);dropTransactions(p);dropComposeSessions(p);if(p.plugin.on_unload){try{p.plugin.on_unload(p.plugin.user);}catch(...) {}}for(auto& font:p.fonts)destroyComponentFont(p,font.second);p.fonts.clear();p.deviceCallback=nullptr;p.deviceUser=nullptr;/* The image table keeps only names and handles: the texture manager is about to retire every GL object this Mod owns, so nothing is released twice here. */p.images.forget();textures.reject(&p);p.plugin={};p.accepting=false;p.active=false;/* Keep rejected DLL mapped: it may have static destructors/threads. */}
 
 
  /* Registers a panel for one of the game's own screens.  Same validation and
@@ -4238,7 +7862,7 @@ static PageApi& pageApi(){
 
     The window and both ID scopes are opened and closed here, so a page cannot
     leave the window stack unbalanced. */
-void drawPageContainer(Loaded& owner,UiPage& page,const TCFrame& frame){
+ void drawPageContainer(const std::string& ownerId,UiPage& page,const TCFrame& frame){
   const PageApi& api=pageApi();
   const char* failure=nullptr;
   if(!api.available())failure="engine is missing part of the page container API";
@@ -4281,7 +7905,7 @@ void drawPageContainer(Loaded& owner,UiPage& page,const TCFrame& frame){
       resolve - the executable owns those symbols).  Our window, our scale: set
       it for the header, put it back for the content. */
    const bool withFont=api.setWindowFontScale!=nullptr;
-   const float headerScale=(2.f*scale)/1.6666666f;
+   const float headerScale=(1.25f*scale)/1.6666666f;
    const float beforeFont=api.getFontSize?api.getFontSize():0.f;
    if(withFont)api.setWindowFontScale(headerScale);
    if(withFont&&api.getFontSize){
@@ -4292,12 +7916,18 @@ void drawPageContainer(Loaded& owner,UiPage& page,const TCFrame& frame){
             " -> "+std::to_string((int)api.getFontSize()));
     }
    }
-   api.text(owner.id.c_str(),nullptr);
-   if(api.button("< BACK###TCModPageBack",PageApi::Vec2{110.f*scale,40.f*scale}))closePage();
+   /* One fixed-height row: putting the title above the button made both of
+      them exceed pageHeaderHeight() at large UI scales, so plugin content was
+      drawn through the Back button.  Keep the control at the documented
+      top-left hit box and place the human page title beside it. */
+   if(api.button("< 返回###TCModPageBack",PageApi::Vec2{110.f*scale,40.f*scale}))closePage();
+   api.setCursorPos(PageApi::Vec2{126.f*scale,8.f*scale});
+   api.text((page.title.empty()?ownerId:page.title).c_str(),nullptr);
+   api.setCursorPos(PageApi::Vec2{0.f,52.f*scale});
    api.separator();
    if(withFont)api.setWindowFontScale(1.f);
    api.setCursorPos(PageApi::Vec2{0.f,pageHeaderHeight()});
-   api.pushId(owner.id.c_str());
+    api.pushId(ownerId.c_str());
    api.pushId(page.id.c_str());
    const float contentHeight=size.y>pageHeaderHeight()?size.y-pageHeaderHeight():0.f;
    /* The page content gets the same clipped, scrollable region as a board
@@ -4306,12 +7936,12 @@ void drawPageContainer(Loaded& owner,UiPage& page,const TCFrame& frame){
       where it is not visible. */
    bool hovered=false;
    PageApi::Vec2 region{0.f,pageHeaderHeight()};
-   const std::string who=owner.id+"/"+page.id;
+    const std::string who=ownerId+"/"+page.id;
    const bool ok=drawContentRegion(api,PageApi::Vec2{size.x,contentHeight},scale,"###content",
                                     who,page.draw,page.user,frame,hovered,region);
    if(!ok){
     page.draw=nullptr;page.failed=true;
-    statuses[owner.id]="UI page disabled after an exception";
+     statuses[ownerId]="UI page disabled after an exception";
    }
    /* One bounded line per page: the playtest needs the content origin to turn
       a widget's own coordinates into a click point. */
@@ -4444,6 +8074,34 @@ void drawPageContainer(Loaded& owner,UiPage& page,const TCFrame& frame){
     if(!value.missing.empty())value.missing+=", ";
     value.missing+=entries[i].name;
    }
+  }
+  return value;
+ }
+ struct ComponentInputApi {
+  using Vec2=SlotApi::Vec2;
+  int (*getFrameCount)()=nullptr;
+  void (*mousePos)(Vec2*)=nullptr;
+  bool (*mouseDown)(int)=nullptr;
+  bool (*mouseClicked)(int,bool)=nullptr;
+  bool (*mouseReleased)(int)=nullptr;
+  bool (*mouseDoubleClicked)(int)=nullptr;
+  bool (*keyDown)(int)=nullptr;
+  bool (*keyPressed)(int,bool)=nullptr;
+  bool available() const{return getFrameCount&&mousePos&&mouseDown&&mouseClicked&&
+                                mouseReleased&&mouseDoubleClicked&&keyDown&&keyPressed;}
+ };
+ static const ComponentInputApi& componentInputApi(){
+  static ComponentInputApi value;static bool bound=false;
+  if(!bound){bound=true;HMODULE module=GetModuleHandleW(L"tc_game_engine.dll");
+   if(!module)module=GetModuleHandleW(nullptr);
+   value.getFrameCount=(decltype(value.getFrameCount))proc(module,"igGetFrameCount");
+   value.mousePos=(decltype(value.mousePos))proc(module,"igGetMousePos");
+   value.mouseDown=(decltype(value.mouseDown))proc(module,"igIsMouseDown_Nil");
+   value.mouseClicked=(decltype(value.mouseClicked))proc(module,"igIsMouseClicked_Bool");
+   value.mouseReleased=(decltype(value.mouseReleased))proc(module,"igIsMouseReleased_Nil");
+   value.mouseDoubleClicked=(decltype(value.mouseDoubleClicked))proc(module,"igIsMouseDoubleClicked_Nil");
+   value.keyDown=(decltype(value.keyDown))proc(module,"igIsKeyDown_Nil");
+   value.keyPressed=(decltype(value.keyPressed))proc(module,"igIsKeyPressed_Bool");
   }
   return value;
  }
@@ -4711,6 +8369,55 @@ bool hasBoardTools() const {
   }
   return true;
  }
+ void componentMouseWheel(float x,float y){componentWheelX+=x;componentWheelY+=y;}
+ bool componentTextUtf8(const char* text){
+  if(!text||!*text)return false;
+  return componentInputs.text(TC_COMPONENT_INPUT_TEXT_COMMIT,text,
+                              static_cast<uint32_t>(std::min<size_t>(std::strlen(text),63)));
+ }
+ bool componentTextCodepoint(uint32_t codepoint){
+  char utf8[5]{};uint32_t count=0;
+  if(codepoint<=0x7f){utf8[count++]=static_cast<char>(codepoint);}
+  else if(codepoint<=0x7ff){utf8[count++]=static_cast<char>(0xc0|(codepoint>>6));utf8[count++]=static_cast<char>(0x80|(codepoint&0x3f));}
+  else if(codepoint<=0xffff){utf8[count++]=static_cast<char>(0xe0|(codepoint>>12));utf8[count++]=static_cast<char>(0x80|((codepoint>>6)&0x3f));utf8[count++]=static_cast<char>(0x80|(codepoint&0x3f));}
+  else if(codepoint<=0x10ffff){utf8[count++]=static_cast<char>(0xf0|(codepoint>>18));utf8[count++]=static_cast<char>(0x80|((codepoint>>12)&0x3f));utf8[count++]=static_cast<char>(0x80|((codepoint>>6)&0x3f));utf8[count++]=static_cast<char>(0x80|(codepoint&0x3f));}
+  return count&&componentInputs.text(TC_COMPONENT_INPUT_TEXT_COMMIT,utf8,count,codepoint);
+ }
+ bool componentIme(uint32_t kind,const char* text){
+  const char* value=text?text:"";
+  return componentInputs.text(kind,value,
+      static_cast<uint32_t>(std::min<size_t>(std::strlen(value),63)));
+ }
+ bool componentInputFrame(){
+  if(!componentInputs.hasHandlers())return false;
+  const ComponentInputApi& api=componentInputApi();if(!api.available())return false;
+  const int frame=api.getFrameCount();if(frame==lastComponentInputFrame)return componentInputs.keyboardFocused();
+  lastComponentInputFrame=frame;
+  ComponentInputApi::Vec2 mouse{};api.mousePos(&mouse);
+  uint32_t modifiers=0;
+  if(api.keyDown(524)||api.keyDown(528))modifiers|=TC_COMPONENT_INPUT_MOD_CTRL;
+  if(api.keyDown(525)||api.keyDown(529))modifiers|=TC_COMPONENT_INPUT_MOD_SHIFT;
+  if(api.keyDown(526)||api.keyDown(530))modifiers|=TC_COMPONENT_INPUT_MOD_ALT;
+  if(api.keyDown(527)||api.keyDown(531))modifiers|=TC_COMPONENT_INPUT_MOD_SUPER;
+  component_input::PointerSample sample{};sample.screenX=mouse.x;sample.screenY=mouse.y;
+  sample.down=api.mouseDown(0);sample.pressed=api.mouseClicked(0,false);
+  sample.released=api.mouseReleased(0);sample.doubleClicked=api.mouseDoubleClicked(0);
+  sample.wheelX=componentWheelX;sample.wheelY=componentWheelY;sample.modifiers=modifiers;
+  componentWheelX=componentWheelY=0.f;
+  bool consumed=componentInputs.pointer(sample);
+  std::set<uint32_t> now;
+  for(uint32_t key=512;key<=583;++key){
+   if(!api.keyDown(static_cast<int>(key)))continue;
+   now.insert(key);const bool wasDown=componentKeysDown.count(key)!=0;
+   if(!wasDown||api.keyPressed(static_cast<int>(key),true))
+    consumed|=componentInputs.keyboard(TC_COMPONENT_INPUT_KEY_DOWN,key,0,modifiers,wasDown);
+  }
+  for(uint32_t key:componentKeysDown)if(!now.count(key))
+   consumed|=componentInputs.keyboard(TC_COMPONENT_INPUT_KEY_UP,key,0,modifiers,false);
+  componentKeysDown=std::move(now);
+  return consumed||componentInputs.keyboardFocused();
+ }
+ bool hasComponentInputs() const{return componentInputs.hasHandlers();}
  bool boardSlotFrame(){
   if(!hasBoardSlots())return false;
   const SlotApi& api=slotApi();
@@ -4880,7 +8587,7 @@ bool hasBoardTools() const {
     the neutral colour).  A plugin's own report also lands here, so the Mods
     page can show it the same way as a loader-detected failure. */
  std::map<std::string,int> statusLevels;
-NativeRuntime(Core& c,HMODULE e,fs::path saves,std::function<void(const std::string&)> log):core(c),engine(e),saveRoot(std::move(saves)),types(c.dir/L"registry.json"),logger(std::move(log)),services(gameHandles){services.bindBoardSnapshot(this,&NativeRuntime::captureBoardSnapshotService);services.bindBoardObjects(&NativeRuntime::captureBoardObjectsService);services.bindBoardReaders(&NativeRuntime::readComponentService,&NativeRuntime::readWireService);services.bindBoardPinReader(&NativeRuntime::readPinsService);services.bindBoardWireEndsReader(&NativeRuntime::readWireEndsService);services.bindSimulation(this,&NativeRuntime::simulationStateService,&NativeRuntime::simulationValueService);services.bindSimulationControl(this,&NativeRuntime::simulationCycleService,&NativeRuntime::simulationStateSizeService,&NativeRuntime::simulationSnapshotService,&NativeRuntime::simulationRunToService,&NativeRuntime::simulationRunForService,&NativeRuntime::simulationPauseService,&NativeRuntime::simulationResetService,&NativeRuntime::simulationStepService,&NativeRuntime::simulationSliceService,&NativeRuntime::simulationControlService);services.bindSimChannels(this,&NativeRuntime::channelFromWireService,&NativeRuntime::channelResolveService);services.bindSimCapture(this,&NativeRuntime::captureConfigureService,&NativeRuntime::captureStartService,&NativeRuntime::captureStopService,&NativeRuntime::captureReadService,&NativeRuntime::captureStatusService);services.bindIoValue(this,&NativeRuntime::ioEvaluateService,&NativeRuntime::ioFormatService,&NativeRuntime::ioReadInputService,&NativeRuntime::ioWriteInputService,&NativeRuntime::ioFlipInputService,&NativeRuntime::ioInputWidthService,&NativeRuntime::ioWriteConstantService,&NativeRuntime::ioWriteConstantSlotService);activeInstance=this;}
+ NativeRuntime(Core& c,HMODULE e,fs::path saves,std::function<void(const std::string&)> log):core(c),engine(e),saveRoot(std::move(saves)),modStorage(c.root,c.dir,saveRoot),settingsPage{"settings","Mod settings",&draw_settings_page_api,this,false},types(c.dir/L"registry.json"),logger(std::move(log)),services(gameHandles){services.bindBoardSnapshot(this,&NativeRuntime::captureBoardSnapshotService);services.bindBoardObjects(&NativeRuntime::captureBoardObjectsService);services.bindBoardReaders(&NativeRuntime::readComponentService,&NativeRuntime::readWireService);services.bindBoardPinReader(&NativeRuntime::readPinsService);services.bindBoardWireEndsReader(&NativeRuntime::readWireEndsService);services.bindSimulation(this,&NativeRuntime::simulationStateService,&NativeRuntime::simulationValueService);services.bindSimulationControl(this,&NativeRuntime::simulationCycleService,&NativeRuntime::simulationStateSizeService,&NativeRuntime::simulationSnapshotService,&NativeRuntime::simulationRunToService,&NativeRuntime::simulationRunForService,&NativeRuntime::simulationPauseService,&NativeRuntime::simulationResetService,&NativeRuntime::simulationStepService,&NativeRuntime::simulationSliceService,&NativeRuntime::simulationControlService);services.bindSimChannels(this,&NativeRuntime::channelFromWireService,&NativeRuntime::channelResolveService);services.bindSimCapture(this,&NativeRuntime::captureConfigureService,&NativeRuntime::captureStartService,&NativeRuntime::captureStopService,&NativeRuntime::captureReadService,&NativeRuntime::captureStatusService);services.bindIoValue(this,&NativeRuntime::ioEvaluateService,&NativeRuntime::ioFormatService,&NativeRuntime::ioReadInputService,&NativeRuntime::ioWriteInputService,&NativeRuntime::ioFlipInputService,&NativeRuntime::ioInputWidthService,&NativeRuntime::ioWriteConstantService,&NativeRuntime::ioWriteConstantSlotService);activeInstance=this;}
  NativeRuntime(const NativeRuntime&)=delete;NativeRuntime& operator=(const NativeRuntime&)=delete;
  /* ---------------------------------------------------------------------
     Native UI page API (used by src/loader.cpp)
@@ -4894,7 +8601,7 @@ NativeRuntime(Core& c,HMODULE e,fs::path saves,std::function<void(const std::str
  /* Requests a page, closing whatever was open.  Returns false and changes
     nothing when the owner has no such page: a plugin that failed to load is
     never reachable, so a rejected plugin leaves no entry behind. */
- bool openPage(const std::string& owner,const std::string& page){UiPage* found=nullptr;if(page.empty()||owner.empty())return false;for(auto& p:loaded){if(!p->active||p->id!=owner)continue;for(auto& candidate:p->pages)if(candidate.id==page)found=&candidate;}if(!found)return false;openPageOwner=owner;openPageId=page;lastUiFrame=-1;return true;}
+  bool openPage(const std::string& owner,const std::string& page){UiPage* found=nullptr;if(page.empty()||owner.empty())return false;if(owner=="tc.modloader"&&page==settingsPage.id&&!settingsPage.failed){for(auto& p:loaded)if(p->active&&!p->settings.empty())found=&settingsPage;}else for(auto& p:loaded){if(!p->active||p->id!=owner)continue;for(auto& candidate:p->pages)if(candidate.id==page)found=&candidate;}if(!found)return false;openPageOwner=owner;openPageId=page;lastUiFrame=-1;return true;}
  void closePage(){openPageId.clear();openPageOwner.clear();lastUiFrame=-1;}
  /* True when the given address is inside one of the board UI functions, i.e.
     when the board scene is the one being built.  Used by the loader's
@@ -4910,6 +8617,7 @@ NativeRuntime(Core& c,HMODULE e,fs::path saves,std::function<void(const std::str
     (a plugin load, which only happens during boot). */
  std::vector<PageEntry> pages(){
   std::vector<PageEntry> result;
+   for(auto& p:loaded)if(p->active&&!p->settings.empty()){result.push_back(PageEntry{"tc.modloader",settingsPage.id.c_str(),settingsPage.title.c_str(),settingsPage.failed});break;}
   for(auto& p:loaded){if(!p->active)continue;for(auto& page:p->pages)result.push_back(PageEntry{p->id.c_str(),page.id.c_str(),page.title.c_str(),page.failed});}
   return result;
  }
@@ -4960,20 +8668,42 @@ NativeRuntime(Core& c,HMODULE e,fs::path saves,std::function<void(const std::str
   auto engineTime=(double(*)())GetProcAddress(engine,"igGetTime");
   if(!engineFrame||!engineTime)return;
   const int number=engineFrame();
-  textures.advance(number);
+  advanceTextures(number);
   if(number==lastUiFrame)return;
   lastUiFrame=number;
-  Loaded* owner=nullptr;UiPage* page=nullptr;
-  for(auto& p:loaded){if(!p->active||p->id!=openPageOwner)continue;for(auto& candidate:p->pages)if(candidate.id==openPageId){owner=p.get();page=&candidate;}}
-  if(!owner||!page){closePage();return;}
+  UiPage* page=nullptr;
+  if(openPageOwner=="tc.modloader"&&openPageId==settingsPage.id)page=&settingsPage;
+  else for(auto& p:loaded){if(!p->active||p->id!=openPageOwner)continue;for(auto& candidate:p->pages)if(candidate.id==openPageId)page=&candidate;}
+  if(!page){closePage();return;}
   if(!page->draw){page->failed=true;return;}
   TCFrame frame{sizeof(TCFrame),number,engineTime()};
   {static int calls=0;++calls;if(calls<=3||calls%600==0)logger("UI page frame "+std::to_string(calls)+": "+openPageOwner+"/"+openPageId+" drawn="+std::to_string(page->draw!=nullptr)+" frame="+std::to_string(number));}
-  try{drawPageContainer(*owner,*page,frame);}
-  catch(const std::exception& e){page->draw=nullptr;page->failed=true;logger("Plugin UI page failed: "+owner->id+"/"+page->id+": "+e.what());statuses[owner->id]="UI 页面异常：已停用该页";}
-  catch(...){page->draw=nullptr;page->failed=true;logger("Plugin UI page failed: "+owner->id+"/"+page->id);statuses[owner->id]="UI 页面异常：已停用该页";}
+  try{drawPageContainer(openPageOwner,*page,frame);}
+  catch(const std::exception& e){page->draw=nullptr;page->failed=true;logger("UI page failed: "+openPageOwner+"/"+page->id+": "+e.what());statuses[openPageOwner]="UI 页面异常：已停用该页";}
+  catch(...){page->draw=nullptr;page->failed=true;logger("UI page failed: "+openPageOwner+"/"+page->id);statuses[openPageOwner]="UI 页面异常：已停用该页";}
  }
- void boot(){if(started)return;started=true;gameThreadId=GetCurrentThreadId();textures.advance(0);try{
+ void advanceTextures(int frame){
+  textures.advance(frame);const uint64_t generation=textures.generation();
+  for(auto& plugin:loaded){if(!plugin)continue;
+   const auto retire=[this,&plugin](uint64_t texture){textures.release(plugin.get(),texture);};
+   plugin->images.prune([](uint64_t customId,uint64_t instanceId,uint64_t instanceGeneration){
+    TCComponentInstanceHandle handle{};handle.size=sizeof(handle);handle.version=TC_COMPONENT_INSTANCES_API_VERSION_1;
+    handle.custom_id=customId;handle.instance_id=instanceId;handle.generation=instanceGeneration;
+    TCComponentStorageInfoV1 info{};info.size=sizeof(info);
+    return tc::logic::storageInfo(&handle,&info)==TC_COMPONENT_STORAGE_OK;
+   },retire);
+   if(plugin->deviceCallback&&plugin->deviceGeneration&&plugin->deviceGeneration!=generation){
+    TCComponentRenderDeviceEventV1 event{};event.size=sizeof(event);
+    event.version=TC_COMPONENT_RENDER_DEVICE_EVENT_VERSION_1;event.generation=generation;
+    event.reason=TC_COMPONENT_RENDER_DEVICE_REBUILT;
+    try{plugin->deviceCallback(plugin->deviceUser,&event);}
+    catch(...){logger("Component render: device callback threw for "+plugin->id);
+     plugin->deviceCallback=nullptr;plugin->deviceUser=nullptr;}
+   }
+   plugin->deviceGeneration=generation;
+  }
+ }
+ void boot(){if(started)return;started=true;gameThreadId=GetCurrentThreadId();advanceTextures(0);try{
   /* The fault journal must be armed before the first plugin callback runs, so a
      crash inside a plugin callback is attributed instead of anonymous. */
   fault::install((core.dir/L"fault.log").c_str());
@@ -4991,8 +8721,13 @@ NativeRuntime(Core& c,HMODULE e,fs::path saves,std::function<void(const std::str
 armDefaultDrawingControl();
 armPlacementPreviewControl();
 armSelectionHintControl();
- armFoundryButtonControl();
+armFoundryButtonControl();
+armDescriptionPictureControl();
+armDescriptionBoxControl();
+armComponentPreviewControl();
+armPanelTrace();
  armComponentPanelControl();
+armComponentMenuRefresh();
 armPictureControl();
 armSelectionMeshTrace();
  buildChains();
@@ -5053,6 +8788,26 @@ p->host={sizeof(TCHost),TC_MOD_API_VERSION,p.get(),TC_GAME_BUILD_LABEL,p->id.c_s
   installChains();
  }catch(const std::exception&e){logger(std::string("Native runtime unavailable: ")+e.what());}}
  void frame(){if(inside)return;inside=true;boot();
+   /* Test/development convenience mirroring TC_MODLOADER_OPEN for the manager:
+      open the loader-owned settings page without guessing a home-screen click.
+      It is checked once and has no effect in ordinary player processes. */
+   {static bool checked=false;if(!checked){checked=true;char value[8]{};
+    if(GetEnvironmentVariableA("TC_MODLOADER_OPEN_SETTINGS",value,sizeof(value))>0&&value[0]!='0'){
+     if(openPage("tc.modloader","settings"))logger("Opened UI page tc.modloader/settings (auto)");
+     else logger("Mod settings page auto-open requested but no fields are registered");
+    }}}
+   /* Generic visual-regression entry point.  The value is "mod-id/page-id";
+      ordinary launches never set it, while a screenshot test can open the
+      exact plugin page without guessing a scaled home-button rectangle. */
+   {static bool checked=false;if(!checked){checked=true;char value[256]{};
+    const DWORD length=GetEnvironmentVariableA("TC_MODLOADER_OPEN_PLUGIN_PAGE",value,sizeof(value));
+    if(length>0&&length<sizeof(value)&&value[0]){
+     const std::string request(value,length);const size_t slash=request.find('/');
+     if(slash!=std::string::npos&&slash>0&&slash+1<request.size()&&
+        openPage(request.substr(0,slash),request.substr(slash+1)))
+      logger("Opened UI page "+request+" (auto)");
+     else logger("Plugin page auto-open request was not found: "+request);
+    }}}
   /* One line the first time a compile carries the per-cycle scope tick: "the
      capture never sees a cycle" and "the program was never instrumented" are
      different reports, and this tells them apart in the log. */
@@ -5060,12 +8815,20 @@ p->host={sizeof(TCHost),TC_MOD_API_VERSION,p.get(),TC_GAME_BUILD_LABEL,p->id.c_s
    static uint64_t reported=0;
    if(sites!=reported){reported=sites;
     logger("Scope tick: instrumented "+std::to_string(sites)+" per-cycle call site(s) so far");}}
-auto getFrame=(int(*)())GetProcAddress(engine,"igGetFrameCount");auto getTime=(double(*)())GetProcAddress(engine,"igGetTime");int n=getFrame();lastEngineFrame=n;gameHandles.beginFrame(n);textures.advance(n);if(n!=lastFrame){lastFrame=n;observeBoardChanges();
+auto getFrame=(int(*)())GetProcAddress(engine,"igGetFrameCount");auto getTime=(double(*)())GetProcAddress(engine,"igGetTime");int n=getFrame();lastEngineFrame=n;gameHandles.beginFrame(n);advanceTextures(n);if(n!=lastFrame){lastFrame=n;observeBoardChanges();
+  /* The placement half of the component lifecycle: one walk of the live
+     instances per frame, after the board's own change detection. */
+  pollComponentGeometry();
   /* Some custom instances are bound while level.load is still flattening the
      Board, before their saved tail records can be found.  Finish those restores
      automatically on the first frame that can see the records, before plugin
      on_frame callbacks attempt a refresh or render an editor. */
   tc::logic::restorePendingTailConfigs();
+  componentChannels.eraseIf([](const component_channel::Key& key){
+   TCComponentInstanceHandle handle{sizeof(TCComponentInstanceHandle),
+       TC_COMPONENT_INSTANCES_API_VERSION_1,key.customId,key.instanceId,key.generation};
+   return tc::logic::instanceValidate(&handle)!=TC_COMPONENT_INSTANCES_OK;
+  });
   /* One cycle sample per frame is what "the simulation is advancing" means
      here: a configuration write refreshes the board only when it is not (see
      the storage write path in native_logic.hpp). */

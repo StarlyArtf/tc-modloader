@@ -1,0 +1,11 @@
+{
+  "format": 2,
+  "id": "test.component-runtime-replace",
+  "name": "Component runtime replacement regression",
+  "version": "0.1.0",
+  "capabilities": ["log", "services", "symbol"],
+  "native": {
+    "api": 1,
+    "entry": "native/probe.dll"
+  }
+}

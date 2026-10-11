@@ -1,5 +1,5 @@
 # True-game case for the Float Ops "leave the sandbox and come back" path
-# (examples/float-ops/components.cpp, components_ui.cpp, and the loader's
+# (examples/float-ops/components.cpp, editor.cpp, and the loader's
 # level-lifecycle restore in src/native_logic.hpp / src/sim_control.hpp).
 #
 # The player reports this case exists for (2026-09-26):
@@ -140,6 +140,8 @@ $taskPreviousLayout = $env:TC_FLOATOPS_LAYOUT
 $taskPreviousBodies = $env:TC_FLOATOPS_BODIES
 $taskPreviousKeys = $env:TC_FLOAT_REENTRY_KEYS
 $taskPreviousLevel = $env:TC_FLOAT_REENTRY_LEVEL
+$taskPreviousRows = $env:TC_FLOAT_ROWS
+$taskPreviousTrace = $env:TC_EDITOR_TRACE
 
 # The game decides for itself which board it opens at startup, and a launch that
 # never showed the fixture board says nothing about the Mod, so the launch is
@@ -156,6 +158,11 @@ for ($taskAttempt = 1; $taskAttempt -le $taskAttempts; ++$taskAttempt) {
     # The Mod publishes every body's rectangle so the driver can click the
     # component the way the player does: that click is what opens the drawer.
     $env:TC_FLOATOPS_BODIES = '1'
+    # The rows are the loader's now, so the driver reads their rectangles - and
+    # the fact that they were drawn again after the re-entry - from the loader's
+    # own row trace instead of a file this Mod used to write.
+    $env:TC_EDITOR_TRACE = '1'
+    $env:TC_FLOAT_ROWS = $taskLog
     $env:TC_FLOAT_REENTRY_KEYS = $Keys
     $env:TC_FLOAT_REENTRY_LEVEL = $taskLevel
     # Every attempt starts from the same board: an attempt that reached the save
@@ -186,6 +193,8 @@ for ($taskAttempt = 1; $taskAttempt -le $taskAttempts; ++$taskAttempt) {
     $env:TC_FLOATOPS_BODIES = $taskPreviousBodies
     $env:TC_FLOAT_REENTRY_KEYS = $taskPreviousKeys
     $env:TC_FLOAT_REENTRY_LEVEL = $taskPreviousLevel
+    $env:TC_FLOAT_ROWS = $taskPreviousRows
+    $env:TC_EDITOR_TRACE = $taskPreviousTrace
     if ($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning) {
       [void]$taskProcess.CloseMainWindow()
       if (!$taskProcess.WaitForExit(4000)) { Stop-Process -Id $taskProcess.Id -ErrorAction SilentlyContinue }
@@ -234,14 +243,16 @@ Assert-TaskContains ('DRIVER: typed "' + $Keys + '" and pressed Enter')
 # (The field already holds the record's text - "1" for a fresh Constant - so the
 # typing lands after it; what matters is that the edit *moved* the value and that
 # both visits agree, not which decimal the typing produced.)
-$taskWrittenBits = -1
+# The rows are the loader's now, so the write is the host's own line: it names
+# the field it committed and the value it parsed out of what the driver typed.
+$taskCommit = -1
 foreach ($taskLine in $taskLines) {
-  if ($taskLine -match 'float-ops: constant 0x([0-9a-f]+) set to 0x([0-9a-f]+)') {
-    $taskWrittenBits = [Convert]::ToUInt32($Matches[2], 16)
+  if ($taskLine -match 'Component editor: committed field "value" on instance 0x([0-9a-f]+) value=(\S+)') {
+    $taskCommit = [Convert]::ToDouble($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
   }
 }
-if ($taskWrittenBits -lt 0) { throw "The Constant's value was never written; inspect $taskLog" }
-if ($taskWrittenBits -eq 0x3F800000) {
+if ($taskCommit -lt 0) { throw "The Constant's value was never written; inspect $taskLog" }
+if ($taskCommit -eq 1.0) {
   throw "The Constant still holds the default 1.0 after the edit; inspect $taskLog"
 }
 Assert-TaskContains 'float-ops: component configuration saved in the game''s circuit file'
@@ -360,15 +371,12 @@ if ($taskAfter.Kinds -notmatch 'value') {
   throw "The Constant's value row was missing after the re-entry (rows [$($taskAfter.Kinds)]); inspect $taskLog"
 }
 
-# (3) The rows were filled from the record, not from the board that is gone: the
-#     Mod's own line names the instance, its type and the text now in the fields,
-#     and it has to appear after the second level load with the value the first
-#     visit ended on.
-$taskDrawerPattern = 'float-ops: the drawer (?:is editing|re-read) instance 0x' + $taskAfter.Instance +
-  ' \(type 0x' + $taskAfter.Type
-if ($taskValueText) { $taskDrawerPattern += ', label "[^"]*", value "' + [regex]::Escape($taskValueText) + '"\)' }
-if ((Get-TaskIndex $taskDrawerPattern $taskReentry) -lt 0) {
-  throw "The drawer never read the re-entered board's record back into its fields; inspect $taskLog"
+# (3) The rows were the loader's, and they were drawn again for the re-entered
+#     instance: the host logs one line per row it paints, so a row line for the
+#     same instance has to appear after the second level load.
+$taskRowPattern = 'Component editor: row instance=0x' + $taskAfter.Instance + ' field="value"'
+if ((Get-TaskIndex $taskRowPattern $taskReentry) -lt 0) {
+  throw "The loader never drew the row for the re-entered instance; inspect $taskLog"
 }
 
 # A field the driver never touched after the re-entry: the saved value reached the

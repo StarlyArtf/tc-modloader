@@ -605,6 +605,38 @@ inline uint64_t prototypeOutputPinWordSize(const TCPrototype& p, uint64_t index)
     return pin ? pinWordSizeRaw(*pin) : 0;
 }
 
+/* The prototype's *second* input list, at +0x70/+0x78.  It is empty for most
+   kinds and carries the pins the palette does not draw for exactly the storage
+   family - Register, Counter, Delay Line, the Auto variants - plus 0x35.  Those
+   pins are wired like any other (the game connects them, and its compiler reads
+   them), but `prototypeInputCount` does not count them, so a reader that wants
+   the whole geometry has to ask for both lists.
+
+   The entries have the same 0x38-byte layout as the declared pins, which is why
+   the same helpers work on them. */
+inline uint64_t prototypeHiddenPinCount(const TCPrototype& p) {
+    uint64_t count = 0;
+    memcpy(&count, p.bytes + 0x70, sizeof(count));
+    return count;
+}
+
+inline TCPin* prototypeHiddenPin(const TCPrototype& p, uint64_t index) {
+    if (index >= prototypeHiddenPinCount(p)) return nullptr;
+    void* data = nullptr;
+    memcpy(&data, p.bytes + 0x78, sizeof(data));
+    return data ? static_cast<TCPin*>(data) + index : nullptr;
+}
+
+inline TCPinPoint prototypeHiddenPinPoint(const TCPrototype& p, uint64_t index) {
+    const TCPin* pin = prototypeHiddenPin(p, index);
+    return pin ? pinPoint(*pin) : TCPinPoint{0, 0};
+}
+
+inline uint64_t prototypeHiddenPinWordSize(const TCPrototype& p, uint64_t index) {
+    const TCPin* pin = prototypeHiddenPin(p, index);
+    return pin ? pinWordSizeRaw(*pin) : 0;
+}
+
 inline TCNimString prototypeName(const TCPrototype& p) {
     TCNimString value{};
     memcpy(&value.length, p.bytes + kPrototypeNameOffset, sizeof(value.length));

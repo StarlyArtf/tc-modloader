@@ -42,6 +42,9 @@ try {
  if ($taskPreviousVersion -ne $taskVersion) { Write-Host "Version: $taskPreviousVersion -> $taskVersion (src/version.hpp regenerated)" }
  New-Item -ItemType Directory -Force build,dist | Out-Null
  if (!(Test-Path src\proxy.def)) { & node tools\exports.js; if ($LASTEXITCODE) { throw 'Export generation failed' } }
+ # The installer's icon is generated like the export list: checked in, and
+ # rebuilt by its own script when someone removes it.
+ if (!(Test-Path assets\tc-modloader.ico)) { & .\tools\make-icon.ps1; if ($LASTEXITCODE) { throw 'Icon generation failed' } }
  foreach ($taskFile in @('miniz','miniz_tdef','miniz_tinfl','miniz_zip')) {
   & "$taskCompiler\gcc.exe" -O2 -Ivendor -c "vendor\$taskFile.c" -o "build\$taskFile.o"
   if ($LASTEXITCODE) { throw 'C compilation failed' }
@@ -75,11 +78,64 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  & .\tools\Pack-Mod.ps1 -Source $taskPinNamesMod -Output (Join-Path $taskRoot 'dist\local.pin-names-patch.mod')
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -Ivendor src\cli.cpp @taskObjects -lbcrypt -o dist\tcmod-cli.exe
  if ($LASTEXITCODE) { throw 'CLI build failed' }
- '101 RCDATA "../dist/tc-loader.dll"' | Set-Content build\setup.rc -Encoding ascii
- & "$taskCompiler\windres.exe" -Ibuild build\setup.rc -O coff -o build\setup-resource.o
+ # The installer's resources: the embedded loader (one file to distribute), the
+ # version block Explorer reads, and the manifest that makes the process
+ # per-monitor V2 DPI aware and keeps it a normal-user process until the player
+ # asks for administrator rights.  The version comes from VERSION like every
+ # other place that prints it.
+ $taskVersionCommas = '{0},{1},{2},0' -f $taskMajorNumber, $taskMinorNumber, $taskPatchNumber
+ $taskVersionResource = @'
+#pragma code_page(65001)
+#include <windows.h>
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION __COMMAS__
+ PRODUCTVERSION __COMMAS__
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "CompanyName", "TC Mod Loader"
+      VALUE "FileDescription", "__DESCRIPTION__"
+      VALUE "FileVersion", "__VERSION__"
+      VALUE "InternalName", "TCModLoader-Setup"
+      VALUE "OriginalFilename", "TCModLoader-Setup.exe"
+      VALUE "ProductName", "TC Mod Loader"
+      VALUE "ProductVersion", "__VERSION__"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END
+'@
+ # Keep the template ASCII: Windows PowerShell reads BOM-less UTF-8 scripts
+ # through the ANSI code page, which can corrupt non-ASCII string literals.
+ $taskDescription = 'TC Mod Loader ' + (-join @([char]0x5b89, [char]0x88c5, [char]0x5668))
+ $taskVersionResource = $taskVersionResource.Replace('__COMMAS__', $taskVersionCommas).Replace('__VERSION__', $taskVersion).Replace('__DESCRIPTION__', $taskDescription)
+ # Written with an explicit UTF-8 BOM: rc.exe/windres read resources in the ANSI
+ # code page unless the file is marked, and PowerShell 7's `-Encoding utf8`
+ # deliberately writes no BOM (which turned 安装器 into mojibake in the version
+ # block).  The #pragma above then makes windres decode the rest as UTF-8.
+ [IO.File]::WriteAllText((Join-Path $taskRoot 'build\setup-version.rc'), $taskVersionResource, (New-Object System.Text.UTF8Encoding($true)))
+ & "$taskCompiler\windres.exe" -Ibuild -Isrc src\setup_resources.rc -O coff -o build\setup-resource.o
  if ($LASTEXITCODE) { throw 'Resource build failed' }
- & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -municode -mwindows -Ivendor src\setup.cpp build\setup-resource.o @taskObjects -lbcrypt -lcomdlg32 -lshell32 -o dist\TCModLoader-Setup.exe
+ # The installer is split along the boundaries docs/PLAN-installer-ui.md §6
+ # asks for: file work, discovery, state rules, window and entry point.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Wno-misleading-indentation -static -municode -mwindows -Ivendor src\setup.cpp src\setup_core.cpp src\setup_discovery.cpp src\setup_state.cpp src\setup_window.cpp build\setup-resource.o @taskObjects -lbcrypt -lcomdlg32 -lshell32 -ladvapi32 -o dist\TCModLoader-Setup.exe
  if ($LASTEXITCODE) { throw 'Installer build failed' }
+ # The state -> action matrix, the safety lines and the discovery rules are pure
+ # functions, so the whole installer state machine is testable without a window
+ # or a game directory.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -Ivendor tests\setup-state.cpp src\setup_state.cpp src\setup_discovery.cpp -ladvapi32 -o build\setup-state-test.exe
+ if ($LASTEXITCODE) { throw 'Installer state test build failed' }
+ & .\build\setup-state-test.exe
+ if ($LASTEXITCODE) { throw 'Installer state tests failed' }
+ New-Item -ItemType Directory -Force (Join-Path $taskRoot 'examples\cycle-guard\native') | Out-Null
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared examples\cycle-guard\plugin.cpp -o examples\cycle-guard\native\cycle-guard.dll
  if($LASTEXITCODE){throw 'Example plugin build failed'}
  $taskExample=Join-Path $taskRoot 'build\cycle-guard-package'
@@ -88,6 +144,7 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  Copy-Item examples\cycle-guard\native\cycle-guard.dll (Join-Path $taskExample 'native') -Force
  if(Test-Path dist\example.cycle-guard.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.cycle-guard.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskExample -Output (Join-Path $taskRoot 'dist\example.cycle-guard.mod')
+ New-Item -ItemType Directory -Force (Join-Path $taskRoot 'examples\mod-inspector\native') | Out-Null
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -static -shared -Isdk examples\mod-inspector\plugin.cpp -o examples\mod-inspector\native\mod-inspector.dll
  if($LASTEXITCODE){throw 'Inspector example build failed'}
  $taskInspector=Join-Path $taskRoot 'build\mod-inspector-package'
@@ -100,9 +157,13 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  # engine drives the board, so the package carries the simcore headers it was
  # built against.
  $taskSandboxSim=Join-Path $taskRoot 'build\sandbox-sim-package'
+ if(Test-Path -LiteralPath $taskSandboxSim){Remove-Item -LiteralPath $taskSandboxSim -Recurse -Force}
  New-Item -ItemType Directory -Force (Join-Path $taskSandboxSim 'native') | Out-Null
+ & .\simcore\view\build.ps1
+ if($LASTEXITCODE){throw 'simcore-view build failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\sandbox-sim\plugin.cpp -o (Join-Path $taskSandboxSim 'native\sandbox-sim.dll')
  if($LASTEXITCODE){throw 'Sandbox simulator build failed'}
+ Copy-Item (Join-Path $taskRoot 'build\simcore-view.exe') (Join-Path $taskSandboxSim 'native\simcore-view.exe') -Force
  # The simulator reads the interactive switch/button from their instance
  # configuration (tc.component.instances + tc.component.storage), which is why
  # it needs the "component" capability as well.
@@ -128,6 +189,28 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  Copy-Item examples\custom-or\native\custom-or.dll (Join-Path $taskCustomOr 'native') -Force
  if(Test-Path dist\example.custom-or.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.custom-or.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskCustomOr -Output (Join-Path $taskRoot 'dist\example.custom-or.mod')
+ # The declarative property editor (tc.component.editor): a component whose
+ # whole state is its configuration, with a field table instead of an editor
+ # window.  The playtest drives the host's rows with real mouse and keyboard.
+ New-Item -ItemType Directory -Force examples\editor-demo\native | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk examples\editor-demo\plugin.cpp -o examples\editor-demo\native\editor-demo.dll
+ if($LASTEXITCODE){throw 'Editor demo build failed'}
+ $taskEditorDemo=Join-Path $taskRoot 'build\editor-demo-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskEditorDemo 'native') | Out-Null
+ Copy-Item examples\editor-demo\mod.json $taskEditorDemo -Force
+ Copy-Item examples\editor-demo\native\editor-demo.dll (Join-Path $taskEditorDemo 'native') -Force
+ if(Test-Path dist\local.editor-demo.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\local.editor-demo.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskEditorDemo -Output (Join-Path $taskRoot 'dist\local.editor-demo.mod')
+ # The row-driving gate for the same service: the driver enters a level, places
+ # one editor-demo component, clicks its body and then clicks a row of the editor
+ # the loader drew (tests/component-editor-playtest.ps1 -Stage rows).
+ $taskEditorDriver=Join-Path $taskRoot 'build\component-editor-driver-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskEditorDriver 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\component-editor-driver.cpp -o (Join-Path $taskEditorDriver 'native\component-editor-driver.dll')
+ if($LASTEXITCODE){throw 'Editor driver build failed'}
+ ('{"format":2,"id":"dev.component-editor-driver","name":"Component editor driver","version":"0.1.0","capabilities":["log","symbol","symbol_alias","hook","services","game_handles"],"native":{"api":1,"entry":"native/component-editor-driver.dll"}}') | Set-Content (Join-Path $taskEditorDriver 'mod.json') -Encoding ascii
+ if(Test-Path dist\dev.component-editor-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.component-editor-driver.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskEditorDriver -Output (Join-Path $taskRoot 'dist\dev.component-editor-driver.mod')
  # Optional custom drawing SDK example.
  $taskDrawing=Join-Path $taskRoot 'build\drawing-demo-package'
  New-Item -ItemType Directory -Force (Join-Path $taskDrawing 'native') | Out-Null
@@ -268,6 +351,20 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  Copy-Item examples\byte-adder\native\byte-adder.dll (Join-Path $taskByteAdder 'native') -Force
  if(Test-Path dist\example.byte-adder.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.byte-adder.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskByteAdder -Output (Join-Path $taskRoot 'dist\example.byte-adder.mod')
+ # TC-Verilog project example: the DLL loads its definition and RTL from the
+ # sibling files the Mod cache extracted from native/.
+ $taskVerilogRam=Join-Path $taskRoot 'build\tc-verilog-ram-package'
+ if(Test-Path -LiteralPath $taskVerilogRam){Remove-Item -LiteralPath $taskVerilogRam -Recurse -Force}
+ New-Item -ItemType Directory -Force (Join-Path $taskVerilogRam 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Werror -static -shared -Isdk `
+   examples\tc-verilog-ram\plugin.cpp sdk\tc_verilog.cpp sdk\tc_verilog_project.cpp `
+   -o (Join-Path $taskVerilogRam 'native\tc-verilog-ram.dll')
+ if($LASTEXITCODE){throw 'TC-Verilog RAM example build failed'}
+ Copy-Item examples\tc-verilog-ram\mod.json $taskVerilogRam -Force
+ Copy-Item examples\tc-verilog-ram\tc-verilog.json,examples\tc-verilog-ram\ram16x8.v `
+   (Join-Path $taskVerilogRam 'native') -Force
+ if(Test-Path dist\example.tc-verilog-ram.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\example.tc-verilog-ram.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskVerilogRam -Output (Join-Path $taskRoot 'dist\example.tc-verilog-ram.mod')
  # Probe for the two 0-pin component shapes (a source and a sink): it reuses the
  # byte-adder level runner and only replaces the registration, so the log says
  # whether the game imported the scaffolds and whether the callbacks ran.
@@ -287,6 +384,16 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  '{"format":2,"id":"dev.cost-watch","name":"Gate and delay score observer","version":"0.1.0","native":{"api":1,"entry":"native/cost-watch.dll"}}' | Set-Content (Join-Path $taskCostWatch 'mod.json') -Encoding utf8
  if(Test-Path dist\dev.cost-watch.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.cost-watch.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskCostWatch -Output (Join-Path $taskRoot 'dist\dev.cost-watch.mod')
+ # Real-machine driver for the built-in Keyboard rewrite: pushes key events into
+ # the component's own ring buffer and reads its output slots back (dev only;
+ # tests/keyboard-fix-playtest.ps1 owns the assertions).
+ $taskKeyboardFix=Join-Path $taskRoot 'build\keyboard-fix-driver-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskKeyboardFix 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\keyboard-fix-driver.cpp -o (Join-Path $taskKeyboardFix 'native\keyboard-fix-driver.dll')
+ if($LASTEXITCODE){throw 'Keyboard fix driver build failed'}
+ '{"format":2,"id":"dev.keyboard-fix-driver","name":"Keyboard fix driver","version":"0.1.0","capabilities":["log","services"],"native":{"api":1,"entry":"native/keyboard-fix-driver.dll"}}' | Set-Content (Join-Path $taskKeyboardFix 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.keyboard-fix-driver.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.keyboard-fix-driver.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskKeyboardFix -Output (Join-Path $taskRoot 'dist\dev.keyboard-fix-driver.mod')
  # Built-in prototype table dump (dev only).
  $taskKindList=Join-Path $taskRoot 'build\kind-list-package'
  New-Item -ItemType Directory -Force (Join-Path $taskKindList 'native') | Out-Null
@@ -295,6 +402,38 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  '{"format":2,"id":"dev.kind-list","name":"Built-in prototype table dump","version":"0.1.0","native":{"api":1,"entry":"native/kind-list.dll"}}' | Set-Content (Join-Path $taskKindList 'mod.json') -Encoding utf8
  if(Test-Path dist\dev.kind-list.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.kind-list.mod')}
  & .\tools\Pack-Mod.ps1 -Source $taskKindList -Output (Join-Path $taskRoot 'dist\dev.kind-list.mod')
+ # The built-in type catalogue service (M4 first cut): a probe that queries
+ # tc.component.compose and dumps it in the same spelling kinds.txt uses, so the
+ # playtest can compare the two independent readers of the prototype table.
+ $taskComposeProbe=Join-Path $taskRoot 'build\compose-probe-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskComposeProbe 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\compose-probe.cpp -o (Join-Path $taskComposeProbe 'native\compose-probe.dll')
+ if($LASTEXITCODE){throw 'Compose probe build failed'}
+ '{"format":2,"id":"dev.compose-probe","name":"Built-in type catalogue probe","version":"0.1.0","capabilities":["log","services"],"native":{"api":1,"entry":"native/compose-probe.dll"}}' | Set-Content (Join-Path $taskComposeProbe 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.compose-probe.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.compose-probe.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskComposeProbe -Output (Join-Path $taskRoot 'dist\dev.compose-probe.mod')
+ # The internal-netlist builder (tc.component.compose V2): a probe that registers a
+ # composite - a three-input AND built from the game's own AND parts - puts it on
+ # the and_gate_3 fixture board and lets the game's own level test judge it.
+ $taskComposite=Join-Path $taskRoot 'build\composite-package'
+ New-Item -ItemType Directory -Force (Join-Path $taskComposite 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\composite-probe.cpp -o (Join-Path $taskComposite 'native\composite.dll')
+ if($LASTEXITCODE){throw 'Composite probe build failed'}
+ '{"format":2,"id":"dev.composite-probe","name":"Internal-netlist composite probe","version":"0.1.0","capabilities":["log","symbol","hook","component","logic","services"],"native":{"api":1,"entry":"native/composite.dll"}}' | Set-Content (Join-Path $taskComposite 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.composite-probe.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.composite-probe.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskComposite -Output (Join-Path $taskRoot 'dist\dev.composite-probe.mod')
+ # The wide half of the same feature: the 5-to-32 decoder of
+ # examples/composite-decoder/decoder.hpp registered as a component through the
+ # same service, so the type can be placed on a board and opened (the game draws
+ # the sixty-five-part tree inside).  tests/component-decoder.cpp checks the same
+ # netlist offline.
+ $taskDecoder=Join-Path $taskRoot 'build\decoder-probe'
+ New-Item -ItemType Directory -Force (Join-Path $taskDecoder 'native') | Out-Null
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static -shared -Isdk tests\decoder-probe.cpp -o (Join-Path $taskDecoder 'native\decoder.dll')
+ if($LASTEXITCODE){throw 'Decoder probe build failed'}
+ '{"format":2,"id":"dev.decoder-probe","name":"5-to-32 composite decoder","version":"0.1.0","capabilities":["log","component","logic","services"],"native":{"api":1,"entry":"native/decoder.dll"}}' | Set-Content (Join-Path $taskDecoder 'mod.json') -Encoding utf8
+ if(Test-Path dist\dev.decoder-probe.mod){Remove-Item -LiteralPath (Join-Path $taskRoot 'dist\dev.decoder-probe.mod')}
+ & .\tools\Pack-Mod.ps1 -Source $taskDecoder -Output (Join-Path $taskRoot 'dist\dev.decoder-probe.mod')
  # Menu page registration + ID isolation probe (dev only).  The peer package is
  # the same source with a different mod id, so two pages with identical widget
  # labels exist at once.
@@ -467,6 +606,16 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'Declarative component test build failed'}
  & .\build\native-component-test.exe
  if($LASTEXITCODE){throw 'Declarative component tests failed'}
+ # TC-Verilog's synthesizable parser/interpreter and source-to-V3-component
+ # adapter: ports, Z propagation, edge-triggered NBA state and inferred RAM.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Werror -static -Isdk tests\tc-verilog.cpp sdk\tc_verilog.cpp -o build\tc-verilog-test.exe
+ if($LASTEXITCODE){throw 'TC-Verilog kernel test build failed'}
+ & .\build\tc-verilog-test.exe
+ if($LASTEXITCODE){throw 'TC-Verilog kernel tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Werror -static -Isdk tests\tc-verilog-project.cpp sdk\tc_verilog.cpp sdk\tc_verilog_project.cpp -o build\tc-verilog-project-test.exe
+ if($LASTEXITCODE){throw 'TC-Verilog project test build failed'}
+ & .\build\tc-verilog-project-test.exe
+ if($LASTEXITCODE){throw 'TC-Verilog project tests failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-timing.cpp -o build\component-timing-test.exe
  if($LASTEXITCODE){throw 'Component timing test build failed'}
  & .\build\component-timing-test.exe
@@ -540,10 +689,70 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'Component geometry test build failed'}
  & .\build\component-geometry-test.exe
  if($LASTEXITCODE){throw 'Component geometry tests failed'}
+ # The built-in type catalogue (tc.component.compose V1): the stable spelling of
+ # a game part, its duplicate ranks, the lookups and the ABI capacities.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-compose.cpp -o build\component-compose-test.exe
+ if($LASTEXITCODE){throw 'Component compose test build failed'}
+ & .\build\component-compose-test.exe
+ if($LASTEXITCODE){throw 'Component compose tests failed'}
+ # The internal-netlist builder (tc.component.compose V2): the encoder has to
+ # match the definition bytes the game already accepts (build/nl_def_and3.data),
+ # and every refusal the validator promises has to hold.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-netlist.cpp -o build\component-netlist-test.exe
+ if($LASTEXITCODE){throw 'Component netlist test build failed'}
+ & .\build\component-netlist-test.exe
+ if($LASTEXITCODE){throw 'Component netlist tests failed'}
+ # The wide composite example (examples/composite-decoder/decoder.hpp): a five
+ # input, thirty-two output one-hot decoder built from the game's own parts.  It
+ # pins the generated netlist's shape, that the builder's routing accepts the
+ # layout, that it encodes, and the truth table of all thirty-two patterns.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-decoder.cpp -o build\component-decoder-test.exe
+ if($LASTEXITCODE){throw 'Component decoder test build failed'}
+ & .\build\component-decoder-test.exe
+ if($LASTEXITCODE){throw 'Component decoder tests failed'}
+ # The declarative property rows behind tc.component.editor: field validation,
+ # the little-endian configuration round trip, clamping and the enum cycle.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-editor.cpp -o build\component-editor-test.exe
+ if($LASTEXITCODE){throw 'Component editor test build failed'}
+ & .\build\component-editor-test.exe
+ if($LASTEXITCODE){throw 'Component editor tests failed'}
+  # Loader-owned per-Mod storage: global/profile namespaces, isolation,
+  # atomic replacement, key/value bounds and profile-copy semantics.
+  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Wno-misleading-indentation -static -Ivendor tests\mod-storage.cpp -o build\mod-storage-test.exe -lbcrypt
+  if($LASTEXITCODE){throw 'Mod storage test build failed'}
+  & .\build\mod-storage-test.exe
+  if($LASTEXITCODE){throw 'Mod storage tests failed'}
+  # Declarative Mod settings: copied schemas, constraints/defaults and the
+  # stable text codecs the loader persists through tc.mod.storage.
+  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\mod-settings.cpp -o build\mod-settings-test.exe
+  if($LASTEXITCODE){throw 'Mod settings test build failed'}
+  & .\build\mod-settings-test.exe
+  if($LASTEXITCODE){throw 'Mod settings tests failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-render.cpp -o build\component-render-test.exe
  if($LASTEXITCODE){throw 'Component render test build failed'}
  & .\build\component-render-test.exe
  if($LASTEXITCODE){throw 'Component render tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-input.cpp -o build\component-input-test.exe
+ if($LASTEXITCODE){throw 'Component input test build failed'}
+ & .\build\component-input-test.exe
+ if($LASTEXITCODE){throw 'Component input tests failed'}
+ # The built-in Keyboard rewrite runs on the program the game generated, so its
+ # fixture is that program's real text; see src/keyboard_fix.hpp for the two
+ # defects and the captures they were measured on.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\keyboard-fix.cpp -o build\keyboard-fix-test.exe
+ if($LASTEXITCODE){throw 'Keyboard fix test build failed'}
+ & .\build\keyboard-fix-test.exe
+ if($LASTEXITCODE){throw 'Keyboard fix tests failed'}
+ # The code-editor widget's input callback: the Enter/indent decisions and the
+ # guard that keeps it away from a buffer layout it does not recognise.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -Werror -static tests\tc-code-editor.cpp -o build\tc-code-editor-test.exe
+ if($LASTEXITCODE){throw 'Code editor test build failed'}
+ & .\build\tc-code-editor-test.exe
+ if($LASTEXITCODE){throw 'Code editor tests failed'}
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-channel.cpp -o build\component-channel-test.exe
+ if($LASTEXITCODE){throw 'Component channel test build failed'}
+ & .\build\component-channel-test.exe
+ if($LASTEXITCODE){throw 'Component channel tests failed'}
  & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\simulation.cpp -o build\simulation-test.exe
  if($LASTEXITCODE){throw 'Simulation service test build failed'}
  & .\build\simulation-test.exe
@@ -556,6 +765,20 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'Component tail test build failed'}
  & .\build\component-tail-test.exe
  if($LASTEXITCODE){throw 'Component tail tests failed'}
+ # tc.component.instances V2: which component the game addresses when one is
+ # selected.  The container rule is a pure function over the flattened board
+ # sequence, and the SDK wrapper is checked against a stand-in host table.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-instances.cpp -o build\component-instances-test.exe
+ if($LASTEXITCODE){throw 'Component instances test build failed'}
+ & .\build\component-instances-test.exe
+ if($LASTEXITCODE){throw 'Component instances tests failed'}
+ # tc.component.render V7: the image table behind the picture primitive.  Keys,
+ # handle stability across reloads, revision, retirement and the per-Mod quota
+ # are pure bookkeeping, so they are pinned without a game.
+ & "$taskCompiler\g++.exe" -std=c++17 -O2 -Wall -Wextra -static tests\component-images.cpp -o build\component-images-test.exe
+ if($LASTEXITCODE){throw 'Component images test build failed'}
+ & .\build\component-images-test.exe
+ if($LASTEXITCODE){throw 'Component images tests failed'}
  # The clock Mod's adjustable period (examples/clock): the wave each ladder value
  # produces, the state/RESET/REFRESH contract, and the period the face draws.  The
  # plugin is one translation unit, so the test drives its real callbacks.  The
@@ -594,7 +817,7 @@ Copy-Item build\pin-names-patch.dll (Join-Path $taskRoot 'dist\pin-names-patch\g
  if($LASTEXITCODE){throw 'AND component fixture generation failed'}
  & .\build\and-component-fixture.exe build\and2_component_storage.data 1 1 storage
  if($LASTEXITCODE){throw 'Component storage fixture generation failed'}
- foreach($taskBoard in @('single','mixed','multi','not1board','and3board','adderboard','double8board','xor8board','mux8board','asr8board','adder8board','src0board','sink0board','wide9board')) {
+ foreach($taskBoard in @('single','mixed','multi','not1board','and3board','adderboard','double8board','xor8board','mux8board','asr8board','adder8board','src0board','sink0board','wide9board','wide2048board')) {
   & .\build\and-component-fixture.exe build\and2_component.data 1 1 ('nl-'+$taskBoard)
   if($LASTEXITCODE){throw ('Native logic '+$taskBoard+' board generation failed')}
  }

@@ -1,5 +1,6 @@
 build/
 dist/
+/pack/
 examples/*/native/*.dll
 __pycache__/
 host.log

@@ -59,6 +59,18 @@ size_t format_scientific(uint32_t bits, char* out, size_t capacity);
 size_t format_hex(uint32_t bits, char* out, size_t capacity);
 size_t format_value(uint32_t bits, DisplayMode mode, char* out, size_t capacity);
 
+/* The same four entry points for whichever width the calling type was
+   registered in (plan 6.4.1).  binary32 is the implementation above; binary64
+   formats with Ryu's d2s, and binary16 formats its exact binary32 image and then
+   shortens the digit string until it stops round-tripping back to the same
+   binary16 - the reason `0.1` reads "0.1" in every width instead of the
+   binary32 spelling of the binary16 value. */
+size_t format_shortest_for(uint32_t format, uint64_t bits, char* out, size_t capacity);
+size_t format_scientific_for(uint32_t format, uint64_t bits, char* out, size_t capacity);
+size_t format_hex_for(uint32_t format, uint64_t bits, char* out, size_t capacity);
+size_t format_value_for(uint32_t format, uint64_t bits, DisplayMode mode, char* out,
+                        size_t capacity);
+
 /* `nan`, `inf`, `-inf` and the signed zero are part of the contract; these name
    them the same way the formatters do. */
 const char* decimal_special_name(uint32_t bits); /* nullptr for finite values */

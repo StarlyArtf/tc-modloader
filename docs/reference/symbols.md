@@ -34,7 +34,7 @@ sim_do__modelZsimulationZcompile95thread_u3036
 | `scene.change` | 函数 | 场景切换 |
 | `board.wire.update` | 函数 | `bool(void*, void*, void*, uint32_t point, uint8_t colour)` |
 | `board.world_to_screen` | 函数 | `Vec2(Vec2 world)`：读全局 `ubo_view_model` 里的相机，返回**归一化**屏幕坐标；游戏自己的 `draw_simple_rect` 会把它乘上 `ImGuiIO.DisplaySize`（`io+8`）再画。板面网格 Mod 用它把网格画在板面坐标系上 |
-| `options.general` | 函数 | `void(void* presenter)`：设置页「常规」那一页；板面网格 Mod 钩它并追加一行开关 |
+| `options.general` | 函数 | `void(void* presenter)`：设置页「常规」那一页；保留给确实需要扩展游戏原页的 Mod（板面网格已迁到 `tc.mod.settings`，不再 Hook） |
 | `save.count` | 数据 | `const int64_t*` 保存次数 |
 | `save.path.level` | 数据 | 关卡路径的 emutls 控制块 |
 | `save.path.schematic` | 数据 | 原理图路径的 emutls 控制块 |
