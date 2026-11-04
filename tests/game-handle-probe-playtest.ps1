@@ -41,7 +41,13 @@ $taskMod = if ($Example) { 'dev.game-handle-probe' } else { 'dev.game-handle-pro
 # Always refresh the sandbox: make-ui-sandbox.ps1 is what copies the loader
 # (dist\tc-loader.dll -> game_engine.dll), and a sandbox that keeps an older
 # loader silently tests the previous build.
-& (Join-Path $PSScriptRoot 'make-ui-sandbox.ps1') -Sandbox $Sandbox -Mods $taskMod
+# -Recreate additionally drops the sandbox's profile.  The driver's own scene
+# ends with the game's "save the level" command, so the profile holds a
+# schematic the next run would load back: the board would then start with a
+# live component, the edit phase's placement would land on an occupied cell
+# (`FAILED/STATE`) and this case would fail for a reason that has nothing to do
+# with the loader.
+& (Join-Path $PSScriptRoot 'make-ui-sandbox.ps1') -Sandbox $Sandbox -Mods $taskMod -Recreate
 "Loader under test: $((Get-FileHash (Join-Path $taskRoot 'game_engine.dll') -Algorithm SHA256).Hash)"
 Remove-Item -LiteralPath $taskLog -ErrorAction SilentlyContinue
 

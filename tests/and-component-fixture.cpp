@@ -16,6 +16,8 @@ namespace {
 constexpr uint64_t kAndComponentId = 0x414E44325F303031ULL;
 constexpr uint64_t kInnerComponentId = 0x414E44325F303032ULL;
 constexpr uint64_t kNot1ComponentId = 0x4E4F54315F303031ULL;
+constexpr uint64_t kWide2048ComponentId = 0x57323034385F3031ULL; /* "W2048_01" */
+constexpr uint64_t kWideSourceComponentId = 0x5736345352433031ULL; /* "W64SRC01" */
 /* The custom-tail keyspace the host stores a configuration in
    (src/component_tail.hpp): "TCM3" in the high 32 bits, field number below. */
 constexpr uint64_t kTailMagic = 0x54434D33ULL;
@@ -616,6 +618,19 @@ std::vector<uint8_t> buildNativeLogicBoard(const std::string& kind) {
         addWire(writer, -12, -1, {0xC004, 0x000F, 0x4005, 0x0000});  // level input -> NOT in
         addWire(writer, -12, 1, {0x0006, 0xC001, 0x0000});           // level input -> component in0
         addWire(writer, 6, 0, {0x0006, 0x0000});                     // NOT out -> level output
+    } else if(kind=="wide2048board") {
+        // A fully unconnected 32 x 64-bit V2 component beside the not_gate
+        // level's ordinary NOT path.  Its generated scaffold is still compiled
+        // and scheduled, so the callback has to receive all 2048 staged bits
+        // (zero here) while the stock path lets the level finish normally.
+        writer.i64(3);
+        addV13CustomInstance(writer, -12, 28, 0x1111111111111111ULL, kWideSourceComponentId);
+        addV13CustomInstance(writer, -5, 12, 0x2222222222222222ULL, kWide2048ComponentId);
+        addV13Pin(writer, 0x03, 4, 0, 0x4444444444444444ULL, "", 1);
+        writer.i64(3);
+        addWire(writer, -10, 28, {0x0003, 0x0000});
+        addWire(writer, -12, -1, {0xC004, 0x000F, 0x4005, 0x0000});
+        addWire(writer, 6, 0, {0x0006, 0x0000});
     } else if(kind=="wide9board") {
         // A nine-input V2 component: pins at (-7,-4)..(-7,4) for an instance at
         // (-5,0), which is the geometry the declarative path reports (three

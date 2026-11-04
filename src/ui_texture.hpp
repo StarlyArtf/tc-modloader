@@ -98,22 +98,73 @@ struct UploadState {
 };
 
 class Manager {
-    struct Entry {void* owner;GLuint id;uint64_t bytes;int retired=-1;HGLRC context;};
+    struct Entry {
+        void* owner=nullptr;GLuint id=0;uint64_t bytes=0;int retired=-1;
+        HGLRC context=nullptr;uint32_t width=0,height=0,filter=0;
+        std::vector<unsigned char> pixels;
+    };
     std::map<uint64_t,Entry> entries;
     uint64_t next=1;
     DWORD thread=0;
     int currentFrame=-1;
     GL gl;
+    uint64_t deviceGeneration=0;
+
+    bool upload(const unsigned char* pixels,uint32_t width,uint32_t height,uint32_t filter,
+                GLuint* out) {
+        if(!out||!pixels||!gl.ready())return false;
+        GLint maximum=0;glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
+        if(width>static_cast<uint32_t>(maximum)||height>static_cast<uint32_t>(maximum))return false;
+        GLuint id=0;
+        {
+            UploadState restore(gl);
+            glGenTextures(1,&id);
+            if(id) {
+                glBindTexture(GL_TEXTURE_2D,id);
+                const GLint mode=filter?GL_NEAREST:GL_LINEAR;
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,mode);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,mode);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,0x812F);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,0x812F);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+                GLint uploadedWidth=0,uploadedHeight=0;
+                glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH,&uploadedWidth);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT,&uploadedHeight);
+                if(uploadedWidth!=static_cast<GLint>(width)||uploadedHeight!=static_cast<GLint>(height)) {
+                    glDeleteTextures(1,&id);id=0;
+                }
+            }
+        }
+        *out=id;return id!=0;
+    }
 public:
     /* Called only by the main-thread runtime, before invoking plugins. */
     void advance(int frame) {
         if(!thread)thread=GetCurrentThreadId();
         if(thread!=GetCurrentThreadId())return;
         currentFrame=frame;
+        const HGLRC previous=gl.context;
         if(!gl.ready())return;
+        if(!deviceGeneration)deviceGeneration=1;
+        else if(previous&&previous!=gl.context) {
+            ++deviceGeneration;
+            /* Objects from the old context cannot be used or safely deleted in
+               the new one.  Re-upload every live entry from the loader-owned
+               pixel copy; public handles do not change. */
+            for(auto& item:entries)if(item.second.retired<0) {
+                GLuint replacement=0;
+                if(upload(item.second.pixels.data(),item.second.width,item.second.height,
+                          item.second.filter,&replacement)) {
+                    item.second.id=replacement;item.second.context=gl.context;
+                } else {
+                    item.second.id=0;item.second.context=gl.context;
+                }
+            }
+        }
         for(auto i=entries.begin();i!=entries.end();) {
-            if(i->second.retired>=0 && i->second.retired<frame && i->second.context==gl.context) {
-                glDeleteTextures(1,&i->second.id);i=entries.erase(i);
+            if(i->second.retired>=0 && i->second.retired<frame) {
+                if(i->second.id&&i->second.context==gl.context)glDeleteTextures(1,&i->second.id);
+                i=entries.erase(i);
             } else ++i;
         }
     }
@@ -127,32 +178,16 @@ public:
         size_t owned=0;uint64_t ownedBytes=0;
         for(auto& item:entries)if(item.second.owner==owner){++owned;ownedBytes+=item.second.bytes;}
         if(owned>=64||ownedBytes+bytes>128u*1024u*1024u||!next)return -3;
-        GLint maximum=0;glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
-        if(pixels->width>static_cast<uint32_t>(maximum)||pixels->height>static_cast<uint32_t>(maximum))return -3;
         // Allocate map storage BEFORE creating a GPU resource, so allocation
         // failure cannot orphan a texture.
         const uint64_t handle=next++;
-        auto inserted=entries.emplace(handle,Entry{owner,0,bytes,-1,gl.context}).first;
+        Entry entry;entry.owner=owner;entry.bytes=bytes;entry.context=gl.context;
+        entry.width=pixels->width;entry.height=pixels->height;entry.filter=pixels->filter;
+        const auto* source=static_cast<const unsigned char*>(pixels->rgba);
+        entry.pixels.assign(source,source+static_cast<size_t>(bytes));
+        auto inserted=entries.emplace(handle,std::move(entry)).first;
         GLuint id=0;
-        {
-            UploadState restore(gl);
-            glGenTextures(1,&id);
-            if(id) {
-                glBindTexture(GL_TEXTURE_2D,id);
-                const GLint filter=pixels->filter?GL_NEAREST:GL_LINEAR;
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,filter);
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,filter);
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,0x812F); // CLAMP_TO_EDGE
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,0x812F);
-                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,pixels->width,pixels->height,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels->rgba);
-                GLint width=0,height=0;
-                glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH,&width);
-                glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT,&height);
-                if(width!=static_cast<GLint>(pixels->width)||height!=static_cast<GLint>(pixels->height)) {
-                    glDeleteTextures(1,&id);id=0;
-                }
-            }
-        }
+        upload(source,pixels->width,pixels->height,pixels->filter,&id);
         if(!id){entries.erase(inserted);return -4;}
         inserted->second.id=id;
         *out=TCUiTexture{sizeof(TCUiTexture),pixels->width,pixels->height,0,handle,id};
@@ -168,5 +203,15 @@ public:
         if(!onThread())return;
         for(auto& item:entries)if(item.second.owner==owner&&item.second.retired<0)item.second.retired=currentFrame;
     }
+    bool resolve(void* owner,uint64_t handle,uint64_t* renderer,uint64_t* generation=nullptr) const {
+        if(renderer)*renderer=0;
+        auto found=entries.find(handle);
+        if(found==entries.end()||found->second.owner!=owner||found->second.retired>=0||
+           !found->second.id)return false;
+        if(renderer)*renderer=found->second.id;
+        if(generation)*generation=deviceGeneration;
+        return true;
+    }
+    uint64_t generation() const {return deviceGeneration;}
 };
 }}

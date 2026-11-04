@@ -60,6 +60,14 @@ constexpr uint64_t kFp32ToI32Id = UINT64_C(0x4633324632495f31);
 constexpr uint64_t kFp32ToU32Id = UINT64_C(0x4633324632555f31);
 constexpr uint64_t kSplitBitsId = UINT64_C(0x46333253504c5f31);
 constexpr uint64_t kMakeBitsId = UINT64_C(0x4633324d4b425f31);
+/* The width cut's Constant/Add/Display in the other two formats (plan 6.4.1:
+   one format is one type, so each has its own id). */
+constexpr uint64_t kFp16ConstantId = UINT64_C(0x463136434f4e5331);
+constexpr uint64_t kFp16AddId = UINT64_C(0x4631364144445f31);
+constexpr uint64_t kFp16DisplayId = UINT64_C(0x4631364449535031);
+constexpr uint64_t kFp64ConstantId = UINT64_C(0x463634434f4e5331);
+constexpr uint64_t kFp64AddId = UINT64_C(0x4636344144445f31);
+constexpr uint64_t kFp64DisplayId = UINT64_C(0x4636344449535031);
 
 struct Writer {
     std::vector<uint8_t> bytes;
@@ -346,6 +354,68 @@ Board buildCrowdCircuit() {
     return board;
 }
 
+/* The widths board: one Constant -> Add -> Display chain per format, so a real
+   game run computes 1.0 + 1.0 in binary16, binary32 and binary64 at the same
+   time and the Mod's own display lines show each result in its own width's
+   text ("2 0x4000", "2 0x40000000", "2 0x4000000000000000").  The arithmetic
+   and the per-instance rounding of each width are covered offline
+   (tests/float-compat.cpp, tests/float-kernel.cpp, tests/float-text.cpp); what
+   this board adds is the end-to-end path in the shipped game - registration,
+   pins, the compiled program, the callbacks, the text layer and the display.
+
+   Every instance keeps the configuration its type registered (a Constant of
+   1.0 in that width, RNE), so nothing here depends on a write: the board itself
+   proves that the three chains run in three different formats. */
+Board buildWidthsCircuit() {
+    Writer writer;
+    writer.i64(INT64_C(0x6f13c29bb2e19440));
+    writer.u32(0);
+    writer.i64(0);
+    writer.i64(0);
+    writer.u8(1);
+    writer.i64(10000);
+    writer.emptyI64Sequence();
+    writer.string("");
+    writer.u8(0);
+    writer.u16(0);
+    writer.emptyByteSequence();
+    writer.string("");
+    for (int i = 0; i < 512; ++i) writer.u8(0);
+
+    struct Chain {
+        uint64_t constant;
+        uint64_t add;
+        uint64_t display;
+        int16_t y;
+    };
+    const Chain chains[] = {
+        {kFp16ConstantId, kFp16AddId, kFp16DisplayId, 0},
+        {kConstantId, kAddId, kDisplayId, 16},
+        {kFp64ConstantId, kFp64AddId, kFp64DisplayId, 32},
+    };
+    writer.i64(static_cast<int64_t>(sizeof(chains) / sizeof(chains[0])) * 4);
+    uint64_t identity = UINT64_C(0x4000000000000000);
+    for (const Chain& chain : chains) {
+        addCustomInstance(writer, -12, chain.y, identity++, chain.constant);      /* A */
+        addCustomInstance(writer, -12, static_cast<int16_t>(chain.y + 4), identity++,
+                          chain.constant);                                       /* B */
+        addCustomInstance(writer, 0, chain.y, identity++, chain.add);
+        addCustomInstance(writer, 8, chain.y, identity++, chain.display);
+    }
+    writer.i64(static_cast<int64_t>(sizeof(chains) / sizeof(chains[0])) * 3);
+    for (const Chain& chain : chains) {
+        addWire(writer, -9, chain.y, {east(6)});
+        addWire(writer, -9, static_cast<int16_t>(chain.y + 4), {east(6), north(3)});
+        addWire(writer, 3, chain.y, {east(2)});
+    }
+
+    Board board{};
+    board.passCount = 0;
+    board.catalogueCount = static_cast<int>(sizeof(chains) / sizeof(chains[0])) * 4;
+    board.bytes = std::move(writer.bytes);
+    return board;
+}
+
 void appendLiteralSnappy(const std::vector<uint8_t>& raw, std::vector<uint8_t>* out) {
     uint64_t remaining = raw.size();
     do {
@@ -401,6 +471,11 @@ int main(int argc, char** argv) {
         const std::filesystem::path output =
             argc > 2 ? argv[2] : "build/float-crowd-board.data";
         return writeBoard(buildCrowdCircuit(), output, "crowd");
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--widths") == 0) {
+        const std::filesystem::path output =
+            argc > 2 ? argv[2] : "build/float-widths-board.data";
+        return writeBoard(buildWidthsCircuit(), output, "widths");
     }
     if (argc > 1 && std::strcmp(argv[1], "--boundary") == 0) {
         const std::filesystem::path output =

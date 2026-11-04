@@ -688,6 +688,23 @@ typedef struct TCComponentRenderV1 {
 
 ## 21. 状态表
 
+> **M4 完成（2026-09-29，四刀）。** 第一刀 `tc.component.compose` V1：引导时读一遍
+> 原型表，给每个 kind 一条记录——**稳定拼写** `builtin/<名字>`（同一构建重名按 kind 升序编号
+> `#2`、`#3`…；没名字的槽位用 `builtin/0x<kind>`）、名字与说明、声明的引脚（板面格偏移 + 原始
+> 字宽：数字 / `0x7fff…` 自动标记 / 本构建两个 Splitter 那个未核实的衍生标记）与两个标志
+> （`NO_DECLARED_INPUTS`、`HAS_SHAPE`）。**代价与能力位故意不报**（前者由游戏打分器从内部电路算，
+> 原型里那两个字段全 0；后者是别名那条路的研究）。离线 `tests/component-compose.cpp`；真机
+> `component-compose` 用例把新探针与既有引脚表探针装进**同一个沙盒、同一次会话**，要求两个互相
+> 独立的读表者 125 条逐字段一致。第二刀 **V2 内部网表 builder**：`begin/node/connect/commit/abort/status`，
+> 校验（悬空/越界/多驱动/无状态组合环/布线冲突）在提交前跑完，门数由游戏按内部电路重算（真机 2 个
+> AND 节点读回 `gates=2`，探针故意声明 1），离线编码器与游戏已接受的夹具字节逐字段对照
+> （`tests/component-netlist.cpp`）。第三刀**嵌套**：`node()` 接受另一个已注册类型的 `type_id`。
+> 第四刀**复用三路径**：`create_builtin_node`（就是 `builtin/…` 节点）与 `clone_builtin_metadata`
+> （名字/说明/代价；图标不可复制，用 V5 图片）已交付；`register_builtin_alias` **判定不可用**
+> （`alias()` 恒 `UNSUPPORTED`，目录 `TC_BUILTIN_FLAG_ALIASABLE` 从不置位——游戏按 kind 字节分发，
+> Mod 实例恒 `0x4e`）。真机门禁 `component-composite`：AND3 放进 `and_gate_3` 关卡，游戏自己的测试
+> 判 `verdict=1`。仍未做、编码事实与下一批起点见 [HANDOFF-component-m4.md](HANDOFF-component-m4.md)。
+
 > M5 最新进展（2026-09-23）：除 geometry V1 与 footprint 命中闭环外，已交付
 > `tc.component.render` V1 最小覆盖层（逐类型/逐实例回调、帧级句柄、四向旋转仿射基、裁剪框、
 > 宿主受控基础图元和 4096 条/实例/帧配额）与 **V2 的 `set_default_drawing`**（按类型关掉游戏给
@@ -706,14 +723,75 @@ typedef struct TCComponentRenderV1 {
 > 生命周期、正文完全迁移、缺 Mod 可见占位与元件栏
 > 预览的进一步验收；下表 M5 行若与本段冲突，以本段为准。
 
+> **元件属性编辑器（`tc.component.editor`）第一刀（2026-09-27）**：按 §14 的"声明式属性
+> schema"落地了 V1——类型交一张字段表（bool / int / uint≤31 位 / enum / text / float），宿主在
+> 游戏自己的元件抽屉上画行、收鼠标键盘、按 `tc.component.storage` 的同一条路提交（一次提交
+> 一步撤销并触发 `on_config_changed`）。ABI 基线 1238 → 1281；示例 `examples/editor-demo`；离线
+> 单测 `tests/component-editor.cpp`；真机两条门槛都已过：注册
+> （`tests/component-editor-playtest.ps1`）与行驱动
+> （`-Stage rows`：真实鼠标点中宿主画的行、文本行打字 + 回车，断言落在元件自己的
+> `on_config_changed` 上）。三条用例进 `tests/test-catalog.json`。§14 里"自定义绘制""调整尺寸
+> 手柄""右键菜单""把多字段改动合并成一步撤销"等仍属后续版本，不在第一刀内。
+
+> **V2（2026-09-27 同日第二刀）**：`TCComponentEditorApiV2` 加上布局标志
+> （`FULL_ROW`/`INLINE`/`SEPARATOR`）、枚举单选（`RADIO`）、可编辑十六进制（`HEX`，上限 31 → 64 位）
+> 与**滚动行窗口**（按内容高度夹紧 + 尺寸约束封顶，32 行实测 `scrollmax=458`）。示例
+> `examples/editor-demo` 扩成两个类型（7 字段覆盖全部形状、32 行压滚动），真机用例从 3 条加到
+> **6 条**（注册 / 复选框 / 文本 / 单选 / 十六进制 / 长表滚动）全过，ABI 基线 1281 → 1296。
+> 仍未做：下拉/弹窗枚举、颜色字段、行内校验提示、自定义行绘制、多字段合并成一步撤销。
+
+> **编辑器有了真实消费者（2026-09-27）**：`local.float-ops` 已把 22 个类型的属性行从"自己画窗口"
+> 迁到 `tc.component.editor` V2 的字段表（`examples/float-ops/editor.cpp`），并顺手关掉了 render V4 的
+> 工坊按钮、把元件名改成 `浮点/<分类>/<名字>` 五层文件夹。证据见
+> [verification.md](verification.md) 的"`local.float-ops` 改用加载器接口"一节；§14 里仍未交付的部分
+> 不变。
+
+> **`tc.component.editor` V3（2026-09-28）：§14 的可选自定义绘制、枚举下拉、颜色、行内校验与编辑
+> 事务一次补齐，并加了玩家当天的四条界面要求**。V3 的字段描述符是 `TCComponentFieldV2`（内嵌一份
+> 完整 V1/V2 字段），只有显式查询 V3 的 Mod 才会用到：`TC_COMPONENT_FIELD_DROPDOWN`（真下拉）、
+> `TC_COMPONENT_FIELD_COLOR_RGBA8`（颜色）、`TC_COMPONENT_FIELD_CUSTOM` + `TCComponentEditorCustomRowV1`
+> （宿主开裁剪画布、Mod 自己画）+ `TCComponentEditorActionCallbackV1`（右键菜单 / 双击 / 缩放抓手）、
+> `TCComponentEditorValidateV1`（提交前校验：ERROR 拒绝并保留旧字节、WARNING 提交并提示）、
+> `TCComponentEditorApiV3::begin_edit/commit_edit/abort_edit`（把多字段改动合成一步撤销；抓手自动用）。
+> **界面约束**：行窗口每帧读游戏底部面板的矩形并严格夹在其中（装不下就滚动、放得下才把上半留给
+> 游戏内容）；面板折叠时完全不画也不动编辑状态，拉起后同矩形、同已填内容；窗口尺寸变化时字段宽度与
+> 位置每帧重算。**说明文字**：V2 定义默认不把 `description` 写进原型（游戏会把它印在属性行所在的面板
+> 顶部），`TC_COMPONENT_TYPE_SHOW_DESCRIPTION` 显式打开；文字仍留在加载器的类型目录里。§14 里仍未
+> 交付：颜色以外的取色形状、提示图标化、确认/取消式多字段对话框、右键菜单以外的棋盘集成（删除/
+> 移动/选中集写入仍属 §14 依赖的棋盘能力）。
+> **`tc.component.editor` V4（2026-09-29）：§14 剩余的三件一次补齐**。取色的另外两种形状
+> （`TC_COMPONENT_FIELD_COLOR_PALETTE` 色块条 + `TC_COMPONENT_FIELD_COLOR_HEX` 混合十六进制框）、
+> 校验提示的图标化（`TC_COMPONENT_FIELD_VALIDATION_ICON`，消息进 tooltip 与日志）与"确认 / 取消"式
+> 多字段编辑（表级 `TC_COMPONENT_EDITOR_TABLE_CONFIRM` + `set_fields_v3()`：整批一次写 = 一步撤销、
+> 一次 `on_config_changed`）。字段描述符仍是 `TCComponentFieldV2`，V3 的表一字未改；
+> `TC_COMPONENT_FIELD_V3_KNOWN_FLAGS` 把 V3 的位集冻结下来。§14 里仍未交付的只剩它自己点名的
+> **棋盘集成**（删除 / 移动 / 选中集写入 / 高亮 / 镜头），那几项属于 [PLAN-backlog.md](PLAN-backlog.md)
+> 与 [HANDOFF-next-steps.md](HANDOFF-next-steps.md) 的棋盘能力，不是编辑器本身。
+
+> **`tc.component.render` V7（2026-09-27，§10.2 的资源生命周期第一刀）**：§10.1/§10.2 要的"元件在
+> 棋盘本体上画自己的图、资源由宿主持有并回收"落地了第一层——`load_image(key, png_path)` 让加载器
+> 读 PNG、建 GL 对象、按 Mod 持有并在卸载时回收（每 Mod 16 张 / 解码 16 MiB），绘制表 V3 加了
+> `image(handle, quad)` 图元（四角 + uv + tint，计入原有配额与裁剪）。插件从此拿不到 renderer id，
+> 也就不用管理寿命；`examples/clock` 已从"自研 WIC + 宿主纹理 + 引擎入口"迁到它。**仍未做**：
+> 字体资源（斜体/自定义字体）、按实例的资源隔离、设备重建通知（本构建没有重建路径，见
+> reference/limits.md）、以及元件栏分类服务（§21 M4/M5 的其余项）。证据见
+> [verification.md](verification.md) 的 `tc.component.render` V7 一节。
+
+> **`tc.component.instances` V2（2026-09-27，顺手补的加载器缺口）**：§5 表里的 instances 服务补上
+> 一个 `top_level_id`——游戏选中集与顶层遍历认的那个 id（棋盘级元件是它自己，装在别的自定义元件
+> 内部时是外层元件的 id）。此前这一对只以 `interactive-map.txt` 诊断文件形式落盘，
+> `examples/clock` 只能往自己数据目录上跳三级去读它；现在它是正式调用，clock 已迁过去（旧加载器
+> 才回退读文件）。离线 `tests/component-instances.cpp`、真机 `clock-period-window`（含三条新断言，
+> 见 [verification.md](verification.md)）。输入/通道已在 2026-09-28 落地主体；合成/外设与输入真机门禁见 §21 状态表。
+
 | 里程碑 | 状态 |
 |---|---|
 | M0 原版 Keyboard/Screen 调用链研究 | 未开始 |
 | M1 Registry/Pin/Signal V2 | **完成**（2026-09-22）：类型目录 V1、0 脚（纯源/纯汇）、`tc.component.types` V1 + `TCLogicIOV2` + `TCComponentTypeDefinitionV2`（每方向 0–16 脚、自定义状态大小）、三条前置测量（导入上限、外调 4 参数、每脚 64 位）。离线与真机（九脚）证据见 [research/custom-component-pins.md](research/custom-component-pins.md) 与 [verification.md](verification.md)。取舍：不做多字 >64 位信号（出口是 M2 的宿主状态/缓冲） |
-| M2 实例、生命周期和大状态 | **第一刀完成**（2026-09-22）：实例句柄（generation）、`on_create`/`on_destroy`、宿主状态 blob、失效规则与 `tc.component.instances` V1 都已交付，离线 + 真机（两个实例/重置/删除/旧句柄）证据见 [verification.md](verification.md)。M2 回补已开始（2026-09-22）：`on_config_changed` 已交付（一次成功的 write_config 与一次撤销/重做各触发一次，装载与迁移不算改变，回调在实例锁外运行因此可调用 storage 服务；离线 + 真机 `component-storage` 三个模式断言 `config_changes`）。剩余：`on_clone`、`on_load/on_save`，最后是 move/rotate/resize 与编译类回调 |
+| M2 实例、生命周期和大状态 | **完成**（放置/编译/解绑 2026-09-28 收口）：实例句柄（generation）、宿主状态 blob、失效规则、`tc.component.instances` V1/V2，以及整套 `TCComponentLifecycleV1`——`on_create`/`on_destroy`（2026-09-22）、`on_config_changed`、`on_clone`、`on_load`/`on_save`（2026-09-22）、`on_move`/`on_rotate`/`on_resize`/`on_compile`/`on_unbind`（2026-09-28，`TCLogicIOV2` 同时加了放置尾巴）。真机：两个实例/重置/删除/旧句柄、storage 三个模式、`pin-shape-wide9` 的 compile/resize/unbind 断言。**仍未关**：`on_move`/`on_rotate` 的自动真机门禁（棋盘记录确实变了这一步依赖真实拖动/旋转，合成输入在本构建上不被棋盘接受，见 research/component-hitbox-path.md），以及 `on_compile_failed`（编译失败路径不经过生成器，没有可靠信号，不进契约） |
 | M3 存储、迁移和编辑事务 | **完成**（2026-09-22，五刀）：①配置写进元件记录自己的键值表并随原理图存档（绑定即回读、写入先提交记录再改内存、`TCM3` 键空间 + 校验和、构建画像控制布局）；②schema 迁移回调（`OK` 才升级记录，`KEEP`/`REJECT` 保留原字节）；③缺失 Mod：加载期捕获（钩 tail setter 读 `table-0x190` 的完整记录）、诊断、跨会话 store、装回 Mod 后救援注入；④配置写入进撤销/重做（宿主保存前后字节并在有未消费步骤时接管游戏 undo/redo 入口，一次写入或一组 `begin_edit`/`commit_edit` = 一步）；⑤收口：`tc.component.storage` V2 编辑事务、1024 字节上限实测（132 表项、约 1 KB/实例）。全部有真机证据，见 [verification.md](verification.md)。明确留待后续：缺 Mod 期间画面上的占位元件（并入 M5 §10.1）、仿真状态是否入档（§18 决策点）、复制（`on_clone`，M2 回补） |
-| M4 组合电路与原版复用 | 未开始 |
-| M5 棋盘绘制与输入 | **进行中：geometry V1、footprint 命中闭环、render V1 覆盖层、V2 默认绘制接管、V3 选中提示接管与 V4 工坊按钮接管已交付**（2026-09-23）。①`tc.component.geometry` V1 支持声明 footprint 与按旋转回读；**可拖区 = footprint 框**，文本框已采用 8×4 整框命中。②`tc.component.render` V1 提供类型级逐实例回调、帧级句柄、配置快照、局部到屏幕仿射基、裁剪框、受控基础图元和配额，不外借 renderer 指针；V2 增加按类型的 `set_default_drawing`，只对带实例 id 的棋盘实例跳过游戏自己的缩略图/水印绘制，元件栏预览保持原样；V3 增加按类型的 `set_selection_hint`，把游戏那圈白色断弧按元件关掉（真机：同一窗口抑制 0、`KEEP_ARCS` 灵敏度对照 546），Mod 自己按声明 footprint 画提示环；V4 增加按类型的 `set_foundry_button`，把选中时底部面板那个"在元件工坊编辑"按钮关掉（透明绘制 + 返回未点击，面板布局不变；真机同一 42×42 px 矩形：关掉 0、保留对照 654）。③文本框真机门禁已覆盖 rotation 0/1/2/3、实时缩放 25.60→28.16 px/格、四实例相机平移 150 px 且轴不变、平移后按新坐标打开编辑器、四边部分越界的 framebuffer 像素裁剪、关闭默认绘制后 `hidden=0`/对照 `visible=350` 的逐像素对照，以及"空像素处按下并拖动一格 + 选中计数 1→0"。④命令总线放置后的游戏登记遗漏也已修复。剩余：字体/纹理资源生命周期与设备重建、文本正文完全迁移、缺 Mod 可见占位（§10.1）、元件栏预览与自定义 LED/七段显示器的阶段 5 像素回读验收。 |
+| M4 组合电路与原版复用 | **完成（2026-09-29，四刀）**：①目录 V1（稳定拼写 `builtin/<名字>`、重名按 kind 升序 `#2`…、无名槽位 `builtin/0x<kind>`、声明引脚与两个标志；两个独立读表者 125 条全一致）；②**内部网表 builder** V2（`begin/node/connect/commit` + 校验：悬空/越界/多驱动/无状态组合环/布线冲突；编码器 `src/component_netlist.hpp` 与游戏已接受的夹具字节逐字段对照）；③**嵌套**（`node()` 接另一个已注册类型的 `type_id`，真机导入成功）；④**复用三路径**：`create_builtin_node` 已交付、`clone_builtin_metadata` 已交付（名字/说明/代价；**图标不可复制**——游戏对自定义原型忽略 shape SVG，用 V5 图片）、`register_builtin_alias` **判定不可用**（`alias()` 恒 `UNSUPPORTED`，`TC_BUILTIN_FLAG_ALIASABLE` 从不置位；游戏按 kind 字节分发、Mod 实例恒 `0x4e`）。真机：两个原版 AND 拼的 AND3 在 `and_gate_3` 关卡被游戏自己判 `verdict=1`，读回 `gates=2`（游戏按内部电路重算，探针故意声明 1）。**仍未做**：有状态零件的实测输入位置进 builder、字宽节点校验、内层 Mod 被卸载的语义——见 [HANDOFF-component-m4.md](HANDOFF-component-m4.md) §5 |
+| M5 棋盘绘制与输入 | **进行中：geometry/render/input/channel 主体已交付**（2026-09-28）。在既有 geometry V1 与 render V1–V7 上，新增 `tc.component.input` V1：类型级局部命中矩形、宿主仿射命中、逐实例 hover/捕获/键盘焦点、点击/双击/滚轮/拖动、物理键、UTF-8/中文最终提交、Windows IME preedit BEGIN/UPDATE/END 与事件消费；新增 `tc.component.channel` V1：按 owner + 实例 generation 隔离的双向有界队列、丢弃策略/序号/统计与双缓冲快照，调用不等待，实例/场景/Mod 生命周期清理。离线覆盖旋转命中、两实例焦点隔离、拖动、中文码元/preedit、队列次序/满载/快照/owner 隔离，ABI 已冻结。**未关门**：真实中文输入法候选窗/取消组合、两实例真机焦点与快捷键穿透、队列压力真机门禁；以及字体/设备重建、缺 Mod 可见占位、元件栏预览与 LED/七段显示器像素回读。 |
 | M6 Keyboard 参考元件 | 未开始 |
 | M7 Screen/Framebuffer 参考元件 | 未开始 |
 | M8 诊断、配额、文档和发布收口 | 未开始 |

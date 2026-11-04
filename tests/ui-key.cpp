@@ -73,6 +73,39 @@ int main() {
     assert(seen.focus == -1);
     assert(isItemFocused() && seen.focused == 1);
 
+    struct MultilineRecorded {
+        const char* label = nullptr;
+        char* buffer = nullptr;
+        unsigned long long capacity = 0;
+        Vec2 size{};
+        int flags = 0;
+    };
+    static MultilineRecorded multiline;
+    table().inputTextMultiline = [](const char* label, char* buffer,
+                                    unsigned long long capacity, Vec2 size, int flags,
+                                    void* callback, void* user) {
+        assert(!callback && !user);
+        multiline = {label, buffer, capacity, size, flags};
+        return true;
+    };
+    char source[32] = "module x;\nendmodule";
+    assert(inputTextMultiline("##source", source, sizeof(source), {640.f, 360.f}, 17));
+    assert(std::strcmp(multiline.label, "##source") == 0 && multiline.buffer == source &&
+           multiline.capacity == sizeof(source) && multiline.size.x == 640.f &&
+           multiline.size.y == 360.f && multiline.flags == 17);
+
+    table().getContentRegionAvail = [](Vec2* out) { *out = {777.f, 333.f}; };
+    const Vec2 available = contentRegionAvailable();
+    assert(available.x == 777.f && available.y == 333.f);
+    struct SelectableRecorded { bool selected = false; int flags = 0; Vec2 size{}; };
+    static SelectableRecorded selectableCall;
+    table().selectable = [](const char*, bool selected, int flags, Vec2 size) {
+        selectableCall = {selected, flags, size}; return true;
+    };
+    assert(selectable("source.v", true, 9, {220.f, 28.f}));
+    assert(selectableCall.selected && selectableCall.flags == 9 &&
+           selectableCall.size.x == 220.f && selectableCall.size.y == 28.f);
+
     /* The enum values the playtest confirmed with real key messages. */
     static_assert(Key_Tab == 512 && Key_Enter == 525 && Key_Escape == 526 &&
                   Key_Space == 524 && Key_A == 546 && Key_F5 == 576 && Key_LeftArrow == 513);

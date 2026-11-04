@@ -73,6 +73,14 @@ Mod 回退到裸函数调用。
 V1 的命令只有 `type` 与 `argument`，够表达运行／停止／撤销／保存，但表达不了"在某个格点放一个
 元件"。`TCCommandApiV2` 保留 V1 前缀，追加放置载荷；V1 表照旧可查。
 
+V2 目前有三种编辑命令，都用同一个 Board 句柄做 `subject`：
+
+| type | 行为 | 载荷 | 详见 |
+|---|---|---|---|
+| `TC_COMMAND_BOARD_PLACE_COMPONENT` | 在格点放一个元件 | `custom_prototype_id`／`kind`／`x`／`y`／`rotation` | 本节 |
+| `TC_COMMAND_BOARD_DUPLICATE_COMPONENT` | 复制一个自定义实例（含配置，一次 Ctrl+Z 撤掉整个复制） | `argument` = 源实例 id、`custom_prototype_id` = 源类型、`x`／`y`／`rotation` = 目的地 | [services.md](services.md) 的 `on_clone` 一节 |
+| `TC_COMMAND_BOARD_DELETE_COMPONENT` | 删掉一个自定义实例（可撤销） | `argument` = 实例 id、`custom_prototype_id` = 类型 | 下文的"V2：删除元件" |
+
 ```cpp
 TCCommandApiV2 commands{};
 if (tc::commandService(host, &commands) != TC_SERVICE_OK) return 2;
@@ -122,6 +130,59 @@ component placement command board before=2 after=3 found=1
 
 `found=1` 是按公开路径回读的：V3 枚举 → V4 读数，命中的元件 kind `0x4e`、自定义 id 与坐标
 `(20,6)` 全部匹配——命令确实改变了棋盘，而不只是返回成功。
+
+### V2：删除元件（可撤销）
+
+```cpp
+TCCommandV2 erase{};
+erase.size = sizeof(erase);
+erase.type = TC_COMMAND_BOARD_DELETE_COMPONENT;
+erase.subject = board;                    // 当前 Board 句柄
+erase.custom_prototype_id = myTypeId;     // 目标元件的类型
+erase.argument = instanceToDelete;        // 目标元件的实例 id（V4 读到的 id）
+uint64_t request = 0;
+if (commands.submit(commands.context, &erase, &request) != TC_COMMAND_OK) return 3;
+```
+
+载荷和复制命令同一套身份（实例 id + 类型）：`argument` 是实例 id，`custom_prototype_id` 是它
+所属的类型，`x/y/rotation/kind` 不使用。命令按两句名字找目标——序列里 kind `0x4e`
+（`board_edits::kCustomKind`）、`+8` 处的实例 id、`+0x188` 处的自定义 id 全部匹配的那条记录——
+找不到就是 `FAILED/TC_COMMAND_ERR_NOT_FOUND`，不删任何东西。
+
+**删除走游戏自己的撤销感知包装**（`try_delete__modelZutilities_u8585`），不是低层
+`board_delete_component`：它先复制要删的记录、连在元件上的导线一起删，最后把变更列表交给游戏的
+撤销栈。所以一条 `TC_COMMAND_BOARD_UNDO` 会把元件（含其导线）放回来，一条
+`TC_COMMAND_BOARD_REDO` 再把它去掉——这正是低层墓碑删除做不到的（墓碑没有撤销条目，见
+[research/board-object-fields.md](../research/board-object-fields.md) §6.1）。撤销后槽位仍然留在
+序列里，只是变成 kind 0 记录，所以数元件同样要跳过 kind 0。
+
+**别人的类型删不掉。** 入队前会查元件目录（`tc::component_registry`）里这个类型登记的
+`owner_mod`：如果目录把它记在**另一个** Mod 名下，命令直接 `TC_COMMAND_ERR_ARGUMENT`（未入队，
+`request` 保持 0），棋盘一个字节都不会动。目录只记加载器经手过的注册——声明式
+`tc.component.types` 和由加载器桥接的电路导入都带 `owner_mod`。
+
+**目录没有记录的类型则不做归属判断**：一个 Mod 用 `tc.component.model` 自己导入电路
+（`examples/circuit-and`、`examples/custom-or` 走的就是这条路），这条路完全在加载器视野之外，目录
+里没有它的条目，加载器无从判断归属，于是命令照原样执行——和 `DUPLICATE_COMPONENT` 一样，
+总线在这条路上不承担"这是谁的元件"的判断。真机证据里两条都有：删另一个 Mod 的类型被拒（`-2`，
+棋盘不变），删一个没人注册过的类型 id 则入队后在棋盘回读处失败（`NOT_FOUND`）。
+
+真机证据（同一个 `component-placement-playtest`，在放置与事务相位之后）：
+
+```text
+component delete command submit=0 request=4 instance=…
+component delete command state=3 result=0 live=3->2 at(28,10)=0
+component delete undo state=3 result=0 live=3 at(28,10)=1
+component delete redo state=3 result=0 live=2 at(28,10)=0
+component delete peer placement state=3 result=0 instance=… at(12,10)=1
+component delete foreign type submit=-2 request=0 still=1
+component delete unknown type state=4 result=-5 at(12,10)=1
+```
+
+第三行是这条命令与低层删除的分界：撤销把元件放回同一格，`at(28,10)` 又从 0 变回 1；重做再清掉。
+随后三行是归属规则的两半：`submit=-2` 说明另一个 Mod 的类型连队都没进（`request=0`，`still=1`
+说明棋盘上的元件还在），而没人注册过的类型 id 会正常入队、在棋盘回读处以 `NOT_FOUND` 失败。
+peer 用的是本仓库自带的 `local.editor-demo` 包，它的类型 id 是公开的。
 
 **导线编辑故意还没有进总线**：这个构建里唯一"不需要上下文"的加线入口
 （`add_wire_from_pos`）只是鼠标按下式的起步——它留下的记录两个端点相同、状态槽为奇数，而且游戏

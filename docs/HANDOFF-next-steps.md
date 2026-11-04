@@ -16,6 +16,10 @@
 - 第 2 项完成了第一层核实：`board_delete_component(board+0x78,index)` 真机能删除目标活记录，但
   会留下 kind 0 墓碑；放置会复用它。这个低层入口不自行写撤销历史，尚未进命令总线。反汇编找到
   撤销感知的 `try_delete(board, component_indices, wire_ids)`，下一步先测 delete → undo → redo。
+  **2026-09-28 更新：这条后续已落地**——`try_delete` 真机跑通（删除 → `board.undo` 放回 →
+  `board.redo` 再删掉），成为 `TC_COMMAND_BOARD_DELETE_COMPONENT`（type 9）的实现，归属规则
+  （只拒别的 Mod 的类型）与真机门禁见 [sdk/commands.md](sdk/commands.md) 的 V2 删除一节、
+  [verification.md](verification.md) 的"命令 V2：可撤销删除元件"。
 - 移动仍未找到独立入口：`board_commit_move` 只是提交已经发生的拖拽，依赖选择集与拖拽状态，
   没有目标坐标参数。选择相关符号只记录、没有动手，遵守计划边界。
 - 第 3 项（关卡信息只读探针）尚未开始，仍是下一轮首项。
@@ -91,16 +95,19 @@ nm "Turing Complete.exe" | Select-String "modelZboardZboard" |
 
 **风险**：这类全局量可能在某些关卡类型下不写。宁可给"不可用"标记，也不要猜一个值。
 
-## 4. Mod 自己的配置与数据（A 类，生态刚需）
+## 4. Mod 自己的配置与数据（A 类，三刀已完成）
 
 **想要什么**：Mod 有自己的设置，以及"跟着存档走"的数据——而不是自己写文件、换存档就丢。
 
-**现状**：只有每个 Mod 的目录（`plugin-data/<id>/`）；"存一次档"能触发，但 Mod 的数据存不进去。
+**现状更新（2026-09-27）**：三刀均已交付。V1 提供 GLOBAL / PROFILE 隔离 blob；V2 增加与
+payload 同文件原子提交的 schema 版本和迁移回调；`tc.mod.settings` 把声明字段统一放进主页设置页，
+自动读取、校验、保存和重置，并按全局/当前存档分组。
 
-**第一步（拆两小步，别一起做）**：
+**交付拆分**：
 
-1. **每 Mod 的键值配置**：纯加载器侧，读写一个按 Mod id 隔离的配置，没有技术障碍；
-2. **跟关卡/存档绑定的数据**：先搞清楚存档目录结构与"提交成功后再保存"的时序，保证"存了能读回来"。
+1. **已完成：每 Mod 全局配置**：`TC_MOD_STORAGE_SCOPE_GLOBAL`；
+2. **已完成：跟存档绑定的数据**：`TC_MOD_STORAGE_SCOPE_PROFILE`，随 profile 复制；
+3. **已完成：schema 迁移 + 统一设置页**：失败保留旧值；bool/int/float/enum/text 声明式字段。
 
 **验收**：配置部分——写完 → 重启游戏 → 读回相同值；关卡数据部分——存一次 → 换关 → 回关 → 数据还在。
 
@@ -150,6 +157,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/abi.ps1
    + `changelog.md`；涉及行为就补 `verification.md`，涉及上限就补 `reference/limits.md`。
 3. **新增离线单测要同时改 `build.ps1`**，否则没有任何一层会跑到它。
 4. **写文件用 LF**：`Set-Content` 会写成 CRLF，本项目要求 LF。
+5. **`tests/test-catalog.json` 里只写 ASCII**：`tools/test.ps1` 用 PowerShell 5.1 的
+   `Get-Content -Raw | ConvertFrom-Json` 读它，在没有 BOM 的文件上按本机 ANSI（GBK）解码，
+   描述里出现 `…`、弯引号这类字符会把字节对解成引号，整份目录直接解析失败（实测：插入一条带
+   `…` 的描述后，`ConvertFrom-Json` 报 "Invalid object passed in, ':' or '}' expected"）。
 5. **计划表里的三项没有明确指令不要动**（撤销分组、让游戏选中、棋盘高亮/标注/镜头）。
 
 ## 相关文档

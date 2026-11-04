@@ -5,7 +5,9 @@
    come from the generated program itself.  The loader rewrites that source
    (the same hook the native-logic bridge uses) and inserts
 
-       game_engine.'tc_scope_tick'(U64 cycle)
+       if load(<U8>, Ptr <recording flag>) != 0 {
+           game_engine.'tc_scope_tick'(U64 cycle)
+       }
 
    immediately before every `cycle += 1` - that is, after the cycle's own work
    has been written and before the front end is told the cycle finished.  The
@@ -13,8 +15,8 @@
    run: the player's run button, a single step, or the level's own tests.
 
    Threads.  `tick` runs on the simulation thread, inside the generated loop,
-   once per cycle, and must stay free when nothing is recording (one relaxed
-   atomic load and a return).  Everything else - configure/start/stop/read/
+   once per recorded cycle.  When idle the generated code only reads the flag;
+   it makes no foreign call.  Everything else - configure/start/stop/read/
    status - runs on the render thread.  The handover is a single ring buffer:
    the writer owns its cursor, the reader copies what is there, and rows the
    writer overwrote before the reader looked are not hidden - a cycle that did
@@ -170,7 +172,16 @@ public:
                    (text[indentEnd] == ' ' || text[indentEnd] == '\t'))
                 ++indentEnd;
             const std::string indent = text.substr(from, indentEnd - from);
-            const std::string call = indent + "game_engine.'tc_scope_tick'(U64 cycle)\n";
+            /* This host and the game JIT are Windows x64.  Naturally aligned,
+               lock-free atomic storage can be read with the same native load
+               used for the game's command mailbox.  The Store outlives every
+               compiled program; start/stop keep using release stores. */
+            static_assert(std::atomic<uint8_t>::is_always_lock_free);
+            static_assert(sizeof(std::atomic<uint8_t>) == sizeof(uint8_t));
+            const auto flag = reinterpret_cast<uintptr_t>(&recording_);
+            const std::string call = indent + "if load(<U8>, Ptr " +
+                std::to_string(flag) + ") != 0 {\n" + indent +
+                "    game_engine.'tc_scope_tick'(U64 cycle)\n" + indent + "}\n";
             /* Insert at the start of the line so the step keeps its own
                indentation and the injected call gets the same one. */
             text.insert(from, call);
@@ -291,7 +302,7 @@ private:
     uint32_t depth_ = 0;
     Trigger trigger_{};
     StateReader reader_ = nullptr;
-    std::atomic<bool> recording_{false};
+    std::atomic<uint8_t> recording_{0};
     std::atomic<bool> injected_{false};
     std::atomic<uint64_t> writeSeq_{0};
     /* The ring: only the simulation thread writes these, the render thread

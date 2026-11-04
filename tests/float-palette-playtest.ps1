@@ -1,4 +1,4 @@
-# True-game case: the float types live in a folder the *game* builds in its own
+﻿# True-game case: the float types live in a folder the *game* builds in its own
 # component column.
 #
 # What the player asked for: "把浮点数mod的这些元件在游戏内右侧元件栏单独开一个
@@ -120,13 +120,17 @@ try {
 $taskReport = Join-Path $taskData 'menu.txt'
 if (!(Test-Path -LiteralPath $taskReport)) {
   $taskTail = if (Test-Path -LiteralPath $taskLog) {
-    (Get-Content -LiteralPath $taskLog | Where-Object { $_ -match 'menu-probe|ENTER-BOARD' } |
+    (Get-Content -LiteralPath $taskLog -Encoding UTF8 |
+      Where-Object { $_ -match 'menu-probe|ENTER-BOARD' } |
       Select-Object -Last 20) -join "`n"
   } else { '' }
   throw "The probe wrote no menu.txt (the game never built its menu).`n$taskTail"
 }
 Copy-Item -LiteralPath $taskReport -Destination (Join-Path $taskRepo 'build\menu.txt') -Force
-$taskLines = Get-Content -LiteralPath $taskReport
+# UTF-8 explicitly: the probe writes the game's own menu names, and Windows
+# PowerShell would otherwise decode those bytes with the ANSI code page (the
+# folder names are Chinese).
+$taskLines = Get-Content -LiteralPath $taskReport -Encoding UTF8
 
 function Assert-TaskContains([string]$Needle) {
   if (!(($taskLines -join "`n").Contains($Needle))) {
@@ -155,16 +159,48 @@ if ($taskFolderIndex -lt 0) {
   throw "自定义 has no 浮点 folder in the game's own palette tree (inspect $taskReport)"
 }
 
-# 3. Every Float Ops component - the 22 catalogue types and the five M0
-#    compatibility probes, which register as "浮点/M0/…" - is inside that folder,
-#    and the folder holds nothing else.
+# 2b. Inside 浮点 the game builds one folder per format, and inside each of those
+#     the operation's own kind: 浮点 ▸ FP16 ▸ 计算 ▸ FP16 Add (plan 6.4.1).
+#     Sixty-five loose rows under one node is what putting the width first
+#     avoids, so the tree shape is part of the contract, not a detail.
+foreach ($taskWidth in @('FP16', 'FP32', 'FP64')) {
+  if (!(($taskLines -join "`n").Contains('tag=2 name="' + $taskWidth + '"'))) {
+    throw "the 浮点 folder has no $taskWidth subfolder (inspect $taskReport)"
+  }
+}
+foreach ($taskKind in @('计算', '比较', '转换', '位与拆分', '常量与显示')) {
+  if (!(($taskLines -join "`n").Contains('tag=2 name="' + $taskKind + '"'))) {
+    throw "the width folders have no $taskKind subfolder (inspect $taskReport)"
+  }
+}
+
+# 3. Every Float Ops component is inside that folder, and the folder holds
+#    nothing else: 22 families in each of the three widths (the binary64 Fused
+#    Multiply Add is the one absent type, because three 64-bit inputs exceed the
+#    loader's 128-bit input budget) plus the five M0 probes, which register as
+#    "浮点/M0/…".
 $taskTypeIds = @(
+  # binary16
+  '463136434f4e5331', '4631364144445f31', '4631364449535031', '4631365355425f31',
+  '4631364d554c5f31', '4631364449565f31', '4631365351545f31', '4631364e45475f31',
+  '4631364142535f31', '463136434d505f31', '463136434c535f31', '463136464d415f31',
+  '46313652454d5f31', '463136524e445f31', '4631364d494e5f31', '4631364d41585f31',
+  '4631364932465f31', '4631365532465f31', '4631364632495f31', '4631364632555f31',
+  '46313653504c5f31', '4631364d4b425f31',
+  # binary32
   '463332434f4e5331', '4633324144445f31', '4633324449535031', '4633325355425f31',
   '4633324d554c5f31', '4633324449565f31', '4633325351545f31', '4633324e45475f31',
   '4633324142535f31', '463332434d505f31', '463332434c535f31', '463332464d415f31',
   '46333252454d5f31', '463332524e445f31', '4633324d494e5f31', '4633324d41585f31',
   '4633324932465f31', '4633325532465f31', '4633324632495f31', '4633324632555f31',
-  '46333253504c5f31', '4633324d4b425f31'
+  '46333253504c5f31', '4633324d4b425f31',
+  # binary64
+  '463634434f4e5331', '4636344144445f31', '4636344449535031', '4636345355425f31',
+  '4636344d554c5f31', '4636344449565f31', '4636345351545f31', '4636344e45475f31',
+  '4636344142535f31', '463634434d505f31', '463634434c535f31', '46363452454d5f31',
+  '463634524e445f31', '4636344d494e5f31', '4636344d41585f31', '4636344932465f31',
+  '4636345532465f31', '4636344632495f31', '4636344632555f31', '46363453504c5f31',
+  '4636344d4b425f31'
 )
 $taskProbeIds = @(
   '4633325352433031', '4633325041535331', '4633324455414c31', '463332464c475331',
@@ -205,6 +241,6 @@ if ($taskLoose.Count -gt 0) {
   throw ("these components are still listed outside the folder: " + ($taskLoose -join ', '))
 }
 
-"PASS float-ops palette: the game built a 浮点 folder inside its own 自定义 category and filed all $($taskOwnIds.Count) float components ($($taskTypeIds.Count) types + $($taskProbeIds.Count) M0 probes) under it; none of them is listed anywhere else in the game's palette tree"
+"PASS float-ops palette: the game built a 浮点 folder inside its own 自定义 category, one FP16/FP32/FP64 folder inside that and the five kind folders inside those, and filed all $($taskOwnIds.Count) float components ($($taskTypeIds.Count) types + $($taskProbeIds.Count) M0 probes) under them; none of them is listed anywhere else in the game's palette tree"
 "dump: $(Join-Path $taskRepo 'build\menu.txt')"
 "sandbox: $taskTest"

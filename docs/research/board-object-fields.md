@@ -162,8 +162,8 @@ component deletion candidate before=2 after=2 live=1->0 found=0
 kind 0 墓碑，而不是缩短数组。紧接着放置命令把墓碑槽复用，读数是 `before=2 after=2 live=0->1`。
 所以今后所有“元件数”断言都必须区分**序列长度**和**跳过 kind 0 后的活记录数**。
 
-这个低层入口本身没有看到 `add_undo_changes` 调用，暂时只算“删除原语已核实”，还没有直接进命令
-总线。反汇编同时找到了更合适的撤销感知包装：
+这个低层入口本身没有看到 `add_undo_changes` 调用，只是“删除原语已核实”，所以它没有进命令总线。
+反汇编同时找到了更合适的撤销感知包装：
 
 ```cpp
 bool try_delete(void* board_model,
@@ -172,8 +172,23 @@ bool try_delete(void* board_model,
 ```
 
 它先复制要删的记录，调用 `board_delete_component`／`board_delete_wire`，最后把生成的变更交给
-`add_undo_changes`。下一步应给这个包装写真机探针（删除 → undo → redo），通过后再设计命令载荷；
-在这一步之前不把“可撤销删除”写进契约。
+`add_undo_changes`。
+
+**2026-09-28：这个包装已在真机上跑通，并成为 `TC_COMMAND_BOARD_DELETE_COMPONENT` 的实现。**
+探针（`tests/component-placement-probe.cpp`，用例 `component-placement`）在沙盒里按公开路径
+先枚举出目标实例，用游戏自己的 `sequenceNew` 造两个 8 字节整数序列（要删的 index、空的导线
+列表）交给 `try_delete`，然后只看 V3/V4 回读：
+
+```text
+component delete command state=3 result=0 live=4->3 at(28,10)=0
+component delete undo state=3 result=0 live=3 at(28,10)=1
+component delete redo state=3 result=0 live=3 at(28,10)=0
+```
+
+删除确实进了撤销栈：一次 `board.undo` 把元件放回同一格（`at(28,10)` 从 0 回到 1），一次
+`board.redo` 再拿走。这和上面的低层入口形成对照——低层墓碑删除没有撤销条目，`at(28,10)` 不会
+回来。命令载荷（`argument` = 实例 id，`custom_prototype_id` = 类型）与归属规则见
+[docs/sdk/commands.md](../sdk/commands.md) 的 V2 删除一节。
 
 ### 6.2 为什么 `board_commit_move` 还不能接
 
@@ -184,3 +199,53 @@ bool try_delete(void* board_model,
 
 同批符号里还确认了 `handle_move_selection`、`stash_move` 与 `select_component`，但它们依赖输入上下文、
 选择集或拖拽状态。按计划边界，本轮只记录签名线索，不实现“让游戏选中”；移动也继续留在探针阶段。
+
+## 7. 内存子系统的元件记录（2026-09-29）
+
+问题：RAM（`0x76`）和它的读写端口（`0x36 Load port` / `0x38 Store port`）在记录里长什么样，
+尤其"这颗 RAM 有多大""这次访问多少位"落在哪。方法：给 `dev.sandbox-sim` 加了一份
+**原始元件记录 dump**（`sandbox-sim-components.txt`，每个元件的整条 `0x238` 字节加若干已知槽位，
+跟着 `dump=1` 走），再把 Symphony 那块 CPU 板（`campaign/symphony_6_ram/circuit.data`）
+部署成沙盒的起点板跑一次真机——用例 `tests/sandbox-memory-playtest.ps1`，产物
+`build/sandbox-memory-components.txt`。
+
+**板子本身先是一条结论**：那块 v14 板解出来是 **2 个 RAM + 6 个 Load port + 4 个 Store port +
+0 根导线**（元件段结束在文件末尾，最后 8 字节的导线计数是 0）。也就是说内存不是用导线接的，
+端口**摆在 RAM 的插座格上**：Store port 占 3 行（`(-15,-1)…(-15,1)`），Load port 占 2 行
+（`(-15,-1)`、`(-15,0)`），所以叠在一起时端口记录点的格距正好是 3、3、3、2、2、2。RAM 在游戏
+自己的原型表里就是 `inputs=0 outputs=0`，与"它不靠脚接、靠端口"一致。
+
+**量到的字段**（`+0x` 是记录内偏移，来源同上）：
+
+| 元件 | 记录里读到的值 |
+|---|---|
+| `0x76` RAM | `+0x30 = +0x40 = +0x88 = 0`（没有脚）；名字在 `+0xc0`（长度）/`+0xc8`（数据指针）；`+0xe0 = +0xe8 = 8`；Main Memory 那颗另有 `+0xf0 = 16`（Register File 那颗是 0） |
+| `0x36` Load port | `+0x30 = 3`、`+0x40 = 2`；`+0x88` = 32/16/8（三颗额外端口各一）；`+0xe0 = +0xe8` = 32/16/8 |
+| `0x38` Store port | `+0x30 = 5`、`+0x40 = 1`；`+0x88 = 0`；`+0xe0 = +0xe8` = 32/16/8 |
+
+32/16/8 与关卡对话里的"32 位字、16 位字、8 位字节"逐条对上，所以 `+0xe0/+0xe8` 读作**这次访问
+的宽度**有依据；`+0x88` 只在 Load port 上跟着变，与它那个 `(16,-1)` 输出脚（宽度 auto）一致。
+随后用 `TC_MODLOADER_DUMP_SOURCE=1` 抓到游戏为该板生成的
+`native-logic-source-*.txt`，上面三个缺口已有两个被直接定死：
+
+- RAM 的地址位数就是 `+0xe0 + +0xf0`。因此 Register File 是 `8+0=8` 位地址、256 B，
+  Main Memory 是 `8+16=24` 位地址、16 MiB；访问先把起始地址与 `capacity-1` 相与；
+- Load/Store 按端口 `+0xe0` 选择 `U8/U16/U32`。Load 只有 Enable=1 才驱动外部结果，Store
+  只有 Enable=1 才写；同一插座按离 RAM 最远到最近的顺序执行，所以 Store 上方的 Load 读旧值，
+  下方的 Load 读新值；
+- 多字节访问跨容量末端时使用末端的零 guard，不把尾部逐字节绕回地址 0；`+0x178` 是
+  `is_little_endian`（见 [memory-editor.md](memory-editor.md)），当前两颗样本为 0，生成代码也按
+  大端字节序取放。
+
+仍未桥接的是**初始内容**：关卡 reset data 走板级 `memory_manager` 缓冲，不在元件记录里。
+simcore 已提供内存初始化回调，但游戏插件还需把 `get_reset_data_range` 那条只读路径接进来。
+
+复现：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\sandbox-memory-playtest.ps1
+# 也可复测玩家自己的电路：
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\sandbox-memory-playtest.ps1 `
+  -CircuitPath '<存档>\schematics\...\circuit.data'
+# 产物 build\sandbox-memory-components.txt：逐行 flush，跟随指针前先 VirtualQuery
+```

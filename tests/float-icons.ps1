@@ -1,4 +1,4 @@
-# The component pictures the Float Ops package ships (tc.component.render V5).
+﻿# The component pictures the Float Ops package ships (tc.component.render V5).
 #
 # examples/float-ops/icons.cpp generates them from the Mod's *own* drawing code -
 # it includes components.cpp and runs the real draw callback against a rasterising
@@ -21,7 +21,9 @@ if ($LASTEXITCODE) { throw 'Float Ops build failed' }
 $taskIcons = Join-Path $taskRepo 'build\float-ops-package\files\asset\float-ops-icons'
 $taskFiles = @(Get-ChildItem -LiteralPath $taskIcons -Filter '*.png' -ErrorAction Stop |
   Sort-Object Name)
-if ($taskFiles.Count -ne 22) {
+# One picture per registered type: 22 families across three widths, minus the
+# binary64 Fused Multiply Add that the input budget cannot carry.
+if ($taskFiles.Count -ne 65) {
   throw "The package must ship one picture per type; it has $($taskFiles.Count)"
 }
 
@@ -30,14 +32,14 @@ $taskPinColour = @(214, 84, 84)       # pinColor()
 $taskFailures = @()
 $taskSummary = @()
 foreach ($taskFile in $taskFiles) {
-  # Every type's custom id starts with the Mod's own "F32" marker, so a picture
-  # named after some other id is a picture of some other component.
+  # Every type's custom id starts with the Mod's own "F16"/"F32"/"F64" marker, so a
+  # picture named after some other id is a picture of some other component.
   $taskId = 0L
   if (![long]::TryParse([IO.Path]::GetFileNameWithoutExtension($taskFile.Name), [ref]$taskId)) {
     $taskFailures += "$($taskFile.Name): the name is not a decimal custom id"
     continue
   }
-  if ($taskId -lt 0x4633320000000000 -or $taskId -ge 0x4633330000000000) {
+  if ($taskId -lt 0x4631360000000000 -or $taskId -ge 0x4637000000000000) {
     $taskFailures += "$($taskFile.Name): not one of this Mod's custom ids"
     continue
   }

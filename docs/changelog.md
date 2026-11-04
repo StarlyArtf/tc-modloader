@@ -1,9 +1,1855 @@
 # 版本历史
 
+## 0.8.5（2026-10-11）
+
+- 加载器内置原版仿真的 x64 JIT 优化：消除冗余寄存器复制、常量移位、位宽掩码与重复栈写入；按控制流和实际使用的位保守分析，不能证明安全时保留原程序。默认启用，可用 `TC_MODLOADER_JIT_OPT=0` 关闭额外 JIT 优化作对照。
+- 未录制波形时跳过采集外调；可编辑宽常量直接读取稳定原子槽，在线修改仍即时生效。冻结 Overture 电路的 4096 周期、64 通道对照一致。实际 MHz 随电路、机器和运行负载变化，不承诺固定达到 20 MHz。
+- TC-Verilog 增加模块展开、参数、generate、组合块和逐输出依赖分析；符合条件的纯组合设计可直接生成游戏 JIT 表达式，并复用公共子表达式。
+- 修复原版 Keyboard 在选通脚未连接时不输出键码，以及事件之间丢失按键状态的问题；保留真实连接的选通条件。
+- 扩展自定义元件的编辑器、组合网表、引脚通道与运行时生命周期接口；提供 Mod 设置、持久存储及 TC-Verilog 源码编辑服务。SDK ABI 基线同步更新。
+- 更新单窗口安装器和相关验证；源码包补齐 simcore 与安装器图标，发布产物包含确定性压缩包和 SHA-256 校验。
+- 发布回归修复：已识别的旧版加载器可直接卸载并恢复原始引擎；精确依赖元件的内部接线避免单依赖锥、门输入、宽输入干线及分数引脚间距误连。源码包同时包含两个独立示例构建脚本，并可在没有预生成 native 目录的情况下构建；旧版 PowerShell 下安装器中文文件描述保持正确。
+
+以下按开发日期记录各项改动的实现细节；本版本之前的“未发布”条目是历史开发记录。
+
+## 未发布：通用仿真热路径（2026-10-07）
+
+- 未录制波形时，生成程序直接读取采集开关并跳过 `tc_scope_tick` 外调；开始录制后仍逐周期采集。
+- 9–64 位可编辑常量直接读取永久原子槽，CYCLE/REFRESH 不再逐拍调用 DLL、访问 TLS 或查哈希表。
+  在线修改仍即时生效，既有 setter 与读取桥 ABI 保留；诊断源码保留常量 ID 以便追溯状态槽。
+- 新增 `simulation-hotpath` 快速回归，并让电路复现脚本可指定加载器、Mod 包和冻结电路，支持隔离对比。
+
+## 未发布：原版 Keyboard 元件的输出修正（2026-10-06）
+
+- 游戏自己生成的程序里，Keyboard（kind `0x5d`）的行为现在由加载器在编译前改写。玩家报的现象
+  是"元件明明收到了按键，却不会输出键码和按键状态"，两条原因都在那段生成代码里：读取脚
+  （`in0`）没有被驱动时，游戏把条件编译成恒假的 `if is_new_value_3 && (U1 0x0) != 0`，弹出
+  分支永远不执行；而 else 分支用 `is_new_value << 16` 覆盖输出缓存，把刚读到的按键状态与键码
+  一起清掉。两份程序用 `TC_MODLOADER_DUMP_SOURCE=1` 抓下来逐字比对过（见
+  [diagnostics](reference/diagnostics.md)）。
+- 改写只动 `com_keyboard` 程序块里的这三点：选通脚被编译成常量 0（`(U1 0x0)` / `(U1 0)`）时
+  去掉该条件，改为"有事件就读"；玩家真正接了信号的选通脚保持原样（例如
+  `&& (U1 ((U1 vid256))) != 0` 不动），录制的按键序列仍按周期确定性地回放。else 分支只刷新
+  "有事件待读"那一位，保留缓存里的状态+键码，输出因此保持最后一次事件直到下一条到来，而不是
+  在两事件之间塌回 0。else 分支还要**把本周期局部变量（按键状态、键码）从缓存里恢复**：
+  游戏把生产者的局部变量直接交给同一周期内的下游，而不是让它读已发布的槽位，所以少了这一步，
+  锁存只有"看板显示"看得见——下游（例如写使能常开的 Store 端口 `store(..., (U8 vid276))`）
+  只在读到事件的那一拍拿到键码，下一拍就用 0 覆盖回去，内存里永远留不住按键。
+- 原版 kind、引脚、贴图与调色板条目全部不变，也不改游戏 EXE/DLL：改写挂在加载器已经持有的
+  生成源码拦截点上（`src/native_logic.hpp` 的 `compile`，与注入 `tc_scope_tick` 同一处），
+  改写器独立在 `src/keyboard_fix.hpp`。`TC_MODLOADER_KEYBOARD_FIX=0` 关闭它（对照用）。
+- 证据分两层。离线：`tests/keyboard-fix.cpp` 用真机抓到的两段原文（未接选通、接了 Constant 的
+  选通）以及出问题那块板子的原文（`store(..., (U8 vid276))`）做单测，断言三处改写、幂等、
+  以及非 Keyboard 程序块不受影响。真机：
+  `tests/keyboard-fix-playtest.ps1` 把一块 0x5d 板子当作 sandbox 关卡的电路载入（刻意不加载
+  `dev.sandbox-sim`，因为它会抑制游戏自己的 run），由 `tests/keyboard-fix-driver.cpp` 按游戏
+  自己的队列布局（条目 `down|key<<8`、步长 8、回绕 4096、写指针在 +4098，与
+  `simulator_queue_key_down/_up`、关卡脚本的 `add_keyboard_value` 同一套）注入按下/抬起事件，
+  再经 `sim.do` 请游戏跑几拍并从 state 数组读回输出槽：修正后 `out1=1 out2=0x41`（按下）→
+  `out1=0 out2=0x41`（抬起）；`-Disabled` 对照跑同一块板、同一组事件时是
+  `out0=1 out1=0 out2=0x0`——缓冲区里有事件、元件也说"有事件待读"，键码和状态就是上不了脚。
+  用例 `keyboard-fix` 与 `keyboard-fix-control`，驱动包 `dist/dev.keyboard-fix-driver.mod`
+  仅供测试，不进发布清单。
+
+## 未发布：TC-Verilog 组合核直接进入游戏 JIT（2026-10-06）
+
+- V2/V3 定义尾部新增版本化 `TC_COMPONENT_TYPE_INLINE_EXPRESSIONS` 程序：宿主把每个输出的
+  直线前缀与最终表达式复制进注册表，在游戏生成模拟程序时直接替换回调调用。组合热路径由此不再
+  经过 DLL FFI、输入分块、`TCLogicIOV3` 打包或 AST 解释器。
+- TC-Verilog 会把无持久状态、全驱动的二态组合设计降成 `U64` SSA。支持 RV32I flat 核使用的
+  连续赋值、组合块、if/case、拼接/复制/选择、算术、逻辑、比较与移位；内存、锁存、四态、复杂
+  signed 运算和时钟状态仍保守回退原 V3 回调。
+- 每个输出从共享 SSA 图反向裁剪，只保留最终值可达的节点，并按输出重命名。生成器同时验证程序
+  只引用该输出依赖掩码内的输入，避免游戏重排输出节点时出现跨输出临时变量和假组合边。
+- 依赖掩码相同的输出现在在游戏实际调度到该组的第一个输出时只发射一次公共 SSA 前缀；组内输出
+  只保留各自的末端表达式，因此既能跨输出消除重复解码，又不依赖游戏选择的输出执行顺序。
+- inline 降低器进一步保留立即数、把整宽单驱动 wire 与无符号扩宽变成别名，并省掉可证明冗余的
+  位宽掩码；Mux 从两次乘法改成 `no ^ ((yes ^ no) & (0 - cond))`，常量条件和布尔 Mux 直接折叠。
+- 条件先布尔化并由 CSE 共享；`cond ? x : 0`、`cond ? 0 : x` 和单比特置位/清零使用专门的短公式。
+  所有输出还改为从一张规范 SSA 图切片：即使依赖掩码不同，指令译码等公共节点也保持相同名字，
+  加载器按游戏实际输出顺序逐声明发射一次。精确依赖和拓扑顺序不变，寄存器数据尚未产生时只会先
+  发射纯指令前驱，读出之后再发射依赖寄存器值的 ALU 节点。
+- 两端均为动态值的通用 Mux 改成 JIT 局部变量加条件赋值，不再无条件执行 XOR/AND/取负选择公式；
+  常量门控继续使用无分支短公式。加载器按完整声明块去重，因此多行条件节点也只在首次使用处出现。
+- 单比特复制（尤其立即数符号扩展里的 `{{20{instr[31]}}, ...}`）直接降成一次取负和位宽掩码，不再
+  生成逐份移位/OR 链；常量拼接、前导零扩宽、静态位选/移位及常见算术/位运算恒等式同步折叠。
+- inline 输出在 CYCLE 模式下是永久驱动的单一源，加载器现在直接发布其值与 `zid=true`，不再经过
+  通用 Switch 的 OR/AND 合并、冲突检测与 Z 比较。跨行生成时用括号深度流式跳过整个死块；定位
+  Switch 使能条件也从目标 `vid` 声明之后开始，避免误改 inline 前缀中 Mux 自己的 `if`。
+- 运行时可编辑常量改为地址稳定、永不回收的原子槽。模拟线程缓存最近一次 `component id -> slot`
+  映射，逐拍读取只剩 relaxed atomic load，不再获取全局 mutex 或重复查询哈希表；低频 setter 与
+  既有 `tc_dynamic_constant` ABI 不变，纸带/常量在线编辑无需重编译的语义保留。
+- `rv32i_flat.v` 已得到 13 路 inline 程序：`state_words=0`，优化后注册文本约 138 KiB。真机沙盒
+  成功编译，生成源由最初约 307 KiB / 2688 个 SSA 临时量降到 117,012 B / 690 个，乘号由约
+  590 个降到 5 个；只编译 CYCLE/REFRESH 两种模式，没有回调 FFI，注册日志带 `jit=inline`。
+  440 条 RV32I 自检仍以 `0x5a5a5a5a` 签名通过。
+- ABI 快照扩展到 1890 条；旧定义的字段偏移不变，未覆盖新尾部或未设置标志时行为不变。
+
+## 未发布：TC-Verilog 逐输出切片、组合拓扑与临时状态（2026-10-05）
+
+- 精确依赖输出的生成代码现在把目标输出编号交给 V3 回调；TC-Verilog 为每个输出预编译反向组合切片，
+  REFRESH 只执行所需 `always` 块并只生成这一只输出，不再为每个引脚重复解释完整设计。
+- 组合块在编译期建立读写图。无环网络按稳定拓扑序执行一次；只有含组合环的切片退回最多 8 轮的
+  既有不动点路径。时钟块在边沿提交前先执行自己的组合前驱切片，因此 RHS 使用当前输入而不是上拍
+  留下的中间值。
+- 单一组合写者、全路径整寄存器赋值、无自反馈且不在组合环中的变量迁入每次调用的 scratch；不完整
+  赋值形成的锁存、多写者、存储器和环内变量仍在实例 state。RV32I 内核版的持久状态从 62 word 降到
+  34，纯组合 flat 版从 28 降到 0。
+- 隐藏 tick 现在只执行时钟 RHS 前驱与边沿提交，不再重算公开输出。连续输出切片按组合块实际读取的
+  叶子信号复用纯 scratch 结果；锁存器、存储器、架构状态写入和组合环不参与缓存。
+- 新增显式 `TC_COMPONENT_TYPE_GROUPED_OUTPUTS`：TC-Verilog 把依赖掩码相同的输出合成一次 V3 回调，
+  组首先发布整组，后续驱动只回读。`rv32i.v` 的 9 个输出归成 `0x0`/`0x2` 两组，因此一拍从
+  10 次回调降到 3 次（2 组 + tick）；普通 V2/V3 定义不设置标志时行为不变。
+- 时钟事件另有一份只含敏感信号的边沿计划：无边沿时不再先解释完整 RHS 数据流；确认至少一个块触发
+  后才执行时钟前驱。块缓存命中改为原位比较/更新，scratch、解析标记、触发位与 NBA 写队列复用实例
+  缓冲，不再在每块/每回调分配临时向量。
+- 模拟真实精确依赖桥（无关输入为 Z）的离线 RV32I 基准中，交替时钟的内核版约 **363 kHz**；
+  静止/下降沿 tick 约 **0.1 us**，包含上升沿的交替 tick 平均约 **1.05 us**（只含回调，不含游戏
+  棋盘/RAM 调度）。语言测试新增逐输出隔离、组选择、tick-only、块缓存失效、锁存保留与组合环退化断言。
+
+## 未发布：内壳布线：门的间距与逐锥分段（2026-10-05）
+
+- **问题（玩家报的"循环依赖"）**：`component_definition::encode` 的精确路径把一个锥内的门
+  **一行一个**排下去，而 XOR 的输入在 row±1：于是第 k 个门的 "+" 脚和第 k+2 个门的 "-" 脚落在
+  **同一格**。一个输入的抽头线终止在那一格，下一级门的前级线也终止在那一格，游戏把它们并成一根
+  网——两个输入被短路，网上出现两个驱动，游戏随即判**组合环**（元件工坊里还能看到那条线从门上
+  横穿过去）。真机复现：`foundry/Verilog RAM 16x8` 的定义解出 18 节点/18 线，其中
+  `wire5+wire11 @(-4,0)`、`wire6+wire13 @(-4,8)`、`wire9+wire12 @(-1,-5)`、`wire11+wire14
+  @(-1,-4)` 合并，网 9 有两个驱动，环 `0→5→11→12→11`。
+- **修法**：锥内门距改成 **4 行**（行距 3 已能分开引脚，第 4 行留给走线），每个锥独占一段行带
+  （带间留 3 行），前级的线改从驱动器旁的空列绕到下一个门的 "-" 脚，不再横穿门体。节点
+  **数量与顺序一字未动**（契约只固定顺序），桥的解析与既有注册路径不受影响。
+- **新工具**：`tools/definition-check.py` 把生成的定义解回节点/走线，报告同锚点节点、端
+  点落在别的线上、一个网多个驱动、组合环，并打印每个输出脚可达的输入脚集合——后者才是真正
+  要对的量：它必须等于声明的依赖掩码。
+- 真机：重装加载器后 `foundry/Verilog RAM 16x8` = **0 问题**（原来 16 问题/2 环），
+  `时钟源` = 0 问题，RAM 的输出脚可达 {2,3} = 声明的 `0xc`。回归 `native-component`、
+  `tc-verilog-project`、`component-compose` 全绿。
+- **仍存在的边界（下一步）**：①**只有一个依赖的输出**不生成门（节点数由桥在
+  `native_logic.hpp` 里按掩码算出的 `dependencyGates` 公式固定），它的抽头走到驱动器时要从 x=3
+  横穿门列，落到那里任何门上——
+  真机上 `foundry/rv32i`（13 输出）仍是 5 驱动 + 组合环；②输入脚 ≥8 时抽头列会跑到元件外并穿过
+  输入脚列。正解是让行带整体落到所有驱动器行之下（那片区域无门），再给每个带门的锥一条自己的
+  竖走廊，或直接改用 `component_netlist::planRoutes` 接管这段布线——两条都还没做。
+
+## 未发布：Mod 元件也能在元件工坊里打开看接线（2026-10-05）
+
+- **问题**：工坊打开元件时是拿**名字**去玩家存档里找
+  `<存档>/schematics/foundry/<名字>/circuit.data`。组合元件早有这条（2026-09-29 起），回调型
+  Mod 类型没有，于是"在元件工坊中编辑"只会开一张白板——玩家存档里那些 49 字节的空定义就是它
+  （真机：`foundry/RV32I` 与 `foundry/rv32i_single_cycle`，各 49 字节、带随机 id）。
+- **加载器注册时补上这条**：新函数 `provideFoundrySchematicBytes` 把类型自己生成的那份定义写进
+  工坊条目，V1 `register_component`、V2/V3 `tc.component.types`、以及 `tc.component.runtime`
+  的运行期注册与替换四条路都接上。工坊由此画出的就是这颗元件真实的内壳：引脚、每个输入的收集器、
+  逐输出的依赖锥、驱动，以及它们之间的导线——和元件栏缩略图用的是同一份字节。
+- **必须同时接受"游戏已经导入过它"**：游戏在**插件加载之前**会把 `schematics/foundry/` 下的一切
+  当成玩家元件导入，所以下一次启动时，这些条目已经带着同一个 custom id 躺在原型表里，普通导入
+  会被 `-3 that id is already imported` 拒绝（实测：`local.clock` 连插件初始化都失败）。现在
+  加载器会先核对工坊条目里确实是本类型自己的 id，是的话走 `update_custom_prototype`
+  **就地替换**（删掉可见原型再加不回去——游戏把 custom id 存在不止一个索引里，这正是 update
+  入口存在的原因）；不是我们的条目、或玩家自己改过的同名片，仍然按原样拒绝/不动。
+  `importGeneratedDefinition` 把这套"导入或就地替换"收成一处，V1、V2/V3、复合元件三条路共用。
+- **不动玩家的东西**：定义以 custom id 开头，条目里带本类型 id 的才算"我们写的"，可以刷新；缺失或
+  ≤64 字节的游戏占位才覆盖；玩家自己改过的同名片一律不动（沿用组合元件那套判据）。
+- 组合元件原先的实现改成调用同一个函数，行为与字节不变。
+- **按钮**：Mod 仍可用 render V4 的 `setFoundryButton(..., false)` 隐藏按钮（`local.float-ops`、
+  `local.text-box` 在这么做）。要连这些一起看，设 `TC_FOUNDRY_SHOW_MOD_TYPES=1`，宿主会让那些
+  隐藏请求在这一局失效并记一行日志。
+- 真机：`tests/live-root-workshop.ps1` 拉起实机（隔离 profile）后 `loader.log` 出现五行
+  `foundry view: filled …`——`Verilog RAM 16x8`、`rv32i`（tc-verilog，13 个输出各带依赖掩码）、
+  `时钟源`/`自锁开关`/`按钮`（local.clock）；文件内容与 `component_definition::encode` 的输出
+  逐字节一致（735 / 2055 / 4925 字节，头部 `0e …` + custom id）。第二遍真机把"条目已存在"的
+  profile 直接拿去过启动：五个类型全部 `registered custom …`，`local.clock` 正常加载，
+  再没有 `-3`。回归 `byte-adder`、`tc-verilog-project`、`component-compose` 全绿。
+
+## 未发布：时钟模块的精确依赖与隐藏 tick（2026-10-05）
+
+- 带 `always @(posedge …)` / `negedge` 的 TC-Verilog 现在也发布逐输出依赖。公开输出仍按自己的
+  掩码在 REFRESH 中独立求值；一个**没有外部输出**的隐藏全输入汇点在 CYCLE 中恰好调用一次，
+  负责提交 PC、寄存器堆等时序状态。这样既不重复提交状态，也不会把 tick 的全输入锥画成任何
+  `输入 → 公开输出` 组合边。
+- 新增 `TC_COMPONENT_TYPE_CLOCKED_TICK`。旧定义和不设置该标志的调用方保持原外壳；TC-Verilog
+  在 `Program::hasClockedState()` 为真时自动同时设置它与精确依赖标志。
+- 根治精确 V3 多输出的第二个缺陷：每个输出和隐藏 tick 的生成代码现在使用唯一的
+  `tc_zin` / `tc_is` / `tc_io` 临时名。此前重复声明会让游戏 JIT 编译失败，并在界面上表现成
+  "循环依赖"与持续重编译，即使依赖图本身已经正确。
+- 真机门禁 `tests/pin-shape-playtest.ps1 -Shape clocked` 已改为 V3：3 进 2 出、精确掩码、隐藏
+  tick，`full_adder` 上 `calls = cycle+1`、状态每周期只加一且输出正确。另用玩家的
+  `D:/p/rv32i/rv32i.v` 和原板复现：注册表为 `0x0,0x2,…`，只生成 4 份正常源码，模拟推进到
+  cycle 51，不再反复编译。
+
+## 未发布：逐输出的组合依赖（"假组合环"的根治，2026-10-05）
+
+- **问题**：TC-Verilog 生成元件的内壳把**每个输出**都画成依赖**全部输入**。外部寄存器堆因此被
+  游戏看成一个环：`寄存器堆读数据 → 内核 → 读地址 → 寄存器堆 → 读数据`。Verilog 源码里
+  `assign rs1_addr = instr[19:15];` 明明不读寄存器堆，但游戏只看生成出来的电路拓扑，于是单周期
+  CPU 被判成循环依赖。
+- **编译器**：`sdk/tc_verilog.cpp` 新增逐输出依赖分析——对 `assign` 和组合块做"输入掩码"不动点
+  传播（位选/部分选择的基准、`if`/`case` 的控制条件都算依赖），`Program::outputDependencies()`
+  给出每个输出实际读了哪些输入引脚，`Program::hasClockedState()` 标出模块里有没有边沿块。
+- **定义 ABI（向后兼容）**：`TCComponentTypeDefinitionV2`/V3 末尾追加
+  `const uint32_t* output_dependencies` + `output_dependency_count`，并新增
+  `TC_COMPONENT_TYPE_OUTPUT_DEPENDENCIES` 标志。`size` 停在旧尾部的定义一个字节都不用改，
+  继续走保守路径；加载器会校验"每个输出一个掩码"且掩码不引用不存在的输入。
+- **加载器内壳**：`component_definition::encode` 拿到掩码后为**每个输出**生成一棵私有依赖锥
+  （输入收集器 + 该输出自己的依赖门 + 驱动），不再是一条吃全部输入的链；`native_logic` 按同一张
+  表给每个驱动单独打包**它自己**的输入，并用 `tc_logic_output` 独立求值。注册日志随之打印
+  `deps=0x1,0x2,...`，真机上可直接对照游戏看到的依赖图。
+- **时钟模块**：公开输出依旧逐项 REFRESH；额外隐藏 tick 每周期只提交一次状态。时序模块和纯组合
+  模块因此使用同一张精确图，而状态提交不会成为公开组合边。
+- 回归：`tests/tc-verilog.cpp` 直接编译 `tests/fixtures/rv32i_single_cycle.v` 并断言
+  `imem_addr` 只依赖 `pc`、`rs1_addr`/`rs2_addr`/`rd_addr` 只依赖 `instr`、`rd_wdata` 依赖全部五个
+  输入；`tools/verilog-dependencies.cpp` 可离线打印任意模块的这张表；真机
+  `tests/tc-verilog-deps-playtest.ps1` 在沙盒里启动游戏，断言加载器收到同一张表。
+
+## 未发布：原生逻辑总输入扩到 2048 位（2026-10-05）
+
+- `tc.component.types` 的 V2/V3 元件现在最多可声明 **32 个输入、32 个输出，输入总宽度
+  ≤2048 位**；单脚仍是 1–64 位。旧 V1 `TCLogicIO[8]` 的 ABI 没变，因此仍是最多 8 脚、
+  总输入 ≤512 位。
+- ≤128 位继续走原来的 `invoke(token, cycle, lo, hi)` 快路径。更宽的输入不增加 JIT 外调参数，
+  而是用若干四参数 `stage` 调用按 128 位分块，完整、周期匹配的批次到齐后才执行一次回调；
+  V3 的 value 与 drive mask 分平面暂存，CYCLE/REFRESH 也各自隔离。周期编码带一位偏置，因此游戏
+  初始化阶段的 cycle=-1 也能完整传输。
+- 输出状态槽从每实例 512 字节扩到 2048 字节，32 个 64 位输出互不重叠；32 个实例的最高槽仍低于
+  已钉住版本的模拟状态边界。
+- 离线回归覆盖 32×64 位最大形状、缺块拒绝、V3 三态驱动平面、cycle=-1 和输出槽边界；真机
+  `tests/pin-shape-playtest.ps1 -Shape wide2048` 注册 32×64 位消费者，并从第 32 路输入把
+  `0x0123456789ABCDEF` 原样送进回调，证明第 1985–2048 位实际经过游戏 JIT 与桥接层。
+
+## 未发布：TC-Verilog 页面里的源码编辑器（2026-10-05）
+
+- **源码框换成了真正的编辑器观感**：行号装订区（光标所在行高亮）、Verilog 语法着色
+  （关键字、`$系统任务`、`` `编译指令 ``、带位宽／基数的数字、字符串、行注释与块注释）、
+  回车按上一行缩进并随 `begin`／`case`／`else` 进一级、随 `end`／`endcase`／`endmodule`
+  退一级，Tab 仍插入真正的制表符。光标、选区、鼠标拖选、撤销重做与 IME 还是引擎自己的
+  `InputTextMultiline`，插件没有第二份编辑状态。
+- 新增 `sdk/tc_code_editor.h`（`tc::ui::codeEditor` / `CodeEditorState` /
+  `loadCodeEditor`）。它是**增量**能力：任何一条必需导出缺失都会退回普通多行输入，并在
+  加载器日志里写明原因；调色板属于控件自己，不读游戏样式表。
+- 页面打开时自动把焦点交给源码框（和 IDE 打开文件一样），这同时是编辑器切到"自己重画全部
+  文本"的前提：多行 `InputText` 的文字画在它自己创建的子窗口里，而 ImGui 渲染子窗口晚于
+  父窗口，父窗口上叠加的着色文字会被输入框自己的文字盖住。回调结构验证通过后，控件把
+  `ImGuiCol_Text` 推成全透明并自己着色重画（光标色与选区色不受影响）；验证前只叠加关键字
+  颜色，最坏情况是"颜色淡"，不会变成空白框。
+- `Ctrl+S` 在源码框里同样保存（等同"保存源码"：先编译验证，结构没变就热加载，变了就排队替换
+  运行模型）。切换文件时控件 id 带文件序号，因此每个文件有自己的编辑会话与撤销栈。
+- 回归：新增 `tests/tc-code-editor.cpp`（`build\tc-code-editor-test.exe`）覆盖 Enter 缩进
+  判定、Tab 缩进保留、多字符编辑不动缓冲区、非法事件与短缓冲区被拒绝、没有引擎时报告不可用；
+  真机回归 `tests/tc-verilog-project-playtest.ps1` 抓整页截图后按调色板数像素（关键字 ≥ 500、
+  数字 ≥ 60 个纯色像素），把"截图里真的有高亮"变成自动判定。
+
+## 未发布：TC-Verilog 的层级名字与 generate if/case（2026-10-05）
+
+- **层级名字（只读）**：展开实例的信号可以用实例路径读到——`assign y = u0.sig;`、嵌套
+  `u0.u1.sig`，以及 generate 循环里同名实例的 `u0[1].sig`（第 0 个也接受 `u0.sig`）。
+  解析顺序是"本作用域/本模块的名字优先，其次才是层级路径"，所以 `a[0]` 这类普通位选不受影响；
+  层级名字只允许出现在表达式右侧，赋值会报 `a hierarchical name may only be read, not assigned
+  to`，找不到的路径报 `unknown hierarchical name 'u0.nope'`。实现是实例展开时记录
+  "实例名.信号名 → 符号 id"（连同该实例自己展开出的层级路径一起加前缀），因此它读到的是真实
+  的、活的信号（测试里读到了子模块内部的 `shadow` 寄存器与输出 `q`，并逐拍核对数值）。
+- **generate 的 `if` / `else if` / `else` 与 `case` / `casez` / `casex`**：条件与标签必须是常量
+  （通常用参数，`#(.P(v))` 的覆盖会一路传到条件里）。**所有分支都会被语法检查，只有被选中的
+  那一支进入设计**：未被选中的分支在解析后被完整回滚（符号、连续驱动、状态字、时钟块、层级表、
+  常量绑定），所以两个分支可以声明同名信号、驱动同一根 net，互不冲突；`discard` 走的是"先全部
+  回滚、最后再解析被选中那支"的顺序，避免被丢弃分支的驱动/声明与选中分支互相干扰。`default`
+  写在哪一条都一样，只在没有标签命中时生效。
+- 内核单元测试新增四组真值断言：`if (WIDE)` 两支分别被选中（同一个子模块用 `#(.WIDE(0))`
+  覆盖后走另一支，行为随之改变）、`if (WIDE)` 默认参数那支、`case (MODE)` 的 `default` 写在
+  最前面仍只在无标签命中时生效、层级读（`u0.shadow` 与 `u0.q`，`stateWords()==3`，逐拍核对
+  NBA 语义）；另加三条拒绝路径断言（非常量 generate 条件、未知层级路径、给层级名字赋值）。
+  `build/probe-verilog-grammar.exe` 里"generate if（未选中分支里有实例）""generate case"
+  "层级读"三行从 `REFUSED` 变成 `ACCEPTED`，非常量条件与未知路径各自给出对应诊断。
+
+## 未发布：TC-Verilog 的展开体作用域（2026-10-04）
+
+- 每个展开的循环迭代、以及 `generate` 里的每个 `begin/end` 块现在都是**独立作用域**：标识符
+  解析先查打开的作用域栈（由内向外）再查模块级名字；作用域里声明的东西记在隐藏键下
+  （`t#7` 之类）并用源名字登记进作用域，所以
+  - 同一名字可以出现在不同迭代里——它们是互不相干的信号；
+  - 块内声明**遮蔽**同名外层信号，出了块就看不到（引用报未知信号）；
+  - 同一个块里重复声明同名仍然是 `duplicate declaration of 'x'`。
+  这样"每个实例一份内部连线/寄存器"就能写了：生成体里 `wire t; sub u(.a(a[g]), .y(t));
+  assign y[g] = t;`，或 `reg r; always @(posedge clk) r <= d[g];`——每个迭代各有自己的线与
+  寄存器（各自占状态字，如"每位一个寄存器"的用例是 4 个寄存器 + 4 个时钟字 = `stateWords()==8`）。
+- 入口随之补上：`generate … endgenerate` 现在用**生成块**解析器（`parseGenerateBody`）处理每一项，
+  所以 `generate begin … end endgenerate`（不带循环、直接一个块）也是合法的，并拥有自己的作用域；
+  之前这种写法会报 `unsupported module item`。
+- 子模块展开（实例化）时作用域栈随其它解析状态一起保存/恢复，子模块内部的声明仍然只属于它自己
+  的符号表——否则子模块的端口会解析不到，这一点由既有的实例化回归守住。
+- 内核单元测试新增三组真值断言：生成体里每轮声明 `wire t` 并实例化（`0b0101 -> 0b1010`）、
+  每轮一个 `reg r` 的"每位一个寄存器"（`stateWords()==8`，逐拍采样与 `en` 保持）、块内声明
+  遮蔽外层同名（`y[0]` 走块内的 `t`、`y[1]` 走模块级的 `t`）；另加两条拒绝路径断言
+  （作用域名字出了块就报未知信号、同一块里重复声明）。`build/probe-verilog-grammar.exe` 里
+  "生成块内声明"与"每轮一个寄存器"两行从 `REFUSED` 变成 `ACCEPTED`，"块外引用作用域名字"
+  报 `unknown signal 'inner'`。
+
+## 未发布：TC-Verilog 的组合式 always（2026-10-04）
+
+- 新增**组合式过程块**：`always_comb`、`always @(*)` / `always @*`、以及电平敏感表
+  `always @(a or b)`（`or`/`,` 都认）。块体里用**阻塞赋值 `=`**，时钟块里仍必须用 `<=`；
+  一边用错会在源码位置报 `use '=' in a combinational block` /
+  `blocking assignments are not supported; use <= in clocked logic`。`always_latch` 仍然拒绝
+  （不推断锁存），`always_ff` 配电平表报 `always_ff needs a posedge/negedge sensitivity list`，
+  `always_comb @(...)` 报 `always_comb takes no sensitivity list`。
+- 执行模型：组合块**不占敏感表状态字**，结果写进被赋值变量自己的状态字；每个宿主阶段
+  （CYCLE/REFRESH/RESET）都求值到**不动点**（上限 8 轮）。所以①一个块里 `t = a & b; y = t | c;`
+  这种阻塞链立刻可见；②两个块互相读对方的结果与**声明顺序无关**；③寄存器被时钟块提交之后，
+  组合逻辑同一拍就看到新值（CYCLE 里先跑时钟块的提交、再跑组合不动点），REFRESH 单独跑也能
+  反映当前状态。成环时取最后一次迭代的值（Verilog 会是 X），这一点写进文档。
+- 新增两条写入检查：同一个变量不能既被组合块又被时钟块赋值（`'x' is assigned from both a
+  combinational and a clocked block`）；组合结果里出现 X/Z 时整条赋值被跳过（状态字存不下 X，
+  沿用既有策略并在文档里说明——需要三态请用 `assign` 驱动 wire）。
+- 顺带把时钟块的敏感表状态字改成**在解析到该 always 时分配**（原来放在模块体解析完之后），
+  这样从子模块展开进来的块不会在父模块里再拿一次状态字。因为引用必须先声明，被 always 块用到的
+  reg/存储器一定写在它前面，所以既有设计的布局逐字不变（计数器 2、RAM 17 的断言照旧）；
+  只有"always 块之后才声明、且块里没用到"的变量会挪位置，这一种代码会在重编译后换布局。
+- 内核单元测试新增三组真值断言：`always_comb` 的二选一（`stateWords()==1`，光靠 REFRESH 就能
+  切换输出）、跨块顺序无关的网络（`y` 的块写在 `t` 的块前面，仍读到新 `t`；`always @(a)`
+  电平表也用上）、组合块读寄存器（时钟沿后 `qbar = ~q` 立刻跟上新值，REFRESH 同样正确）；
+  另加四条拒绝路径断言（组合块里用 `<=`、两种块写同一变量、`always_ff` 配电平表、
+  `always_comb` 带敏感表）。`build/probe-verilog-grammar.exe` 里 `always @(*)` / `always_comb`
+  / `always @(a or b)` 三行从 `REFUSED` 变成 `ACCEPTED`（`state=1`，无敏感表状态字）。
+
+## 未发布：TC-Verilog 的模块实例化（2026-10-04）
+
+- 一个源文件可以写**多个 `module`**：`run()` 先词法扫出每个模块的 token 区间，再挑出顶层
+  （**最后一个没有被任何模块实例化的 module**，判定是"模块名 + 实例名 + `(`/`#`"的词法扫描；
+  全部都被实例化时取最后一个），用顶层重新走一遍单模块解析。原来"`endmodule` 之后不能再有
+  内容"的限制随之取消。
+- **实例化在编译期展开**：`<模块> [#(.P(v))] <实例名> (连接…) ;` 会以该模块的 token 区间**重新
+  解析**一次（新的符号表、新的状态布局），然后把结果并入父模块——符号 id 因为追加而整体偏移
+  一个常量（重映射就是加偏移），寄存器/存储器的 `stateOffset` 挪到父模块的状态数组里，敏感表
+  的状态 word 同理。因此嵌套实例、逐实例参数覆盖、以及"同一个子模块用不同参数实例化两次"
+  都走同一条路径；每个实例都是独立的寄存器副本（`stateWords()` 相应对得上）。
+- 连接支持：具名 `.a(expr)`、具名简写 `.a`、空连接 `.a()` 与位置空槽 `(a, , y)`（不驱动的
+  输入读作 Z）、位置连接 `(expr, expr)`；**输出端口**可以接整根 wire，也可以接常量边界的
+  位选/部分选择，所以 `generate for (g = 0; g < W; g = g + 1) leaf u(.a(a[g]), .y(y[g]));`
+  成立。输入端口变成一根由连接表达式驱动的 wire；输出端口变成驱动父模块那根网的一段
+  （重叠驱动仍按"该位已有连续驱动"拒绝）。
+- 参数覆盖只接受具名形式 `#(.P(v))`（`.P` 简写也可，取同名常量）；覆盖一个模块没有的参数、
+  位置形式 `#(8)`、未知模块名、未知端口名、输出接到 `reg`、顶层之外的多余连接、递归实例化
+  都有各自的诊断。顺带修好一条误报：`always_latch`/`task` 这类不支持的模块项不再被当成
+  "未知模块名"。
+- 内核单元测试新增五组真值断言：两级 `mux2`+`top`（具名连接、`moduleName()=="top"`、行为）、
+  位置连接的有状态计数器（子模块的 reg 与时钟字进入父模块状态，`stateWords()==2`，逐拍计数与
+  `en` 保持）、`ones #(.N(8))` / `#(.N(2))` 两个实例不同参数（`0xFF` / `0b11`）、
+  `generate for` + 每位一个 `inv` 实例（位选连接，`0b1010 -> 0b0101`）、`.a` 简写与空连接
+  （`0 & Z = 0`，`1 & Z` 不是确定值）；另加六条拒绝路径断言（未知模块、未知端口、输出接 reg、
+  位置参数覆盖、覆盖不存在的参数、同一网两处驱动）。
+
+## 未发布：TC-Verilog 的有符号算术（2026-10-04）
+
+- 值（`Bits`）新增 `isSigned`，并贯通解析、常量折叠与求值：
+  - **声明**：端口与信号可以写 `signed`（`input wire signed [3:0] a`、`output reg signed [7:0] q`、
+    `reg signed [7:0] mem [0:3]`），`unsigned` 也接受；
+  - **字面量**：`8'shff` / `4'sd2` / `'shff` 这类 `'s` 有符号常量（此前被拒为
+    `malformed based literal`）；
+  - **转换**：系统函数 `$signed(x)` / `$unsigned(x)`（新表达式种类 `Cast`，位与宽度不变、只改类型）；
+  - **运算符**：`>>>` / `<<<` 进入词法（三字符，优先于 `>>`/`<<`）与优先级表。
+- 语义按 IEEE 1364 的常用规则：放大位宽时 signed 值**符号扩展**（最高位是 X/Z 也扩展成 X/Z），
+  否则补零；`+ - * / %` 与 `< <= > >=` 只在**两侧都是 signed** 时按有符号解释，只要一侧是
+  unsigned 整个表达式就是无符号；`>>` 永远补 0，`>>>` 在左值是 signed 时补符号位（用补码
+  算术实现，不依赖编译器对负数右移的实现定义行为）；`==`/`!=` 只比位模式；比较、拼接、位选、
+  部分选择、复制的结果都是无符号；`/`、`%` 按 Verilog 向零截断，`INT64_MIN / -1` 这类边界
+  显式处理，不触发 C++ 未定义行为。参数常量仍按无符号 32 位值参与折叠（文档写明）。
+- 内核单元测试新增四组真值断言：signed 与 unsigned 比较同一组位（`1000` 小于 `0001` 只在
+  signed 下成立）、放大时符号扩展 `0b1110 -> 0xFE` 与 `$unsigned` 后 `0x0E`、`>>>`/`>>`/`<<<`
+  （`1110 -> 1111 / 0111 / 1100`）、有符号字面量与有符号除法/取负（`4'sd2`、`-2/2 = -1`、
+  `-(-2) = 2`、`4'sh8`）、`$signed` 与混合类型表达式保持无符号；另加一条 `$signed` 缺括号的
+  拒绝断言。`build/probe-verilog-grammar.exe` 里 `signed` 声明、`$signed()`、`>>>`、`8'shff`
+  四行从 `REFUSED` 变成 `ACCEPTED`，`$display` 等系统任务仍拒绝。
+
+## 未发布：TC-Verilog 的 parameter / localparam（2026-10-04）
+
+- 新增**模块常量** `parameter` / `localparam`，两种位置都支持：模块头的
+  `module m #(parameter W = 8, D = 4)(...)`（`parameter` 关键字可省，`#(W = 8, D = 4)` 也认）
+  与模块体里的 `parameter P = ...;` / `localparam P = ...;`；可选 `integer`/`signed` 或
+  `[range]` 类型被接受并忽略，只取折叠后的值。
+- **这一刀把"参数化位宽"接通了**：`parseWidth` 与数组上下界从"只认十进制字面量"改成
+  "接受常量表达式"，常量本身走与循环变量同一套 `ConstantValues` 环境（新符号种类
+  `Parameter`，不占状态 word）。于是 `input wire [W-1:0] a`、`reg [W-1:0] mem [0:D-1]`、
+  `a[N-1:0]`、`{N{1'b1}}`、`for (i = 0; i < N; i = i + 1)` 都能由参数决定，用途与限制同
+  `docs/sdk/tc-verilog.md` 所述。常量在**声明处**求值，所以只能用先声明的常量（前向引用报
+  未知信号），且不能被过程赋值。
+- 这一版没有模块实例化，所以 `parameter` 的"可被上层覆盖"和 `defparam` 无从谈起：写下的
+  默认值就是值，`parameter` 与 `localparam` 行为一致（文档里写明了这一点）。顺带删掉了因此
+  失去唯一用途的 `parseDecimalToken`。
+- 内核单元测试新增四组真值断言：`#(parameter W = 8, D = 4)` 的 RAM（端口位宽来自 `W`、
+  `stateWords()==5`、写入读回 `0xA5`）、`localparam TOP = W - 1` 驱动循环边界与位选
+  （`0b1100 -> 0b0011`，`{a,a}` 得 `0xCC`）、`{N{1'b1}}` / `{M{1'b1}}` 两个复制计数
+  （`0xF` / `0xFF`，`stateWords()==0`）、模块体内 `parameter BASE` + `localparam STEP = BASE/2`
+  的算术（`a+24`）；另加四条拒绝路径断言（前向引用、非常量初值、重复声明、给参数赋值）。
+  `build/probe-verilog-grammar.exe` 里五种参数写法从 `REFUSED` 变成 `ACCEPTED`。
+
+## 未发布：TC-Verilog 的 for / generate 展开（2026-10-04）
+
+- 新增**编译期循环变量** `integer i;` / `genvar i;`（新符号种类 `LoopVar`，不占状态 word，
+  也不能被过程赋值），以及 **`for` 循环**的两种用法：
+  语句里的 `for (i = 0; i < 8; i = i + 1) q[i] <= a[7 - i];`，
+  与模块级的（`generate` 里或直接写）`for (i = 0; i < 2; i = i + 1) assign y[i*4 +: 4] = ...;`；
+  嵌套 `for` 也可以。
+- **展开在编译期完成，循环变量折成字面量**：解析器保存 `for (…)` 头的三处 token 位置
+  （一份词法扫描，不做试探性解析），每一轮把变量绑进 `LoopConstants` 再解析一次循环体，
+  所以 `i` 能出现在位选 `q[i]`、部分选择、`[base +: width]` 的基准、拼接、`case` 标签和任意
+  算术里，而生成的 AST 里只剩常量——运行期没有循环，也不需要为循环变量留状态。
+- 边界必须是常量：起值、条件、步进都在绑定下折叠，折不出常量就报
+  `the for loop's condition must be constant`（起值/步进同理）；步进必须写回同一个循环变量；
+  单次编译的展开上限 **4096 轮**，死循环（如 `i = i`）在这里被拒绝；`generate` 循环至少要
+  跑一次（语句循环可以跑零次，此时循环体仍会被解析一遍以确定词法范围）。
+  循环变量逃出自己的循环报 `a loop variable may only be read inside its own for loop`，
+  SystemVerilog 的 `for (genvar i = ...)` 就地声明报
+  `declare the loop variable before the loop, e.g. 'integer i;' or 'genvar i;'`。
+- 模块项解析重构出 `parseModuleItem` / `parseGenerateBody`，`generate`、`integer`/`genvar`
+  与模块级 `for` 都走同一条入口；`generate … endgenerate` 与不带 `generate` 的模块级 `for`
+  等价。还没做的：`if`/`case` 形式的 generate、generate 块名的层级引用、展开体里的信号声明
+  （第二轮会报重复声明，因为每一轮没有独立作用域）。
+- 内核单元测试新增四组真值断言：语句 `for` 做位反转（`0xC0 -> 0x03`，且 `stateWords()` 仍是
+  2）、模块级 `for` + 索引部分选择做半字节交换（`0x12 -> 0x21`）、`generate for` 生成 4 个
+  `always` 块（`stateWords()==5`，逐拍采样 `0b1010`/`0b0101`）、嵌套 `for`（`0x0C -> 0x03`）；
+  另加五条拒绝路径断言（非常量条件、循环变量逃逸、SV 就地声明、零次 generate、死循环）。
+  `build/probe-verilog-grammar.exe` 里五种 `for`/`generate` 写法从 `REFUSED` 变成 `ACCEPTED`。
+
+## 未发布：TC-Verilog 的多事件敏感表与异步复位（2026-10-04）
+
+- `always` / `always_ff` 现在接受**多事件边沿敏感表**：`@(posedge clk or negedge rst_n)`，
+  `or` 与 `,` 两种写法都认，单独 `@(negedge clk)` 也可以。敏感表的每个条目各占一个状态 word
+  记录上一拍电平，任何条目出现配置的边沿就执行块体：
+  `posedge` = 上一拍不是 1、这一拍是 1；`negedge` = 上一拍不是 0、这一拍是 0（与 Verilog 把
+  x→1、x→0 也算边沿一致）。单事件块仍只占 1 个状态 word，老模块的状态布局逐字不变。
+- 于是 `always @(posedge clk or negedge rst_n)` 里的复位是**异步**的：`rst_n` 拉低那一下不需要
+  时钟沿就执行块体；复位保持期间每个时钟沿依旧走复位分支；复位释放（表里没有 `posedge rst_n`）
+  本身不触发。内核每个宿主周期只采样一次电平——是边沿检测而不是事件队列，所以异步复位在下一个
+  宿主周期生效，这一点写在 `docs/sdk/tc-verilog.md`。
+- 组合式的 `always` 仍然拒绝，但换成了明确的说法：`a sensitivity list entry must be 'posedge'
+  or 'negedge'; a combinational always block is not supported yet`（`always @(*)` 与电平敏感表
+  都走这一条），2 位以上的边沿信号报 `an edge-triggered signal must be one bit wide`，
+  条目之间少了 `or`/`,` 报 `expected 'or' or ',' between sensitivity list entries`。
+- 内核单元测试新增两组真值断言（异步复位：复位下降沿单独清零、保持期间时钟沿仍清零、释放不触发、
+  `en` 低电平不动；`negedge` 单事件块 + 逗号敏感表两路触发）与三条拒绝路径断言；
+  `build/probe-verilog-grammar.exe` 里 `always @(negedge clk)`、`or` 与 `,` 三种写法从
+  `REFUSED` 变成 `ACCEPTED`（`state=2` / `state=3`），`always @(*)` 仍拒绝。
+
+## 未发布：TC-Verilog 的 case / casez / casex（2026-10-04）
+
+- 内核支持 **`case` / `casez` / `casex`** 语句：标签可写逗号列表（`3'd0, 3'd1:`），
+  `default` 可以出现在条目列表的任意位置、且只在没有任何标签命中时执行，条目体可以是单条
+  语句或 `begin/end` 块；`case` 与 `if` 一样可以在时序块里嵌套。
+- 比较是**四态**的：普通 `case` 逐位精确比较（X 只匹配 X、Z 只匹配 Z，任一标签位与被测位
+  一方未知而另一方确定就不匹配）；`casez` 把标签里的 `z` 和 `?`，以及被测值里的 Z 当“不关心”；
+  `casex` 再把被测值里的 X 也当“不关心”。本内核的字面量把 `?` 存成 X，所以标签里的 X 位在
+  `casez`/`casex` 里同样算通配（这是与标准唯一的、写在文档里的偏差）。
+- 两条更清楚一点的诊断：`case` 少了 `endcase` 时报 `unterminated case statement; expected
+  'endcase'`；条目缺语句时报 `expected a statement`，不再退化成“未知信号 'endcase'”。
+- 内核单元测试新增三组真值断言（逗号标签 + default + 块体、`casez` 的 `?` 通配与 default
+  前置、`casex` 接受全 Z 的被测值和拒绝不匹配的确定值）与三条拒绝路径断言（缺 `endcase`、
+  两个 `default`、条目缺语句）；`build/probe-verilog-grammar.exe` 里 `case`/`casez`/`casex`
+  三行从 `REFUSED` 变成 `ACCEPTED`，模块层的裸 `case` 仍然拒绝。
+
+## 未发布：TC-Verilog 拼接、复制与位选/部分选择（2026-10-04）
+
+- 内核支持 **拼接 `{a, b}`**（左起为最高位）、**复制 `{N{value}}`**（`N` 必须是常量）、
+  **位选择 `x[i]`**（下标可以是变量）、**部分选择 `x[msb:lsb]`**（边界必须是常量）与
+  **索引部分选择 `x[base +: width]` / `x[base -: width]`**（宽度是常量、基准可以是变量）。
+  词法层新增 `+:` / `-:` 两个符号。
+- **赋值左侧同样支持位选与部分选择**，包括存储器字内部的位：
+  `q[0] <= a[7]; q[7:4] <= a[3:0]; mem[addr][0] <= d;`。提交阶段由“整字写”改成
+  “读-改-写”：一条非阻塞赋值只拥有自己那几位，同一拍里写同一个寄存器的多条赋值按书写顺序
+  合并，语义与 Verilog 的 NBA 一致（`q[7:4] <= a; q[5] <= 1'b1;` 的 bit 5 取后者）。
+- 读取越界下标或跨出值宽度的位返回 X（多位结果里只有越界位是 X，其余位照常驱动）；写目标
+  越界或下标未知则整次写入跳过，沿用 RAM 地址越界既有的策略。
+- 一条 wire 现在可以由**多条不重叠的 `assign`** 驱动（`assign y[3:0] = a; assign y[7:4] = b;`），
+  位段重叠仍按“该位已有连续驱动”拒绝；`signal()` 按位放置每个驱动，没有驱动覆盖的位保持 Z，
+  单个整宽驱动的结果与改动前逐位一致。
+- 常量折叠（字面量与常量运算符）加入编译器，供 `[msb:lsb]` 边界、`[+:]`/`[-:]` 宽度和复制计数
+  在编译期求值；非恒定边界、非恒定复制计数、超过 64 位的拼接/复制都在源码位置报错。
+- 内核单元测试新增三组真值断言（拼接/复制/半字节交换、位选与部分选择的读写、`+:`/`-:` 与
+  存储器字位选、部分驱动的 wire）与四条拒绝路径断言；
+  `build/probe-verilog-grammar.exe` 复核这四类语法从 `REFUSED` 变为 `ACCEPTED`。
+
+## 未发布：运行中元件生命周期修复（2026-10-04）
+
+- **修复"删除元件后再建同名元件，新元件永远不出现在元件栏"**。游戏的
+  `custom_prototypes_del` 只把 id 从**有序 live 列表**（`cc_length`/`cc_live_values`，元件栏、
+  门数预算与快照三处都读它）里摘掉，原型表（`cc_hashmap`，按 `id & 0xffff` 线性探测）里那条
+  仍在；`custom_prototypes_set` 只在探测到空槽时才把 id 追加进 live 列表，于是同一个 id
+  重新导入时既被 `add_custom_prototype` 判成重复（-3），也不会再回到元件栏。编辑器文件管理器给
+  新文件的 `custom_id` 是**按文件名算的稳定值**（`stableHash`），删掉再建同名文件正好走这条
+  路径：真机日志里是 `Component runtime registration rejected: -3`，元件栏里自然什么都没有。
+- `tc.component.runtime` 现在记住每个 Mod 自己注销过的 id（`Loaded::retiredIds`）：再次注册这
+  些 id 时改走游戏原生的 `update_custom_prototype`（它会重写该 id 的每一份索引），成功后再按
+  游戏自己新增条目的写法把 id 补回 live 列表（`{id, id & 0xffff}` 追加到 `cc_live_values`，
+  计数 +1，只在 id 确实缺失、计数 < 10000 且目标内存可写时做）；游戏确实已经忘记该 id 时
+  退回普通导入。首次注册、替换、注销三条既有路径的行为不变。
+- 新增真机回归 `tests/component-runtime-lifecycle-playtest.ps1`（目录条目
+  `component-runtime-lifecycle`）：注册 → 注销 → **同一 id 再注册**（断言回到 live 列表）→
+  注册第二个 id → 事务式替换，五步全部 `status=0`，并核对真机日志里的
+  `put type 0x… back into the component column's live list`。
+- 真机复核没有回归：`example.tc-verilog-ram` 的"启动后新建元件"仍把新 custom_id 送进游戏
+  菜单树的 `自定义` 分类（`menu-bytes` 探针，`generation 1` 已应用），`tests/tc-verilog-project-playtest.ps1`
+  与既有 V3 桥接用例照常通过。
+
+## 未发布：TC-Verilog 可综合内核第一刀（2026-10-03）
+
+- 新增 `sdk/tc_verilog.hpp` / `sdk/tc_verilog.cpp`。源码在 Mod 加载期编译，执行计划由所有
+  元件实例共享；寄存器、RAM 与前一拍时钟全部落在 `TCLogicIOV3::state`，可随实例保存和重置。
+- 第一批语法包含 ANSI 端口、1～64 位 wire/reg/logic、连续赋值、常用表达式、三目运算、
+  `always @(posedge)`、`if/else`、非阻塞赋值和定长 reg 数组。时钟块使用先求值后统一提交的
+  NBA 语义，已用 16x8 RAM、计数器和三态加法器回归。
+- 内核内部区分 X/Z；V3 无法表示的 X 在边界释放为 Z，未知/越界 RAM 写入不提交。编译失败
+  带源码行列且不会替换上一份有效程序，运行时异常则安全释放全部输出。
+- 新增 `tc::verilog::Component`：从 module 端口自动生成稳定的 V3 pin 数组，从编译状态布局
+  自动填写 `state_words`，并查询 `tc.component.types` V2 完成注册。对象在注册后冻结且不可移动，
+  避免宿主持有的回调、字符串或引脚指针失效；假宿主回归覆盖了完整的源码→定义→注册→执行链。
+- 新增 TC-Verilog format-1 JSON 项目：严格检查字段和安全相对 `.v` 路径，先读取并编译全部元件，
+  成功后才事务式替换项目并批量注册；诊断保留 manifest/source/compile/register/save 阶段、文件、
+  元件序号与 ID、行列。`loadAdjacent` 从 DLL 的包缓存目录找默认项目，`bootstrapWorkspace` 首次把它
+  落到 Mod 持久目录且不覆盖已有编辑，`writeTextFileAtomic` 为后续游戏内编辑器提供原子保存。
+- 新增 `example.tc-verilog-ram.mod`：包内 JSON + `ram16x8.v` + 仅负责加载项目的极小 DLL；首次
+  启动生成可编辑工作区，之后每次启动从工作区重新编译并注册同步写、三态读 RAM。
+- `tc_ui.h` 正式封装 `igInputTextMultiline`；示例新增主菜单 **Verilog 编辑器**，提供项目文件
+  列表、未保存标记、检查语法／保存源码／撤销改动和带文件／行／列的诊断。保存路径由
+  `validateAndSaveSource` 钉住为“临时编译成功后才原子替换”，运行中定义保持冻结并提示重启生效。
+- 项目新增文件管理器 API：`createSource` / `duplicateSource` / `renameSource` / `removeSource`
+  与 `setTypePrefix`。每个操作先校验安全相对路径与源码（新建、复制还要编译通过），再原子改写
+  format-1 清单，失败时磁盘上什么都不变；新建与复制分配新的 `custom_id` 与
+  `<prefix>/<相对路径>` 形式的 `type_id`，改名只移动文件并保留元件身份，每个项目至少保留一个
+  元件。单元测试覆盖成功与拒绝路径，并重新 `load` 清单验证下一次启动仍可载入。
+- **Verilog 编辑器** 页新增文件管理工具栏（新建／复制／改名／删除），带名字输入框与删除确认；
+  新建与复制写入可编译的缓冲器模板，有未保存改动时管理按钮禁用，操作成功后提示重启生效。
+- **同形状热加载**：`Component::hotSwap` 把新编译的程序放进同一个 `Program` 对象（宿主持有的
+  回调 `user` 指针因此一直有效），端口与 `state_words` 不变时所有实例从下一个周期起跑新逻辑；
+  `Project::saveAndReloadSource` 把“编译 → 原子写盘 → 替换”串成一次保存。形状改变时，这个轻量
+  路径仍拒绝直接替换，由下面的 runtime V2 在下一帧重建完整定义。离线用例走宿主的真实回调路径，
+  并分别覆盖同形状替换和移动端口后的完整替换。
+- **运行中元件完整热更新**：`tc.component.runtime` 已扩展为 V2，在 V1 的 `register_type` 之外新增
+  事务式 `replace_type` 与按所有者校验的 `unregister_type`。加载期注册闸门仍只在 `tc_mod_load`
+  开放，这个窄例外只在游戏线程、没有电路板时开放；替换失败会恢复旧定义，删除不会碰到其它 Mod
+  的类型。`Project::registerLive` / `reloadLive` / `unregisterLive` 与 `Component` 封装覆盖新建、复制、
+  改名、端口或状态布局变化及删除，旧加载器继续返回 `TC_COMPONENT_TYPES_ERR_UNAVAILABLE`。
+  编辑器在**下一帧**（`on_frame`，不在页面绘制内）提交这些变更，并把结果写进状态栏。
+- **可见元件栏同步刷新**：加载器在游戏绘制元件栏之前检查运行时类型 generation；generation 变化时，
+  先调用游戏自己的菜单重建函数，再继续原始绘制。这样没有钩住 `reload_component_menu`，不会占用
+  Mod/探针需要的同一入口。隔离真机回归中，延迟到启动后创建 `probe_refresh_1400`，日志确认
+  `generation 1` 已应用，而游戏菜单探针导出的 `自定义` 分类同时出现新 `custom_id`
+  `0xe28f33bd604cd2a9`。
+- **修复运行时结构替换被重复 ID 拒绝**：旧实现先从可见原型表删除类型，再调用
+  `add_custom_prototype` 导入同一 `custom_id`；游戏还有另一张 ID 索引不会被这个删除同步清空，导致
+  新定义和回滚定义都返回重复。替换现在走游戏原生 `update_custom_prototype`，把生成的
+  `circuit.data` 从 Mod 私有暂存目录原位更新，再切换逻辑桥和菜单 generation。真机回归在同一进程
+  将一个类型从 1 输入更新成 2 输入，并从游戏原型表读回 `2in/1out`。
+- **运行中注册新类型的基础契约**：`tc.component.runtime` V1（`register_type`）与
+  `sdk/tc_component_runtime.h`。加载期注册闸门只在 `tc_mod_load` 开放，这个窄例外只接受**尚未
+  存在**的 `custom_id`，且只在游戏线程、没有电路板时开放，注册后立即 `logic::finish` 激活桥接
+  定义，所以下一次进关卡就会被正常编译；`Project::registerLive` / `Component::registerLive`
+  封装了它，旧加载器返回 `TC_COMPONENT_TYPES_ERR_UNAVAILABLE` 时调用方回退到"下次启动生效"。
+  编辑器的新建/复制在**下一帧**（`on_frame`，不在页面绘制内）提交注册，并把结果写进状态栏；
+  真机回归新增断言 `tc-verilog-ram: live component registration available`。
+- 交付过程中发现并撤掉了一个副作用：加载器曾钩住游戏的 `reload_component_menu` 来观察菜单，
+  这会让 Mod 自己再也钩不上同一个函数（MinHook 返回 `MH_ERROR_ALREADY_CREATED`），现在该钩子
+  已完全移除，元件栏相关的既有真机用例（`float-palette-playtest`、`float-menu-probe`）恢复可用。
+- 编辑页完成中文化和响应式重排：文件项使用选中态，宽屏左右分栏、窄屏上下排列，尺寸读取
+  `igGetContentRegionAvail` 的真实余量；宿主页头改为单行“返回 + 中文页名”，修复高 UI 缩放下
+  Mod ID、返回按钮与正文互相覆盖。按钮宽度和底部编译输出空间均由真机帧缓冲截图复核。
+- 真机隔离回归已覆盖两次启动：首次注册日志确认 `0x54435652414d3031` 为 5 输入/1 输出，且
+  `tc-verilog` 页面完成注册；随后写坏持久 `.v`，第二次启动保留玩家内容并报告
+  `ram16x8.v:2:1` 与对应 type ID。
+
 版本号只有一个来源：仓库根目录的 `VERSION`。`build.ps1` 由它生成 `src/version.hpp`，
 加载器横幅与日志、安装器标题、`tcmod-cli --version`、分发包文件名全部读这一处
 （此前 0.4.0 硬编码在五处，而源码里的界面 API 注释写的是 0.5.0/0.6.0，编号已经对不上）。
 当前版本 **0.8.0**（2026-09-27）：0.4.0 之后积攒的全部工作在这一版一次性打包发布。
+
+## 未发布：TCLogicIOV3 三态注册与生成代码桥（2026-09-30）
+
+- `sdk/tc_logic_api.h` 新增 `TCLogicValueV3 { value, drive_mask }` 与
+  `TCLogicIOV3`：每个引脚逐位表达 0、1、Z，Z 位和值域外位都规范化为 0；游戏的短路错误 E
+  不伪装成第四种逻辑值。
+- V3 完整携带 V2 的阶段、实例状态、配置与几何上下文，但引脚元素类型不同，契约明确禁止
+  V2/V3 强制转换。公开布局已进入 Windows x64 ABI 快照：值 16 字节、IO 120 字节。
+- `tc.component.types` 新增 API V2 与 `register_definition_v3(TCComponentTypeDefinitionV3*)`；
+  API V1 保持原尺寸和行为，C++ SDK 新增 `tableV2` / `registerDefinitionV3`。
+- 输入数值仍使用已验证的两个 64 位 payload，输入驱动平面在 invoke 前单独锁存；普通网络视为
+  全驱动，原版三态网络的 `zid`（刷新态为相邻驱动槽）展开成该脚的全宽 mask。
+- V3 生成骨架把每个输出门换成游戏原版 bit/word Switch，并跨 `add_line` 分段改写其使能与
+  数据表达式；Z 因而真正不参与网络驱动，0/1 多驱动冲突仍由原版 OR/AND 合并代码报短路。
+- 原版 word Switch 只有整字使能，所以当前宽脚只接受 0/全宽两种输出 mask；部分 mask 保守
+  发成整脚 Z 并写诊断，不伪造游戏并不存在的逐位高阻。
+- 真机 `native-component-playtest.ps1 -Single -V3` 已通过：V3 注册、输入 drive=255、REFRESH
+  输出 Z、CYCLE 字节倍增 16 组全部过关，生成源码可见 `drive_in → peek/invoke → drive_out → zid`。
+- `build.ps1` 完整通过；Windows x64 ABI 快照增至 1855 条，既有 V1/V2 回归保持通过。
+
+## 未发布：simcore 字宽运算族——原版元件覆盖第一刀（2026-09-29）
+
+沙盒内核要能跑**玩家自己的板子**，而板子一旦离开门级关卡就全是字宽元件。这一刀把
+`build/kinds.txt`（该构建自己的原型表，109 个内置原型）里**声明 `wauto` 的二入一出运算**
+一次做完，并把"还差哪些、每个缺哪个数"写成清单。
+
+- **新器件族（`simcore/include/tcsim/devices.hpp` 的 `WordOp`）**：`addW`（带进位入/出）、
+  `equalW`、`lessU`/`lessS`、`mulW`/`divW`/`modW`、`shlW`/`shrW`/`rolW`/`rorW`/`asrW`、
+  `negateW`/`incW`/`notW`/`clzW`/`ctzW`、字宽 `andW`/`orW`/`nandW`/`norW`/`xorW`/`xnorW`，
+  以及 2 入 `concat2`；`builtinWordDevice`/`builtinWordDeviceNames` 让调用方先问再建。
+- **四态规则照游戏而不是照 Verilog**：游戏生成的程序是**64 位字上的普通 C**，它自己的
+  参考仿真器把每个值都解析成具体数，所以字宽运算里**任意一个未定（X/Z）操作数位会把整个
+  结果变成 X**（比较类给一个 X）；位级门保留逐位真值。理由写在 `devices.hpp` 该族开头：
+  一个游戏不认的"更精确"答案会让交叉验证说谎。
+- **板级接入（`simcore/include/tcsim/board.hpp`）**：新增 `wordKindSpec` /
+  `wordUnarySpec` / `isConcatKind` 三张 kind→器件表；自动宽度从"每元件一个数"改成
+  **每引脚一个数**——移位/循环的**移位量是参数脚**，宽度取到达它的导线，数据脚取整条
+  数据通路；权威顺序是①记录 `+0xe0` 的 `memory_bits`、②数据脚上最宽的导线、
+  ③原型表声明的宽度。三者都没有时**报"宽度未确定"**，不给 1 位默认器件
+  （`0x6a` 这类"输出 `wauto` 但只有配置字段"的元件正落在这里）。
+- **离线门槛**：新增 `testWordOps()`（40 条断言：进位入/出、除零、有符号/无符号比较、
+  移位量等于字宽的边界、循环绕回、污染规则、Concatenator 高低位、未知名返回空指针）与
+  `testWordWidthResolution()`（合成板：Mux 用记录里的 32、Add 退回 8 位导线、**没有任何
+  宽度来源的字宽件被报出来而不是建成 1 位**）。
+  `simcore` **300/300**、`simcore-view` **188/188**、`simcore-iverilog` **8/8**（门级电路
+  的逐事件表与 Icarus Verilog 13.0 仍逐网一致，新代码没有碰到它们）。
+- **一处真回归也被门槛抓住**：宽度改成"每引脚一个数"之后，`memory_bits` 会被写进
+  **控制脚**（Mux 的选通、Switch 的使能、移位的移位量），把它们撑成 32 位；现在
+  `isAutoWidthControlPin` 同时覆盖这三类，记录里的数据宽度永远不写进它们。
+- **盘点与清单**：新增 `tools/kind-coverage.py`（读 `build/kinds.txt` 与 `board.hpp` 的表）
+  与 [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md)——109 个内置
+  原型里 **87 个已能进网表**（16 门级 + 25 字宽/叶子/索引/接口 + 28 手写分支 + 18 空槽），**22 个未支持**，
+  并逐个写出缺的是哪一个数（叶子位序、状态件的配置字段、译码器形状、几个探针、
+  `0x6a` 的宽度来源）与"用游戏当裁判"的测量方案（`kind-oracle` 探针）。
+- **同一轮的第二刀：位序/拼接族**。`board.hpp` 新增 `leafKindSpec` 表，把 14 个
+  Splitter / Maker / Concatenator（`0x10/0x11/0x2f/0x30/0x61–0x64/0x6d–0x70/0x73/0x74`）
+  接上既有的 `deviceSplitter`/`deviceMaker`；宽度从**原型表自己的引脚形状**取
+  （叶子数是几就是几位），拿不到就不建器件并报 `not guessed`。
+  `KindPins`/`KindGeometry` 的输出数组从 4 格放宽到 8 格——游戏的八叶 Splitter 之前
+  会被几何表整块丢掉。
+- **第三刀：Static Indexer（`0x65`）**。`deviceIndexer` 按**游戏自己的两份文件**实现取
+  字段：`campaign/symphony_1_nand/test.si` 用 `(instruction >> 24) & 0b1111` 这一组表达式
+  解码，同一关的 `hint_custom/Instruction Decoder` 解把七个 indexer 配成**同一组数与
+  宽度**（`(29,2) (24,4) (20,4) (16,4) (8,4) (28,1) (0,16)`）；`campaign/multiply` 的解
+  用负 index（`-1`…`-7`）左移搭表。于是规则是"index ≥ 0 取 `(A >> index)` 的 width 位，
+  index < 0 往另一方向移、低位补 0"，唯一由关卡暗示而非明说的一处（负 index 是否也套
+  掩码）写进了注释与待测清单。`BoardComponent` 同时补上 `+0x70` 的 `field_bits` 读数。
+- **新增离线测量工具 `tools/netlist-view.py`**：把游戏自己的
+  `hint_*.data`/`hint_solution.data`/`hint_custom/**/circuit.data` 读成网表（引脚来自
+  `build/kinds.txt`，连线来自文件），`--scan` 还能统计每个 kind 被用了多少次、Splitter
+  与 Maker 的叶子怎么对接、indexer 都配了哪些 index。它给出的两条结论：217 份游戏电路里
+  **0x51 Output Pin 用了 90 次、0x4f Input Pin 74 次、0x27 Register 71 次**（所以剩下的
+  24 个里最该先量的是这三个），以及 §3.2 的位序约定在"关卡自己的解 + 关卡自己的 ISA"
+  两处同时成立。
+- **第七～九刀：真机测量装置 `kind-oracle`（本轮首次拿到读数）**。新增
+  `tests/kind-oracle-probe.cpp`（原生探针：进棋盘 → 用 `tc.commands` 的 `PLACE_COMPONENT`
+  放**一个内置 kind** → 用 `tc.board` 把每个元件与导线记录 dump 出来）与
+  `tests/kind-oracle-playtest.ps1`（隔离沙盒 + 断言 + 抄走 dump）。跨过去四道真机报出来的坎：
+  ①加载器只允许**一个** `igInvisibleButton` 钩子，所以探针复用 `enter-board.cpp` 的加载器、
+  只把自己的 `on_frame` 接上去；②`captureBoardObjects` 的 `buffers` 不是可选的（传空指针判
+  `ARGUMENT`），而且 `buffers->version` 必须等于 `TC_BOARD_OBJECT_SNAPSHOT_VERSION_1`——正解
+  是**带第一版猜测的缓冲调两次**，用第一次失败写回的数量扩容重试；③只能读 `written` 个句柄，
+  否则读出来全是 unreadable；④**内置 kind 确实能通过命令总线放上棋盘并读回记录**。
+  四份读数（`0x2c` 2 Bit Decoder、`0x27` Register、`0x6a` Input、`0x3e` Switched Input）形状
+  一致：`components=2`，index 0 是 `kind=0x00 id=0` 的棋盘自身记录，index 1 是刚放上去的
+  kind 并带独立非零实例 id。**这量到的是"能放、能读、能给 id"，行为（值、槽位、状态）还要
+  下一步跑周期再读状态数组**；本轮不把"能放"说成"行为已验"。
+- **第二十八刀：槽位重排的假设被直接否掉，真机行为测量判为阻塞**。修好缓冲契约后比对编译
+  请求前后的导线表：**逐字相同**（`wires=14 w0@268 … w13@264`），所以"重编之后读错了地方"
+  这个解释不成立。至此凡是能从这个探针侧检查的前置条件都已排除或直接比对：驱动到位
+  （`w11@256` 曾跟着输入走 0,1,2,3）、槽位稳定（本轮）、编译被调用且无报错（§5.18）、命令/
+  状态机/模型/符号全正常。**唯一剩下的解释是游戏没有对这块板子执行仿真**——`sim.run` 提交
+  成功、`sim.do` 链节也带着有效模型回调了，但没有任何字节写回状态数组；这要从仿真线程/程序
+  生成那一侧看，不是帧回调能解决的。**真机行为测量在此判为阻塞**，行为真值表的全部证据仍是
+  第 13 轮那一个单点读数。详见
+  [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §5.20。
+- **第二十七刀：想直接看槽位表，撞上一条 loader 契约**。为验证"重编把槽位重排了"这个假设，
+  加了 `slotMap()`（导线表打成 `id@slot`）并在编译请求前后各打一次。第一次调用就返回
+  `unavailable`：这个 helper **只给了 `wires` 缓冲**，而 `capture_objects` 要求
+  `buffers->components` 也非空（`native.hpp:508`）。**这是我自己的实现疏漏，不是游戏的问题**；
+  槽位重排的假设**尚未验证**。修法很小（照 `wireValues()` 的写法给 helper 也分配 components
+  缓冲）。这条线的净结论不变：编译被调用且无报错，但导线字节不随输入变。
+- **第二十六刀：帧状态机重写（扁平流水线），前三轮的结论被推翻**。把 `kind-oracle` 的帧回调
+  从零重写成"一步一个函数 + 每次转换都记一行"的扁平形式，第一次跑就把真相打全：
+  `step wait-for-board -> place-target` → `placement state=3 result=0` →
+  `want-compile model=…2650 preorder=…1a20` → **`asked the game to recompile the board`**
+  （`preorder progress empty`，不是错误）→ `run-once` → `sweep-write/wait`。
+  因此**第 23～25 轮的三条结论全部更正**：`preorder` **被调用了**、指针**不是 null**、
+  `sim_model` 那一刻**非空**。真正没解决的仍是同一件事：编译请求发出且无报错，但扫描里
+  `w11@256` 四行都是 0（之前能跟着输入走）。下一处要查：这次重编是不是把棋盘状态清掉了，
+  或 `sim.run` 有没有真的跑起来（`sim.do` 链节日志可直接回答）。
+  **方法论教训**（已写进研究文档）：连续三轮我在"日志的缺失"上做推断，而真正的错误是
+  **日志本身没被执行**；遇到"某件事没发生"，第一步应先确认那行日志有没有执行。
+- **第二十五刀：`set_sim_test` 也接上了，诊断范围压到一个日志语句**。按 §5.16 抄了
+  `component-capacity-probe` 的上下文：`set_sim_test__modelZutilities_u6840` 解析成功
+  （`set_sim_test=…cea0`），`recompile()` 里先调它再调 `preorder`；为了定位又在"该编译了"的
+  决策点加了一行日志（打印 `sim_model` 与 `placed_frame`）。**结果这一行也没出现**——所以
+  根因不在 `preorder`，而在决策点之前：`placed_frame >= 0` 在帧回调里（我放这段的位置）
+  没有成立，或那段代码没被执行到。**下一步只看这一行为什么没输出**。本轮到此不再改探针。
+- **第二十四刀：符号是好的，编译调用仍未落地——这条线判为阻塞**。那一行日志跑掉了：
+  `preorder symbol=…1a20 fn=…1a20`，**解析完全正常**。所以唯一剩下的原因是 `sim_model` 在
+  `recompile()` 那一刻还是 null（模型只在 `sim.do` 响应过一次运行请求后才出现），据此把条件
+  改成"模型到手再请编译"并重跑，**`asked the game`/`preorder progress` 依然一次都没出现**，
+  读数逐字未变。至此**四件前置条件（符号、模型、命令、状态机）全部用真机日志排除**，这条线
+  判为阻塞：探针无法让游戏在程序化放置之后重算棋盘，行为真值表因此拿不到。
+  给接手人的最短路径写在 [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md)
+  §5.16：**照 `component-capacity-probe.cpp` 的上下文抄**——它是在 `set_sim_test(model,0,1)`
+  之后才 `preorder(model,&progress,0)`，游戏可能要求先进入测试态才肯编译。
+- **第二十三刀：状态机修好了，`preorder` 一次都没被调用**。三值日志打出真相：
+  `trace stage=1 request=1 placed_frame=-1` → `placed_frame=1..5` → `stage=2`。**第 22 轮那个
+  bug 修对了**——放置命令以 SUCCEEDED 结束、`placed_frame` 开始累加、状态机从 1 走到 2，
+  命令总线那一环好用。**但 `recompile()` 仍没生效**：日志里 `preorder` 出现 0 次。它的前置
+  条件是 `!preorder_fn || !sim_model`，而 `sim_model` 已被证明是好的
+  （`sim.do link fired … model=…24e0`），所以只剩一种解释：**`preorder_fn` 解析出来是 null**，
+  函数在第一行就返回了。下一轮唯一要看的：把该符号的解析结果打进日志（一行）；为 null 就在
+  符号画像里换名字，不为 null 就是调用时机（同一帧里先 recompile 再 run，`sim_model` 那一刻
+  还是 null）。
+- **第二十二刀：找到并修掉一个真 bug，状态行仍未打出**。放置命令的状态检查原先**写在
+  `kWaitingForPlacement` 分支里面**，而状态机发出 run 请求后就转到 `kRunning`——那个分支再也
+  不执行，于是 `placed_frame` 永远是 -1、`recompile()` 的条件永远不成立。这解释了第 21 轮
+  "模型是好的、编译却没跑"。修法是把状态检查提到 stage 门之前（每帧一次），代码已编译通过。
+  **但真机跑完 `placement state=…` 这一行仍没出现**，读数逐字未变，说明
+  `placed_frame < 0 && request != 0` 这个条件本身没成立（要么帧里看到的 `request` 是 0，
+  而提交那一帧明确写着 `request=1`；要么那段没被执行到）。下一轮唯一要看的地方：在帧回调最
+  开头无条件打 `request`/`stage`/`placed_frame` 三个值。
+- **第二十一刀：假设被推翻，问题缩到"放置命令的状态"**。上一轮猜"模型指针拿不到"是**错的**：
+  `sim.do` 链节真机打出了有效指针（`args=…0f90 model=…2770`，多次稳定）。既然模型是好的、
+  日志里却依然没有任何 `preorder`/`recompile` 输出，说明 `recompile()` 的调用点没走到；而它
+  的条件是 `extra_index >= extra_placements.size() && placed_frame >= 0`，所以唯一的解释是
+  **`placed_frame` 仍是 -1**——"放置命令以 SUCCEEDED 结束"这一支从未成立。下一轮只需把
+  `TCCommandStatusV1` 的 `state/result/completed_frame` 每次都打进日志，就能定位是命令没成功
+  还是状态读取分支写错了。
+  **`kind-oracle` 到此确认可用的一半**：进关卡、放内置 kind（可多个）、读回元件/导线记录、
+  按棋盘下标驱动输入、读多字节槽位、`sim.do` 链节拿到模型指针。**未确认的一半**：程序化
+  放置之后让游戏重算这块板子——行为真值表依赖它。详见
+  [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §5.12。
+- **第二十刀：把第 19 轮的变形回退掉，并把"为什么没编译"缩到一行**。去掉"每个值重编一次"
+  之后，读数**恢复到 §5.6 那个形状**（`w11@256` 又跟着输入走 0,1），所以那次变形确实是多余
+  重编造成的。同时查明 `recompile()` **一次都没被调用**：两个钩子都挂上、`preorder` 也解析
+  到了，但日志里没有任何 `preorder progress` 输出；代码路径核对过（钩子安装与 `preorder_fn`
+  赋值都在 `enter_board_load` 之后、`create_hook` 没有被清空），所以最可能是
+  **`tc::hook::simDoArgs(call)->model` 没给出模型指针**、`sim_model` 始终为 null。下一轮第一件
+  事就一行：把 `args->model` 的原始值打进日志确认。`recompile()` 现在也会把 `preorder` 交回的
+  progress 字符串写进日志，好让"编译到底有没有发生"一眼可见。
+- **第十九刀：真去接了编译入口——三条都挂上，行为读数仍然没出来（失败实验）**。
+  `handle_update_wire` 钩子（取模型指针）与 `sim.do` 链都**真机确认挂上**
+  （`model capture armed`、`Hook chain sim.do joined (priority 0)`），
+  `preorder__modelZsimulationZcompile95thread_u3523` 也解析到了。但模型指针要等游戏处理过
+  一次运行请求才出现，于是 `recompile()` 在第一次扫描前一直拿不到模型；改成"每帧重试 +
+  每个值重编一次"后读数反而变形：`w11@256` 不再跟着输入走（四行都是 0），`w2@264` 仍是 1。
+  **这一轮既没拿到真值表，也没保住上一轮能用的形状**——按失败记录，不写成进展。
+  下一步只做一件事：把 `preorder` 调用的返回值与游戏侧副作用记清楚，再决定是编译时机不对
+  还是这条路不对；弄清之前不动 `kind-oracle` 主流程。
+- **第十八刀：把"缺的那一环"写成可执行的接法（未实现）**。查明 `preorder__modelZsimulation
+  Zcompile95thread_u3523` 就是"让游戏重新编译这块板子"的入口（`component-capacity-probe`
+  在放完元件后正是靠它把编译跑起来，两行代码），**缺的只是 `model` 指针**：那个探针是从
+  `handle_update_wire` 的钩子第一个参数取的，而 `kind-oracle` 因为钩子位被 `enter-board`
+  占用（§5.1 第 1 条）一个钩子都没挂。两条可行路线（再挂一个 `handle_update_wire`，或查服务
+  表里有没有直接交出模型的入口）写在
+  [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §5.9。本轮只做了
+  调查与记录，**没有实现**，也没有改口 §5.8 的结论。
+- **第十七刀：完整关卡契约也部署了，结论不变——这条线在此收手**。试玩脚本新增
+  `-LevelSource`，把 `campaign/overture_decoder` 的 `meta.txt`/`test.si`/`ui.txt`/`label.txt`
+  连同我们的 `circuit.data` 一起部署（已确认写出 `Copied … into campaign\sandbox`），读数
+  **与之前逐字相同**；再把等待从 60 帧加到 300 帧、每个值从 30 帧加到 120 帧，也一样。
+  四种组合（只放电路 / 电路+常量驱动 / 电路+完整关卡契约 / 再加长等待）给出同一种形状，
+  而 `sim.run` 与 `write_input` 都返回成功——所以**这块板子的线状态字节从头到尾没有被重算
+  过**，它们是关卡加载时的初值。要拿到行为读数，需要在放置元件之后**让游戏重新编译这块
+  板子**（`compile_request__modelZutilities_u…`，用法见 `component-placement-probe.cpp`），
+  那是 `kind-oracle` 之外的一件独立工作。
+  **本线到此收手**：装置里已真机验证的部分保留（放内置 kind、多放常量、读回元件/导线记录、
+  按棋盘下标驱动输入、按字节含多字节读槽位），"让游戏重算"这一环缺着，行为真值表仍只有
+  第十三刀那个单点读数（地址 0 → `out0=1`）。详见
+  [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §5.8。
+- **第十六刀：查明"值不传播"不是驱动的问题，是这块板子在沙盒里根本没被重算**。
+  上一轮四次扫描里关卡输入确实写进了棋盘（8 位那根线读出 0,1,2,3），但下游的线**一个字节
+  都没动**。这一轮换掉驱动方式再测一次：探针新增 `TC_KIND_ORACLE_EXTRA`（`kind@x,y;…`，
+  在放目标之前先放别的元件），真机确认**放两个 ON 常量（`0x02`）到棋盘上可行**
+  （`component index=1 kind=0x02 x=4 y=0`、`index=2 kind=0x02 x=4 y=2`，各带独立实例 id）。
+  但读数形状与上一轮一样：绝大多数导线的字节是 0。
+  **结论（本轮确定的这一条）**：沙盒里那块板子在关卡没有自己的 `test.si`、也没有声明 I/O 时，
+  游戏**不会重算**它的线——所以"关卡 Input 的驱动"和"常量驱动"两条路都量不到行为。
+  要拿到真值表，得让关卡**有 I/O 与测试**（把 `campaign/overture_decoder` 那类的
+  `meta.txt`/`test.si` 一并部署，或改成用游戏自带的 `byte_mux` 那种已验关卡当宿主）。
+  这条不是猜测：两次不同驱动的读数形状一致，且 `sim.run`、`write_input` 都返回成功。
+- **第十五刀：扫描跑起来了（译码器仍未跟着输入变）**。修掉两个自己的错之后四次扫描跑通：
+  ①扫描必须隐含"跑仿真"那段——第一版把扫描分支挂在 run 阶段之后，而那次没给 `-Run`，状态机
+  从没进过扫描就直接 dump 了；②驱动要写的是**棋盘上的元件下标**（关卡自己的 Input 是
+  **index 4**，不是电路文件里的 8），写对之后能确认驱动生效——8 位那根导线在四次里读出
+  **0,1,2,3**。但同一份读数里**译码器的输入线始终 0、输出线始终 1**，也就是说
+  Splitter→译码器那段没跟着输入动，两种解释（关卡输入在沙盒里没有 `test.si` 驱动 /
+  我对"哪根线是译码器输入"的判定有误）本轮**没有定论**。装置本身（逐值扫描、多字节槽位
+  读取）已在真机上验证；**译码器的真值表仍未拿到**。下一轮候选：确认 2 位线与 `w11` 是否
+  同网，或改用探针放常量元件当驱动源以绕开 `input_replay`。
+- **第十四刀：真值表扫描的装置（装好了，但这一轮没跑起来）**。`tc.io_value` 提供按  **棋盘元件下标**读写的 `write_input`/`read_input`/`flip_input`，所以扫描不必改关卡文件；
+  探针新增 `TC_KIND_ORACLE_SWEEP_INPUT/FROM/TO`（逐值 `write_input` → 让游戏跑一会儿 →
+  把每条导线记成 `id@slot=value` 一行），试玩脚本新增 `-SweepInput/-SweepFrom/-SweepTo`。
+  **但实跑出来的是普通 dump 而不是扫描**：loader 日志里 `sim.run` 与 `sweep input` 两行
+  都没出现，说明探针没进那两个分支（最可能是环境变量没被读到）。装置**尚未被真机验证**，
+  本轮不声称可用；下一轮第一件事是打印探针读到的参数值、把参数通路确认掉。
+- **第十三刀：第一份行为层面的真机读数**。装置打通了整条链：`tools/level-circuit.py` 生成
+  关卡电路 → 试玩脚本把它部署进隔离沙盒的 `campaign/<关卡>/circuit.data`（新增
+  `-CircuitPath`）→ 探针读游戏自己的 `simulation_state` 缓冲区（新增
+  `TC_KIND_ORACLE_RUN`，先让游戏跑 N 个周期）→ 每条导线记录带上**当时的字节值**。
+  结果：游戏加载并运行了我们部署的电路（`components=10 wires=14`，即那份解的七个元件加上
+  探针放上去的第九个），状态偏移以 2 字节步长分配且**线间共享**（`268` 被三根线共用）。
+  可对照的一条：译码器 `out0` 那根线（`slot=264`）的值是 **1**，而关卡 Input 初值为 0——
+  与 `deviceDecoder(2,false)`"地址 0 只点亮 out0"一致。**这是一份单点读数，不是真值表**；
+  地址 1/2/3 要下一轮改初值或找驱动路径再量，本轮不把它说成"语义已验"。
+- **第十二刀：关卡电路生成器落地**。新增 `tools/level-circuit.py`：以游戏自己的解为模板
+  生成"能被部署、能被解析器读回"的关卡电路。**一条实测教训**：第一版想"只保留某些 kind、
+  删掉多余导线"，结果 14 根导线全被丢光——那份解把多根导线接在同一格上（总线式共享），
+  按"两端都落在保留引脚格上"过滤不成立。现在的做法是**不改电路形状**，只（可选地）给
+  关卡自己的 Input 改名/改宽度再编码写回。实测：把 `overture_decoder` 的解改成
+  `--rename-input Instruction` 写进 `build/decoder-level/`，再读回来是
+  `components 8 wires 14 version 13`、Input 名字为 `'Instruction'`，并已带上 `sandbox` 的
+  `meta.txt`/`label.txt`。
+- **第十一刀：行为测量的落脚点探明**。①**编码器可用**：`tools/circuit_format.py` 的
+  v13/14 编解码往返通过（读游戏电路 → 编码 → 解码，元件与导线数量一致），`python-snappy`
+  本机可用，所以"写自己的电路文件"没有工具障碍。②**模板找到了**：
+  `campaign/overture_decoder/hint_solution.data` 本身就是一份最小译码器电路
+  （`0x6a Input` → `0x11 Splitter` → `0x2c 2 Bit Decoder` → 四个 `0x3a Output` + `0x6f Maker`），
+  拿它当模板就不用从零构造元件记录。③**新增 `tools/pin-slots.py`**：打印"哪根导线落在哪个
+  元件的哪个脚上"，它在这份解上验证了自己——四个输出脚各引出一根线到四个独立 Output，
+  输入侧 `in0` 接 Splitter、Splitter 吃 Input，**这就是一位热码译码器在真机电路里的形状**。
+  ④**探明一条限制**：关卡电路里**没有**状态偏移，偏移是游戏加载时分配的（所以探针要 dump
+  导线记录，每条都带 `state_byte_offset`）。
+- **第十刀：把"行为那一半"的路线定下来**。带坐标与旋转的读数（`-X 7 -Y -5 -Rotation 1`
+  读回 `x=7 y=-5 rotation=1`）确认装置可以按坐标/旋转量记录，探针也在放置后多等 5 帧让
+  游戏安定记录。行为测量真正难的是**引脚在棋盘上的位置**（`0x37` 这一类在原型表里没有
+  声明），三条路按风险排序写进了
+  [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §5.1：①写状态数组
+  （需槽位号）；②替游戏写导线记录（布局已实测，但属于直接改游戏内存）；③**用关卡内容当
+  模板**——把目标 kind 与常量/输出脚写成一份 v14 电路、部署成关卡让游戏自己加载运行
+  （`tests/level-content-playtest.ps1` 已证明这条路可行，编码器在 `tools/circuit_format.py`）。
+  按红线 6 的取向**优先第 3 条**：它量到的是"游戏运行我们写的电路"的真机行为，且完全不
+  碰游戏内存。
+- **第六刀不是实现，而是把两种"缺"分开**：原型表里有 **22 个 kind 完全没有声明任何引脚**，
+  但它们的原因不同，下一步该往哪查也因此不同——
+  ①**状态件**（`0x76` RAM、`0x52`/`0x53` Memory Probe）：端口由板级接入自己建模（RAM 的
+  Load/Store 插座顺序已经在 `board.hpp` 里），值在别处，不是"没量到引脚"；
+  ②**真的缺几何**（`0x37` Word Delay Line、`0x0d` Bit Delay Line）：这两件在游戏电路里
+  `out0` 100% 接线（11/11），而原型表那一行没有任何 `in…`/`out…` 声明——**输入端的位置
+  只有游戏自己知道**。它们的记录指纹已经量到（`bits=32` / `bits=1`），所以缺的**只是端口
+  几何**，要么真机把引脚位置读出来，要么先只支持输出端这一半。这是本线第一条"缺的不是
+  字段值、而是引脚位置"的项目，写进 [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §4。
+  **当轮又量到一半**：把 217 份电路里所有 Delay Line 的坐标与导线端点对照，落点**恰好只有
+  两个**——`(-3,0)` 与 `(3,0)`，各 11/11 命中（`(3,0)` 就是表里没写出来的那个 `out0`）。
+  于是几何其实已经量出来了，**没量到的是行为**（那根输入是不是"下一拍出现在输出"），
+  按红线 6 在那之前不建器件。
+- **第五刀：译码器三件（`0x2b` / `0x2c` / `0x2d`）**。`deviceDecoder` 按原型表自己声明的
+  宽度实现一位热码译码：`0x2b` 一个地址位两位出、`0x2c` 两位地址四位出、`0x2d` 三位地址
+  加**一个使能脚**、八位出；未定的地址或使能一律给 X，使能为低时全部输出 0，而**使能不接
+  线时保持使能**（这一处是推断而非实测：它是唯一一个声明偏移不在数据通路上的脚
+  `(0,-4)`，在游戏电路的 11 次出现里只接了 1 次，且那一次承载的是一位信号——已写进
+  待测清单）。行为形状的证据来自游戏自己的 ALU 解：译码器的 `out0..out2` 接进一个
+  4 输入 Maker 的**高三个叶子**、Splitter 的一位接进最低叶子，也就是一个四选一的选择字。
+- **第四刀：接口引脚（`0x4f` Input Pin / `0x51` Output Pin）**。实现为**宽度可变的直通**
+  （`devicePin`，没有驱动时输出 Z）。证据是结构性的、覆盖全部 217 份游戏电路：
+  `--scan` 显示**每一份** Output Pin 的 `in0` 都接着线、`out0` 都不接（90/90），
+  **每一份** Input Pin 反过来（74/74）——这正是直通件的形状，源件与汇件都对不上。
+  这两个 kind 在游戏电路里的用量（90 与 74）是剩下那些里最高的两个。
+- **剩下 22 个的用法与记录指纹全部量出来了**（`--scan` 新增两项：每个 kind 的每根脚
+  "在多少次出现里真的接着线"，以及它的记录在文件格式暴露的字段上长什么样）。表在
+  [research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §4，读出来三件事：
+  ①**十二个 kind 在游戏自己的电路里一次都没出现**（Auto Register / Auto Delay Line /
+  7 Segment / Static Value / Static Evaluator / Auto Static Indexer / Halt /
+  Disassembling probe / Level Component / Level And Delay / 两个无名槽），优先级最低；
+  ②**`0x27` Register 的入口不在棋盘上**——71 次出现里 `in0` 一次都没接、`out0` 只接 33 次，
+  记录里 `i16` 是一串负数而 `boolA=1`，而 `campaign/assembly_programming` 里它们就叫
+  `Reg 0`…`Reg 5`（同电路还有 `Count`、`Program`），说明它是靠名字/索引与仿真器打交道的
+  寄存器堆，**必须真机读数**；③`0x3e` Switched Input 的 `in0` 只有 1/20 接线，属于
+  "值由元件自己配置决定"的源件那一类。
+- **一处两可之间的选择被写明**：原型表给了叶子的偏移与宽度，但没说最上面那片叶子是
+  最高位还是最低位；本版取"最上面的叶子是最高位"，理由是它让 Splitter 与 Maker 互为
+  精确逆运算（`bus_split` 已与 iverilog 逐网对过）、与 2 入 Concatenator 由声明宽度
+  强制的读法一致，并且（第三刀之后）是唯一能让 `symphony_1_nand` 的解与它自己的 ISA
+  对上的读法。这是**命名**层面的选择而非发明行为，真机那一次对照仍列在待测清单里。
+- **本轮的三个真 bug 都是离线门槛抓的**：`switch` 的组合 case 标签被编辑挤掉、字宽按位
+  运算读 `BitVector` 时把位序读反（MSB-first 向量与 C 值的位序）、以及"先污染后比较"
+  让比较件输出 4 位而不是 1 位。
+
+
+当前版本 **0.8.1**（2026-09-28）：在 0.8.0 之上把 Float Ops 铺到 binary16/binary32/binary64
+三个宽度（含加载器新的宽度感知十进制浮点字段）、Mod 可替换关卡内容，并修了底部元件属性栏的
+一轮排版与交互问题。
+
+## 未发布：沙盒兼容自定义元件（kind 0x4E）（2026-09-30）
+
+### 补：定义内部的导线一直在被读错（2026-09-30）
+
+顺着玩家板子上剩下的 6 条 `component pins 2 share the cell …` 量下去，翻出三个真问题——
+它们都不在那 4 条 note 本身，而在**展平自己的数据来源**上：
+
+- **导线步长量错了**。文档与代码都写着"定义里的导线元素步长 `0x40`"（探针当时的猜测），
+  真机内存里腿指针（`+0x28`）是每 **`0x68`** 一次、端点每 `0x68` 落在 `+0x18`——和棋盘
+  导线记录**同一套布局**。用 0x40 读，每隔一条记录就落在前一条中间，7 份 foundry 定义的
+  内部导线大半读成 `0,0 -> 0,0`。改回 0x68 后**没有一条**退化，玩家那块板子的网表从
+  130 网/104 器件 变成 **183 网/146 器件**：以前少掉的内部连接根本没接上。
+- **定义导线不带宽度**（248/248 实测为 0，棋盘导线写在 `+0x30`）。所以网宽改为"导线自己的
+  宽度优先，导线不带宽度时取落在它上面的引脚宽度（引脚声明，或 `wauto` 时该元件记录的
+  `+0xe0`）"——否则自定义元件内部每条 32 位通路都会被建成 1 位网络。
+- **嵌套定义被叠在父定义的坐标系里**。一份定义里可以再放一颗自定义元件，而它的内部件通常
+  比实例占的格子大得多，于是盖住父定义其它元件、凭空造出短接——那 6 条 note 全是这么来的
+  （含一条"四分线器 `out3` 压在**另一份定义**取负器 `out0` 上"）。现在每个实例（含嵌套）
+  分到自己那块 200 格区域；区域数超出 int16 容量时直接拒绝展平，不再冒重叠的险。
+- **顺带**：那 6 条 note 现在会**说出是哪两个引脚**（`component 65 (kind 0x6E) out3 at …`），
+  不再只报一个格子坐标——这次就是靠它定位到"两份不同定义"的。
+- **验证**：`simcore` **372/372**（新增"宽度为 0 的导线按引脚取宽"两条断言）、
+  `view-tests` **197/197**；真机按玩家完整配置连跑**三轮**：**0 崩溃、0 note**、
+  每轮都是 183 网 / 146 器件，查看器读同一份记录得到同样的 183 网。
+
+### 补：两族 `wauto` 的宽度量到了，Word Maker 不再被拒（2026-09-30）
+
+上一轮之后，玩家板子上还剩一条清不掉的 note：`component 155 (maker2) has no width its
+prototype pins down; not guessed`。原型表把"自动宽度分线器"（`0x2f`/`0x63`/`0x64`）和
+Word Maker / 宽 Concatenator（`0x30`/`0x61`/`0x62`/`0x73`/`0x74`）的数据通路写成哨兵，
+游戏自带的 217 份电路里这两族**一次都没出现**，所以只能量真板子。
+
+- **新工具 `tools/kind-wire-widths.py`**：把 `sandbox-sim-board.txt` 里每个实例的引脚
+  （偏移来自 `build/kinds.txt`，含旋转）与**接到它上面的导线的宽度**对出来。玩家板上两条
+  读数：`0x2F in0 64 -> out0 32, out1 32`、`0x30 in0 8, in1 8 -> out0 16`；记录自己的
+  `+0xe0` 独立印证（32 = 每片宽度、16 = 输出总宽）。
+- **规则**：Splitter 的输入 = 叶子数 × n（n 取输出线上量到的宽度、或输入 ÷ 叶子数、或记录
+  的 `+0xe0`）；Word Maker / 宽 Concatenator 的每个输入保留**各自导线**的宽度，输出是它们
+  的拼接（最上面的输入最高位，沿用 §3.2 的位序约定）。
+- **器件**：`deviceWordSplitter(leaves, n)`（2/4/8 出）与 `deviceWordMaker(widths)`
+  （N 入、逐入宽度、输出为和）；位 Maker（`0x10`/`0x6f`/`0x70`）成为"每个叶子 1 位"的特例。
+  顺带修掉两处旧账：`0x2f` 的 n 以前会去读**不存在的输入脚**并把记录的宽度再除 2；输出脚
+  的线宽度以前会混进输入宽度表（Word Maker 因此会被算成 16+8）。
+- **门槛**：`simcore` **370/370**（新增 `testAutoWidthSplitterAndMaker()`：器件真值表
+  `10101011`+`11001101 → 1010101111001101`、四路分线 `16 → 4×4`，以及两块合成板钉住
+  "宽度从导线来"的解析顺序）、`view-tests` **197/197**。
+- **真机**：玩家那块板子从"一件被拒"变成全部建成（`u156_wordmaker`、`u152_wordsplit2x32`），
+  report 里只剩 4 条 `component pins 2 share the cell …` 的几何 note，窗口读同一份记录得到
+  一样的 130 nets / 235 evaluations 与一样的 note。
+
+### 修：存储家族的 cycle 哨兵网络让 `publish()` 越界（2026-09-30）
+
+打开沙盒时游戏**偶发崩溃**，加载器的故障日志写着
+`dev.sandbox-sim in on_frame: access violation at 0x0000000000000000`。
+
+- **根因**：`board.hpp` 为存储家族（寄存器/计数器/延迟线）新增的 `#cycle` 哨兵网络
+  用 `addNet` 建出来，却**没有同步扩容 `slots_of_net`**；而 `SandboxRuntime::publish()`
+  是**按网络下标**遍历 `slots_of_net[net]` 的。少了最后一个条目，它读到的是分配器留在
+  那里的一个 `std::vector`——内容碰巧是空指针时就是一次空指针解引用，所以表现成
+  "偶发"，而且只有带寄存器的板子才会（8/29 的板子没有 cycle token 时不会崩）。
+- **修**：`board.hpp` 建 `#cycle` 之后立刻 `slots_of_net.resize(netCount())`；
+  `runtime.hpp` 的 `publish()` 再加一条边界保护，让"某个构建器忘了给网络配槽位表"
+  永远只是少写几个字节，而不是崩溃。
+- **回归测试**：`testStorageFamily()` 新增三条断言——每个网络都有槽位表（含 cycle token）、
+  该板子能绑上 runtime、`publish()` 能走完所有网络。把修复撤掉时这条会 **FAIL**
+  （`FAIL every net has a slot list, the cycle token included`），修复在时
+  `simcore` **361/361**、`view-tests` **197/197**。
+- **真机验证**：`tests/sandbox-custom-playtest.ps1` 现在可以按玩家的完整配置跑
+  （新增 `-Dump` / `-Mods` / `-Config` 三个参数，这次的复现就是它们做的）：
+  `-Mods dev.sandbox-sim,dev.enter-board,local.float-ops -Config 'vcd=1;vcd_cycles=40;view=1;startup_seed=1;free_run=1;trace=1'`
+  在修之前 **3 轮里 2 轮**写出 `fault.log`，修之后**连跑 3 轮 0 条**，
+  并且三轮都真的在跑（`cycles_run=143…176`、`published≈1.1e5`）。
+
+### 补：独立查看器不再拒跑这些板子（2026-09-30）
+
+沙盒在游戏里跑得好好的，独立窗口 `simcore-view` 却对同一块板子报
+`component N (kind 0x2D) … no pin geometry in the frozen table`、
+`component N (kind 0x2F) has no device in the library`——玩家点名的**分线器、
+3-8 译码器、多位宽寄存器**正是这三条。三处原因，逐条修掉：
+
+- **窗口里的几何表是手抄的，抄落后了。** 真机版从游戏的实时原型表取几何，窗口没有游戏，
+  只能读 `simcore/view/kind_pins.hpp` 里那份冻结副本，而那份副本停在第一次写的时候：
+  `0x2D`/`0x27`/`0x10` 没有引脚、`0x2C`/`0x30`/`0x2F` 没有器件分支，整块板因此拒跑。
+  现在这份表由 **`tools/kind-pins.py` 从 `build/kinds.txt` 生成**
+  （`simcore/view/kind_pins_generated.hpp`，`--check` 可查是否过期），并且每行的宽度按
+  `prototypeGeometry` 的读法填（"auto" 哨兵与 `w0` 都是 1，两边的判断因此逐条一致——
+  `wauto` 的自动宽度 Splitter/Word Maker 在两边一样被明确拒绝，而不是一边猜一个宽度）。
+- **记录里本来就带着引脚，窗口却只看冻结表。** 实时版现在为**每一个**元件写
+  `inbits=/outbits=/inpins=/outpins=`（Mod 类型与内置元件一视同仁，顺序是原型表的
+  声明脚再隐藏脚）。窗口把它们按实例 id 注册，优先级高于冻结表；冻结表退化成"没有这些
+  字段的旧夹具"的兜底。引脚上限同时从 8/4 提到 `KindPins::kMaxPins`（64），否则
+  8 出的 3 Bit Decoder 只画得出 4 根。
+- **自定义元件在窗口里没有定义可展平。** 记录现在额外写出 `defcustom`/`defcomponent`/
+  `defwire` 段（含嵌套定义），展平算法从 `plugin.cpp` 提到共享头
+  `simcore/include/tcsim/custom.hpp`，窗口和真机跑同一份代码。**实例保留自己的槽位**
+  （改成 kind 0，builder 会跳过），内部件追加在板子自己的组件之后——这样"按棋盘下标"
+  的绘制与器件表仍然指同一个元件，而网表是展平后的那份。
+- **顺带**：`+0x70`（Static Indexer 的字段宽度）现在随记录走，否则窗口只能报
+  "declares a 0-bit field"；`field_bits=` 由 `board_file.hpp` 读回。
+- **验证**：离线 `view-tests` **197/197**（新增 `testCustomComponentFlattens`，夹具
+  `simcore/view/data/custom_passthrough.txt`：定义是 Input Pin 直连 Output Pin，断言常量的
+  1 真的从实例输出脚出来）；`simcore-tests` 358/358。真机端到端：`tests/sandbox-custom-playtest.ps1 -Dump`
+  导出玩家那块 52 元件、7 份 foundry 定义的板子，窗口读它得到 **130 nets / 233 evaluations**，
+  不再拒跑，报的 note 与游戏内那份 report 一字不差（见下条）。
+- **仍未做（两边一致地报出来，不假装）**：那块板子上有一个 `maker2`（Word Maker）
+  的宽度只写了 `wauto`，原型表没有能落地的数，两边都拒绝它并各报一条 note；
+  另有 4 处"两个引脚同格"的几何告警（`component pins 2 share the cell …`）。
+
+- **自定义元件不再是"未支持"。** 在游戏里它们不是器件，而是一份**定义**：游戏把一份电路
+  解析后放进自定义原型表。沙盒现在把这份定义**展平**进网表——读自定义原型里的组件数组
+  （`+0xe0`/`+0xe8`）与导线数组（`+0x100`/`+0x108`），把内部元件与导线整体搬到远端坐标
+  （绝不与棋盘撞格），再按**序号**把定义边界脚（`0x4f` Input Pin / `0x51` Output Pin）
+  接到实例自己的引脚上。棋盘原有的外线停在实例脚格上，桥接线共享端点即成同一网络，
+  所以外层接线一个字都不用改。测量与设计写在
+  [research/custom-components.md](research/custom-components.md)。
+- **几何上限**：`KindPins` 每侧从 8 个脚提到 **64**。原来的 8/4 是照内置元件定的，
+  而自定义元件的接口是作者画的——玩家的 `Symphony/DEC` 就是 1 进 7 出，之前因此得到
+  `component 7 has kind 0x4E with no pin geometry`。
+- **真机结果**：玩家那块带 5 种自制元件（`Symphony/DEC`、`ALU`、`cond`、`count`、
+  `ADDRDECODER-3`）的 CPU 板，从"整块拒跑"变成 **nets=130 / devices=103** 的正常网表；
+  新用例 `sandbox-custom`（`tests/sandbox-custom-playtest.ps1`）把它做成回归。顺带新增
+  `tools/definition-layout.py`（复核定义字段偏移）与 `tests/custom-prototype-probe.cpp`
+  （只读 dump 自定义原型与定义数组）。
+- **细节**：定义里的组件记录不重复引脚数（`+0x30`/`+0x40` 读出 0），沙盒改从原型表取，
+  与几何回调同一依据；内部网没有游戏的状态字节，因此用新的哨兵 `tcsim::kNoStateSlot`
+  明确"不要写回"，不再有内部线写进槽 0 的风险；定义结构里的两个 Splitter/Maker 宽度哨兵
+  （`0x7ffe` 一类）不再被当成真宽度（`kind_bit_width` 收紧了判据）。
+- **仍未做**：Mod 注册的**原生**元件（`local.float-ops` 之类）的"定义"是 C++ 回调而不是
+  电路，展平对它们不适用；让它们跑起来需要"宿主以给定输入调用该 Mod 回调"的入口。展平后的
+  **数值**与游戏逐周期对照也还没做（本轮证明的是能建表、能跑）。见
+  [research/custom-components.md](research/custom-components.md) §6。
+
+## 未发布：仿真器补齐最后的原版元件——存储家族与关卡件（2026-09-30）
+
+- **沙盒仿真器现在认识全部 109 个内置原型**（只剩 `0x50` 一个：游戏自己拒绝放置它，
+  交付形态是"识别并明确报未支持"）。上一轮结束后还缺 19 个，这一轮把三组测量一次做完，
+  依据不是黑盒扫输入输出，而是**游戏自己编译出来的程序**：新工具
+  `tests/kind-source-dump.ps1` 跑一块带该元件的板子（`TC_MODLOADER_DUMP_SOURCE=1`），
+  把游戏生成的 `native-logic-source-*.txt` 收进 `build/kind-source-<tag>/`，那份代码就是契约。
+- **引脚**：存储件的输入脚在原型表的**第二个**列表里（`+0x70`/`+0x78`），
+  `tests/kind-list-probe.cpp` 现在也把它 dump 出来（`hidden0=(-3,-1,w1)` 之类）：
+  寄存器 = enable(-3,-1) + data(-3,0)，计数器 = reset(-3,-1) + data(-3,0)，
+  延迟线 = data(-3,0)；Auto 版多一个 (0,-2) 的"蓝脚"（宽度来源）。记录算的是**总数**，
+  真机原话：`component 3 (Counter) has 2/1 pins in its record but the prototype has 0/1`——
+  `KindPins` 因此分成 `input_count`（总数，与记录对齐）与 `declared_inputs`。
+- **行为**：寄存器 `enable ? data : 保持`、延迟线 `每周期 = 输入`、计数器
+  `reset ? 0 : value+1`，三者的锁存都发生在游戏的 LATE 阶段（`cycle += 1` 之前）。
+  simcore 为此第一次有了**每实例存储**（`DeviceSpec::state_behavior` + `state_size`），
+  板级一条私有网 `cycle_token` 由运行时不漏地每个周期边界翻转一次——存储件的时钟就是它。
+- **其余 14 个**：`0x6a` Input 与 `0x3e` Switched Input 按**源**（值来自关卡/游戏状态数组）；
+  `0x53`/`0x33`/`0x59`/`0x57`/`0x4d`/`0x75` 按**观察者**（游戏对它们一行代码都不生成）；
+  `0x29`/`0x3b` 是关卡地图件（生成的是 `level 值 & 引脚`，沙盒没有关卡值，故输出恒 0）；
+  `0x32`/`0x5a`/`0x5e` 是常量源；`0x2f` 是"2n 位劈成两个 n 位"的字宽 Splitter
+  （新器件 `deviceWordSplit`，n 由导线解出）；`0x35` 与 `0x36` Load port 引脚逐条相同，
+  按 Load port 处理。
+- **门槛**：`simcore` **357/357**、查看器 **188/188**；新增真机用例 `sandbox-storage`
+  （`tests/sandbox-storage-playtest.ps1`）把一块常量 + 寄存器 + 计数器 + 延迟线的板子部署成
+  沙盒关卡，断言加载器不再拒绝它、并且 `devices -> u2_0_register, u3_2_counter, u4_1_delay,
+  u1_constant` 四个器件都在。离线测试当场抓到的一个真 bug 是位序（`BitVector` 是 MSB-first，
+  而从元素 0 开始进位会数出 `10000000`）。
+- **没量到的地方照旧写清楚**：`0x5a` Static Value 的"值"存在哪个字段仍是开放问题（记录宽度
+  恰好等于生成的值，改宽度会让游戏丢弃该元件）；`0x57` Halt 在沙盒里按观察者处理（没有"停"
+  这个概念）；关卡件要跟随关卡值需要先有"关卡值"这一层。详见
+  [simcore-kind-coverage.md](research/simcore-kind-coverage.md) §7.5。
+
+## 未发布：元件编辑器 V4——调色板、混合取色、校验标记与确认对话框（2026-09-29）
+
+- **`tc.component.editor` V4（`TC_COMPONENT_EDITOR_API_VERSION_4`）**：把 V3 留下的三件补齐，做法
+  全是加法——字段描述符仍是 `TCComponentFieldV2`，V3 的表一字未改，V3 成员在 `TCComponentEditorApiV4`
+  里的偏移逐个不变（ABI 基线 1763 → 1785，新增 22 条，无一条已有记录被改）。
+- **调色板**：`TC_COMPONENT_FIELD_COLOR_PALETTE`（位 8）让一行颜色画成 Mod 自己声明的**色块条**；
+  色块复用 `choices`/`choice_labels`，每条是一条颜色字面量（`#RRGGBB`/`#RRGGBBAA`，`#RGB` 按 CSS
+  展开，前缀可省），最多 16 个。宿主逐块发布矩形，点一块提交一块。
+- **混合取色行**：`TC_COMPONENT_FIELD_COLOR_HEX`（位 9）在同一行再加一个文本框，内容是打包值
+  `0xAABBGGRR`（也接受颜色字面量）——颜色字段原本没有的精确位型出口。两个位同时声明就是
+  "色块条 + 十六进制框"。
+- **一行式校验标记**：`TC_COMPONENT_FIELD_VALIDATION_ICON`（位 10）把校验消息从"占一整行文字"
+  改成控件末尾一个小方块（错误红 / 警告琥珀），消息进 tooltip 与日志。标记用窗口自己的绘制表画，
+  不提交 ImGui 项，所以行的排版与行高一个像素都不动。
+- **确认 / 取消式多字段编辑**：表级 `TC_COMPONENT_EDITOR_TABLE_CONFIRM`（经新的
+  `TCComponentEditorApiV4::set_fields_v3()` 传入）把整张表改成**暂存**：值落在宿主的副本里、行上
+  显示暂存值、校验照跑，行下多出 Apply / Cancel。Apply 是**一次配置写**——不管改了几个字段都只有
+  一步撤销和一次 `on_config_changed`；Cancel 重读实例、丢掉暂存。声明了 CUSTOM 行的表被拒绝
+  （那种行自己经 `tc.component.storage` 写配置，会和副本抢同一个 blob），并写明是哪一条行。
+- **版本纪律**：`TC_COMPONENT_FIELD_V3_KNOWN_FLAGS` 把 V3 的位集单独留名并逐位写出，
+  `TC_COMPONENT_FIELD_KNOWN_FLAGS` 继续是"当前这一版"的别名；V3 入口按前者校验，所以新加载器不会
+  因为自己长大就悄悄接受一个 V3 调用方不可能知道的位。（第一版把它写成前者到后者的宏别名，于是它
+  在使用点展开成 V4 的位集——离线用例当场抓住，见
+  [HANDOFF-component-editor.md](HANDOFF-component-editor.md) §8。）
+- **示例与门槛**：`examples/editor-demo` 加一条"色块条 + 十六进制框"的混合行、给两条已有校验器
+  的行装上标记，并加第三个类型 `EDIT_003`（表级 CONFIRM）；`tests/component-editor.cpp` 覆盖取色
+  字面量的解析与格式化、位集拒绝、表级开关的拒绝项；真机用例新增 `component-editor-swatch`、
+  `component-editor-color-hex`、`component-editor-validation-icon`、`component-editor-confirm`、
+  `component-editor-confirm-cancel`（编辑器用例 13 → 18 条）。
+
+## 未发布：M4 余项——引脚通道参数与译码器起步（2026-09-29）
+
+- **`tc.component.compose` V2 新增 `pin_lane(session, cells)`**：把组合类型自己的引脚通道拉开
+  （1–16 格，默认 2 = 历史形状 -18/+13，既有形状一个字节不变）。输入列向左、输出列向右，中间空出来
+  的就是内部电路的画布——宽接口元件（译码器这类）要靠它布局。声明式 API 早有同名旋钮且宽通道的导线
+  位置已验证，组合类型直接复用。真机：2 入 / **32 出** + 通道 16 的类型注册成功，游戏读回两列引脚
+  相距 **31 格**（`in0=(-15,0)`、`out0=(16,-15)`；输入侧少一格是游戏对自己 ±3 连接偏移的取整，
+  棋盘读数同值）。
+- **同网络总线**：builder 现在只拒绝**不同网络**的相交，同一源脚扇出的线允许相接、可以画成干线加
+  分支（游戏里相触的线本来就是同一网络）。离线 `tests/component-netlist.cpp` 的 bus 用例通过。
+- **5→32 译码器**：`examples/composite-decoder/decoder.hpp` 的网表生成器（5 个 1 位译码器 + 60 个
+  二输入 AND）与离线真值表模型写好并通过；**布局**仍未完成——按上面的通道参数改成宽通道下的
+  从左到右树形布线是下一步（用显式路径点，让生成器自己画走廊），离线校验器先跑绿，再接真机门禁。
+  `tests/component-decoder.cpp` 因此在 `test-catalog.json` 之外。
+
+### 同日收口（2026-09-29 下午）
+
+- **布线判据订正**：上面的"同网络总线"只对了一半。玩家给出的规则是**一根导线只有两个端点**：
+  在导线中间放端点会把它拆成两根、新端点同属两者（所以那是同一个网络），而**两根线交叉、交叉处
+  没有端点时是两个网络**。原先"相触即同网络"的判据因此过严，会把游戏本来就接受的布局判成错。
+  现在只拒绝**端点落在别的网络上**（等价于放一个端点把两根线接成一个网络）与**共线重叠**，交叉
+  放行。测量与订正过程见 [HANDOFF-component-m4.md](HANDOFF-component-m4.md) §5.1；
+  `tests/component-netlist.cpp` 新增 `routing rule` 一节，逐条钉住这四种情形（交叉合法、端点落上去
+  拒绝、共线重叠拒绝、同源扇出两件事都允许）。
+- **5→32 译码器落地**：生成器改用宽通道（`pin_lane` 16），并把树的**根换成 A4**——线号由此等于输入
+  字（A0 为最低位）。原先从 A0 起树会把位序反过来，真值表 32 组里错 24 组；这个错一直被布线拒绝
+  挡在前面，判据放宽之后才第一次暴露出来。`tests/component-decoder.cpp` 现在进 `build.ps1`：
+  65 个零件（5 个 1 位译码器 + 60 个二输入 AND）的网表能布线、能编码，32 组输入的 one-hot 真值表
+  全过。真机门禁（导入 + 游戏重算门数 + 关卡真值表）还没跑；元件形态见下面的探针。
+- **元件形态的探针**：`tests/decoder-probe.cpp` 把同一份网表经 `tc.component.compose` V2
+  （begin / node / connect / commit）注册成**组合元件**，`build.ps1` 把它打成
+  `dist/dev.decoder-probe.mod`。它先跑一遍离线校验，布局不合规就拒绝注册并写日志，不会留下半注册
+  的类型。
+- **沙盒的观测接上游戏侧（S4 第一件）**：`examples/sandbox-sim` 加了 `vcd=1` 与 `vcd_cycles=N`
+  （默认 60）两个开关——绑定一块板子后跑够 N 个周期，就把引擎自己的 trace 用
+  `tcsim::writeVcd()` 写成标准 VCD 到插件数据目录 `sandbox-sim.vcd`，并记一行
+  `sandbox-sim: wrote … (N event(s), M nets, K violation(s))`。它与离线 iverilog 交叉验证比对的是
+  **同一份事件表**，示波器和棋盘读的也是它，所以外部波形与屏幕不可能各说各话。违例的面板/棋盘
+  高亮那一半还没做。另记一笔位置：开关文件是**插件数据目录**里的
+  `tc-modloader-data/plugin-data/dev.sandbox-sim/sandbox-sim.txt`（先前文档里写的
+  `tc-modloader-data/sandbox-sim.txt` 是错的，已改）。
+- **与 simcore-view 同步**：同一个插件现在把游戏正在跑的板子按 `simcore/view` 的板子记录格式
+  写到 `sandbox-sim-board.txt`（`dump=0` 可关，默认开；绑定板子时写一次，之后约每秒刷新），
+  于是 `build\simcore-view.exe --board <那个文件>` 就能用**另一套渲染管线**（GDI，不是游戏的
+  ImGui）画同一块板子，点一根线还能看到它的 net 值与写回的槽位——这正是分辨"游戏渲染错"还是
+  "simcore 算错"需要的对照。查看器暂为打开时读一次（`O` 键换文件），跟随刷新的 `--watch` 未做。
+- **实时跟随 + 沙盒自动拉起**：`simcore-view` 新增 `--watch`（每 200 ms 看一次记录文件，变了就
+  重载，保留视角与选中），沙盒插件在绑定成功后如果当前是沙盒就自己 `CreateProcess` 起
+  `simcore-view.exe --board <记录> --watch`。viewer 已直接打进 `dev.sandbox-sim.mod` 的 `native/`
+  目录，插件按自身 DLL 路径找到解包后的 exe，安装 Mod 后不再需要手工复制。已有 viewer 不重复开，
+  关闭后下次进入沙盒可重开；`view=0` 关掉、`viewer=<路径>` 覆盖随包版本。真机门槛会核对启动日志、
+  `--watch` 参数和进程实际路径确实来自本次沙盒的插件缓存。
+- **画游戏真正画的那条线（记录带 `path=`）**：运行时导线记录的 `+0x20` 是腿数、`+0x28` 指向腿数组
+  （Nim seq：count/reserved/data，每腿一对 u16 =（方向码, 长度））。方向码是"绕原点逆时针每 45°"
+  八个方向中的四个实测值（`0=+x`、`5=(-1,+1)`、`6=(0,+1)`、`7=(+1,+1)`，腿空间 y 向上），三条线的
+  腿求和与端点差**逐条相等**，所以不是猜的。插件把它换算成绝对点写进板子记录的 `path=x,y;x,y;…`，
+  查看器有这个字段就照它画、没有才用自己的布线器。离线判据：带 `path=` 的图里出现了斜线
+  （查看器的布线器只会画直角），不带则是它自己绕出来的一堆直角。
+- **查看器认 `local.clock` 的三个 Mod 源**：自定义原型的身份在 `custom_id` 里而不是 kind 字节里
+  （三者都是 kind `0x4e`），所以之前查看器一律"无引脚几何"并拒绝跑。现在按 id 认领 `CLOK_001`
+  /`SWIT_001`/`BUTN_001`，几何用**游戏自己报的**读数（`custom 3 id=0x535749545f303031 at
+  (-15,-18) … out0=(-13,-18)`，按钮同形）：0 输入、1 输出、输出在 (+2,0)。时钟进 clock_nets、
+  开关/按钮进 source_nets 的语义 simcore 早就有，缺的只是这张表。
+- **交互源的电平进记录**：自锁开关/按钮的电平存在**宿主持有的实例配置**里（点击写进去），不在
+  状态数组里，所以查看器自己重跑仿真时源默认是 0——游戏里拨到高，view 里还是低。现在插件的组件
+  行会带 `id=<实例> level=<0|1>`（就是它喂给 simcore 的那个值），查看器给源网加激励时优先用记录里
+  的电平，没有才退回它自己的测试模式。判据：同一份记录加上 `level=1` 后那条网从蓝（0）变绿（1）。
+  时钟的相位还没带过去（它走 clock_nets，由查看器自己产生），是已知的下一条。
+- **锁存器的"记忆"进记录**：锁存器的状态就是它的过去，而查看器是从零重跑一遍——所以即使开关电平
+  被带过去了，中间那两条反馈线仍然停在 X。现在插件给每条导线写 `value=<0|1>`（就是游戏正在显示
+  的那个值，来自它每周期写回的游戏状态数组），查看器把**源网**按这个值激励、把**反馈网**按这个值
+  上电种子，于是"先前设好的状态"在 view 里也会被记住。判据：同一块 NAND 锁存器、输入 (1,1)，
+  带 `value=` 时保持 1/0（绿+蓝、无红），不带时一半是 X（红）。
+- **自定义元件的引脚与储存件（同一天，两件）**：
+  - **引脚随记录走**：自定义原型（kind `0x4e`）的引脚只有游戏知道，插件的组件行现在写
+    `inpins=x,y;… outpins=x,y;…`，查看器把它们注册成一张"按实例 id 查"的表（绘制与建网表共用）。
+    于是**任何** Mod 元件都能画出来，不用在查看器里逐个硬编码。离线判据：一个表里从没有过的
+    id（12345）现在画成 "Mod" 并带真实引脚，之前是 `no pin geometry in the frozen table`。
+  - **储存件**：加了三个**声明了引脚**的储存类到冻结表 —— `Auto Register (0x32, in (0,-2)/out
+    (3,0))`、`Auto Delay Line (0x77, 同形)`、`Counter (0x4d, 三个输入)`。其余储存类（Delay Line
+    `0x0d/0x37`、Register `0x0e/0x27`、Counter `0x26`、RAM `0x76`）在目录里**声明 0 个输入脚**，
+    输入位置未实测，按红线 6 不猜、先不加。
+  - 仍未支持的是**行为**：几何有了之后，simcore 仍然拒绝对一个它不认识的 Mod 类型求值（日志
+    `FATAL: custom component … has no sandbox simulator behavior`）——`local.clock` 的三个源是
+    已知类型所以能跑，其余自定义件要跑起来，需要把它的内部电路交给 simcore（对玩家自制件，那份
+    电路在游戏手里），那是独立的一刀。
+  - **内存与其读写端口（同日晚些时候）**：先完成**几何**。测量工具本身有个洞：
+    `tests/kind-list-probe.cpp` 与
+    `tests/compose-probe.cpp` 都只印前 4 个引脚，Store port 的第 5 个输入（`(-1,0)`）正好落在
+    这个洞里；两个 dump 都放宽到 8，`component-compose` 的真机用例（两条独立的读表路径逐字段
+    对照）仍然全绿。补进冻结表的是 `0x36 Load port`（3 进 2 出）、`0x38 Store port`（5 进 1 出）
+    与 `0x76 RAM`（**0 进 0 出**，不是遗漏：游戏自己的原型表就写 0/0，Symphony 那关的棋盘
+    `campaign/symphony_6_ram/circuit.data` 也只有 2 个 RAM、6 个 Load port、4 个 Store port 和
+    **0 根导线**——端口直接摆在 RAM 的插座格上，内存是靠端口接进电路的）。离线判据：
+    `simcore/view/tests/view-tests.cpp` 新增 `memory geometry` 一组（引脚逐条对照，并断言 RAM 与
+    插座端口可以构成一个可运行的共享内存）。
+  - **内存行为已接入**：游戏自己生成的 native logic 源码确认容量为
+    `2^(+0xe0 + +0xf0)` 字节、端口宽度为 8/16/32、起始地址先掩码、跨末端使用零 guard，且插座
+    从上到下执行（同址 Store 上方的 Load 读旧值，下方读新值）。simcore 新增稀疏 RAM 私有状态、
+    Load/Store 器件和隐藏顺序链；宽外部激励与状态槽写回也从 1 bit 修成完整总线。板子记录携带
+    `memory_bits/memory_extra/little_endian`，viewer 重放不会把 16/32 位端口降成 8 位。
+    runtime 在每个游戏周期边界切换私有顺序 token，因此地址/使能保持不变时端口仍会重新执行；
+    第二周期的上方 Load 会看见第一周期 Store 写入的值，不会永远卡在上电读数。
+    真机用例 `tests/sandbox-memory-playtest.ps1` 还新增 `-CircuitPath`，可复测玩家存档。当前剩余边界
+    只有关卡 `memory_manager` 的 reset-data 初始化桥；没注入时 RAM 从全零开始。测量与边界写在
+    [PLAN-sandbox-simulator.md](PLAN-sandbox-simulator.md) §15.3 与
+    [research/board-object-fields.md](research/board-object-fields.md) §7。
+- **布线不得穿过元件本体**：检查器原先只看脚点与别的线，于是宽布局的线会直接从元件身上压过去
+  （能用，但画出来是错的；真机在元件工坊里一眼看得见）。现在每个内层节点按**引脚包围盒 + 一格
+  净空**算一块区域，只有"接到自己那个引脚"的那一段允许进入，其余任何一段落在里面都判
+  `Clearance`。`planRoutes` 同样按这条选路，所以现有网表是绕开的而不是被拒。5→32 译码器重新
+  布线后仍然 32 组真值表全过。
+- **组合元件能在元件工坊里打开**：工坊打开某个元件时，是拿**名字**去玩家那份电路管理器里找
+  `<存档>/schematics/foundry/<名字>/circuit.data`，而 Mod 类型在玩家这边没有这个文件，所以那个
+  "在元件工坊中编辑"按钮只会开一个空定义（这也是 V4 `set_foundry_button` 存在的背景）。真机
+  测量（2026-09-29，用户存档）确认：那个文件就是**元件定义**格式——同一套头部与引脚记录，把
+  我们的定义字节写进去，工坊立刻画出 65 个零件和 157 根线。于是加载器在注册组合元件时**补上
+  这个条目**：文件不存在或是游戏自己建的空占位（≤64 字节）才写，玩家改过的一律不动，并在日志里
+  记一行 `foundry view: filled …`。
+- **simcore 补上游戏自己的字宽 Mux（`0x2a`）**：真机沙盒里正在跑的那块板上就有一块
+  （`sandbox-sim-board.txt` 元件 22，`word30=3 word40=1 memory_bits=32`），而在这一刀之前
+  simcore 递给它的是 `no device in the library`，整块板因此拒跑。现在 `devices.hpp` 有按位宽
+  缓存的 `deviceMux`（`S(1)/A(w)/B(w) → Y(w)`，行为是逐位的 Verilog 条件算子；目录里原来的
+  `mux2` 成为它的一位别名，语义只有一处），`board.hpp` 把"自动宽度"从 Word Switch 一处推广成
+  一张表：先取记录 `+0xe0`（游戏算好的宽度），记录里没有才取数据引脚上最宽的导线，**选通/使能
+  这类 `w1` 控制脚永远不参与加宽**。引脚顺序与宽度全部有据——游戏原型表
+  `in0=(-1,-1,w1) in1=(-1,0,wauto) in2=(-1,1,wauto) out0=(2,0,wauto)`、同一次真机 dump 的导线
+  （1 位线落在 in0）、关卡 `byte_mux/test.si` 的 `select==1 → B`、以及已验过的 `shape_mux8`
+  元件形状。交叉验证新增第八个电路 `mux_word`（4 位 A/B + 选通跳 X 的一拍），iverilog 13.0
+  逐网一致；查看器把那条真机记录固化成 `simcore/view/data/mux.txt`，离线用例断言重放出来的是
+  1 位选通 + 32 位数据的 `mux32` 而不是拒跑。门槛：`simcore` **234/234**、`simcore-view`
+  **180/180**、`simcore-iverilog` **8/8**。顺带量到一条新偏差并记账：多位网的成对弧延迟
+  iverilog 按新值**最低位**选边、本内核按最高位，含 x/z 的值两家都没有可归纳的规则
+  （`simcore/tests/probes/probe4-vector-delays.v`，结论写在计划 §13.3 与 §16），因此总线器件
+  一律用同一个数做弧延迟交叉验证，而不是照抄一方。
+- **屏幕、Time、Keyboard 进 simcore（同样是 2026-09-29）**：真机那块板子上三件都有，而之前
+  它们是三条 fatal（查看器 `no pin geometry`、构建器 `no device in the library`）。语义全部取自
+  游戏自己的文件：原型表给了三个脚（`0x5b Screen inputs=3 in0=(-1…w1) …`），关卡对话给了名字
+  （Enable / Setting index / Value）与"Enable 要是 [T]"，关卡的 ISA 给了写法（`screen %a, %b` =
+  把 %b 写进设置 %a），**手册 `asset/manual/Circuits/The screen/doc.txt` 给了全部语义**——屏幕显示
+  的是它链接的那颗 RAM，四种模式（ASCII 8 / ASCII 32 / Pixel 8 / Pixel 32）、像素格式
+  （`RRRGGGBB` / RGB+填充）与分辨率公式 `4×(setting+1) × 3×(setting+1)`；关卡自己的程序也照着用
+  （`screen 2 := 19` → 80 像素宽，绘制代码每行正好 80 字节）。落点：新增 `tcsim/screen.hpp`
+  （设置表 + 锁存器件 + `renderScreen()`，Pixel 两种模式可实现，ASCII 两种明说缺游戏字库不画假图），
+  `board.hpp` 建出屏幕器件并把设置表、三个网记进 `BuildResult::screens`（输入网同时进
+  `observed_nets`），Time/Keyboard 按宿主源处理（值只有游戏知道，simcore 只当影子；顺手修掉
+  "源种类也会把自己的输入脚标成源"这条对 Keyboard 才暴露的问题）。门槛：`simcore` **255/255**、
+  `simcore-view` **188/188**。**还没到"画出画面"**：屏幕画的是被链接 RAM 的字节，链接字段与
+  RAM 内容这两件数据要么走离线桥（链接 + `memory_manager` 只读桥）、要么走在线桥（转发
+  `screen_mesh` 的 `set8_bit_pixels`/`set32_bit_pixels` 像素），两条路与测量方法写在计划 §17.3。
+- ABI 基线 1763 → **1764** 条（V2 表追加 `pin_lane`）。
+
+## 未发布：M4 第二～四刀——内部网表 builder、嵌套与原版复用三路径
+
+第一刀把原版类型目录服务化了；这一轮把 M4 剩下的三件做完，并按计划 §8.3 把"完整别名"这条
+**明确判定为不可用**，而不是发一个只有外观的空壳。
+
+- **`tc.component.compose` V2：内部网表 builder**。`begin`/`node`/`connect`/`commit`/`abort` +
+  `status`：按稳定拼写建节点（`builtin/…`）、连引脚、提交时校验并导入。定义本身就是内部电路，
+  游戏像编译手画电路一样编译它——所以**门数由游戏按内部电路重算**（真机：两个 AND 节点 →
+  `gates=2`，而探针故意声明 1，这个差额就是"游戏真的走了网表"的证据），`delay` 则原样信任。
+  编码器写在 `src/component_netlist.hpp`，离线用例 `tests/component-netlist.cpp` 把同一个
+  AND3 网表的字节与**游戏已经接受过的夹具定义** `build/nl_def_and3.data` 逐字段对齐。
+- **校验**：空网表、引脚越界、同一脚重复驱动、内部输入没被驱动（外层输出脚也算 sink）、
+  无状态组合环（经过"不声明输入脚"的零件的环合法——这就是 Delay Line 反馈在游戏里的形态）、
+  以及布线清扫（会穿过别的引脚或与别的线相交的布局拒绝，并把冲突点写进 `status`）。
+- **嵌套**：`node()` 也接受另一个已注册类型的 `type_id`（`<mod>/0x<id>`，或直接 `0x<id>`），
+  内层引脚从它自己的原型读——真机探针把一个组合元件嵌进另一个组合元件并成功导入。
+- **复用三路径**：`create_builtin_node` = V2 的 `builtin/…` 节点；`clone_builtin_metadata` =
+  `clone_metadata(custom_id, "builtin/…", NAME|DESCRIPTION|COST)`，真机把 `builtin/AND` 的名字与
+  说明抄到一个组合类型上，游戏存的原型名字就是 `AND`、说明就是它自己的 `[T] when both inputs are [T]`；
+  `register_builtin_alias` **恒返回 `UNSUPPORTED`**（`TC_COMPONENT_COMPOSE_ERR_UNSUPPORTED`），
+  理由写进契约：游戏按 kind 字节分发、Mod 实例恒为 `0x4e`，另有两条既有实测（自定义原型忽略
+  shape SVG；默认绘制只能按类型关掉）指向同一结论。目录新增 `TC_BUILTIN_FLAG_ALIASABLE`，本构建
+  从不置位。替代方案是"名字/说明克隆 + 同一个原版节点拼组合 + V5 图片"。
+- **能力位**：`tc.component.registry` 现在为组合类型报 `implementation=COMPOSITE` 并置新的
+  `TC_COMPONENT_CAP_COMPOSITE`（真机 `capabilities=13` = LOGIC|MULTI_PIN|COMPOSITE）。
+- **真机门禁** `component-composite`（`tests/component-composite-playtest.ps1` +
+  `tests/composite-probe.cpp`）：注册 AND3 → 游戏读回 `in=3 out=1 gates=2 delay=2`；把
+  `build/nl_and3board.data` 放进 `and_gate_3` 关卡，**游戏自己的关卡测试判 `verdict=1`**；嵌套
+  组合也导入成功；坏网表被拒并给出人话理由；`clone_metadata` 与 `alias` 的结果都在日志里。
+- **顺手修掉一个真 bug**：`tc.component.compose` 的 V1 读接口把服务 context 当成了运行时指针
+  （V2 的写接口要用插件指针），两者混用后 V1 调用方会解引用错对象——正是复合探针第一次跑就挂在
+  `begin` 里的原因。现在读/写接口统一以插件为 context、经 `owner` 取运行时，V1 与 V2 两张表都
+  有真机门禁（`component-compose` 与 `component-composite`）。
+- ABI 基线 1718 → **1763** 条（V2 结构、`TCComposeTypeV1`、错误码、克隆标志、能力位）；文档更新
+  `docs/sdk/services.md`（V2 与三条路径）、`reference/limits.md`（builder 规则表）、
+  `docs/HANDOFF-component-m4.md`、`PLAN-custom-components.md` 的 M4 行。
+
+## 未发布：M4 第一刀——原版类型目录（`tc.component.compose` V1）
+
+计划 §16 阶段 4 要的是"Mod 用游戏自己的零件拼元件"：稳定原版类型目录、内部网表 builder、嵌套依赖、
+完整别名。这一轮交付第一项，其余写进交接文档。
+
+- **新服务 `tc.component.compose` V1**（`sdk/tc_component_compose.h`）：引导时把原型表读一遍，
+  给出每个 kind 的**稳定拼写**、名字、说明、声明的引脚（板面格偏移 + 原始字宽/自动标记）与两个
+  标志（`NO_DECLARED_INPUTS`、`HAS_SHAPE`）。查找有 `get`／`find(kind)`／`find_by_type_id`，
+  引脚单独取；读不到原型表时**不发布**这张表，而不是发一张空表。
+- **拼写规则是本轮真正的新契约**：`builtin/<名字>`；同一构建重名按 **kind 升序**编号
+  `#2`、`#3`…；没名字的槽位用 `builtin/0x<kind>`；`find_by_type_id` 先精确匹配，再对**无编号**
+  拼写做 ASCII 大小写折叠，编号拼写永远精确。真机实测本构建 125 个 kind 里 **17 个名字重复**
+  （`Output` ×7、`Input` ×6、`Splitter` ×6、`Word Maker`/`Concatenator`/`Maker` ×3，其余 ×2）、
+  **21 个槽位无名**——按名字找零件必须靠编号，这条规则就是为它写的。
+- **引脚宽度原样三态**：1–64 报 `bits`；`0x7fff…` 报 `AUTO_WIDTH`；本构建两个 Splitter 用的
+  `0x7fff…fe`／`…fd` 未核实语义，报 `RAW_WIDTH` 且 `bits=0`。**不猜**。
+- **代价与能力位故意不报**：内置零件的门数/延迟是游戏打分器从内部电路算出来的（实测 Delay Line
+  5 门 4 延迟），原型里那两个字段本构建全是 0；能力位属于别名那条路要做的研究。
+- **离线**：`tests/component-compose.cpp`（`build.ps1` 内执行）——拼写、重名编号的确定性、
+  大小写折叠的边界（编号不参与折叠）、两个计数、目录 ABI 的字符串容量与字段顺序。
+- **真机**：`tests/component-compose-playtest.ps1`（game 层，用例 `component-compose`）把新探针
+  `dev.compose-probe` 与既有的引脚表探针 `dev.kind-list` **装进同一个沙盒、同一次会话**跑一遍，
+  再要求两个互相独立的读表者（SDK 的 `TCGameModel` 封装 vs 加载器自己的 `prototypeGet`+引脚解码）
+  逐条一致：kind、名字、引脚数、每根引脚偏移与原始字宽——**125 个 kind 全对上**。任意一边悄悄
+  漂移都会变成 mismatch，而不是悄悄通过。
+- ABI 基线加 `tc.component.compose` 的常量、两个结构与查询表；文档
+  `docs/sdk/services.md`（服务一节）、`reference/limits.md`（目录规则）、`docs/HANDOFF-component-m4.md`
+  （本轮范围与下一刀路线）。
+- **顺手修掉一个测试脚手架漏**：`game-handle-probe-playtest.ps1` 复用沙盒 profile，而它的驱动最后会用
+  游戏自己的"保存关卡"命令把棋盘写进 profile——第二次运行就会把那块板读回来，`live-before` 变成 1、
+  编辑相位落在被占的格子上（`FAILED/STATE`），表现为"这个用例时好时坏"。现在该用例加 `-Recreate`
+  （profile 每次重建），连跑两次都过。别的用例要不要同样处理，取决于它们是否也依赖 profile 里的存档。
+
+## 未发布：命令总线补完（可撤销删除元件 + 类型归属）
+
+P1 编辑命令族里"删除元件"一直是空着的：低层 `board_delete_component` 只把记录变成 kind 0 墓碑，
+没有撤销条目，所以上一轮只做到"入口已核实"，没进总线。这一轮把上一轮反推出来的撤销感知包装接上：
+
+- **`TC_COMMAND_BOARD_DELETE_COMPONENT`（type 9）**：载荷是"实例 id + 类型"
+  （`argument` = 实例 id，`custom_prototype_id` = 类型，`x/y/kind/rotation` 不用），执行时按
+  `kind == 0x4e`、记录 `+8` 的实例 id、`+0x188` 的自定义 id 三条同时命中找到序列下标，用它和空
+  导线列表造两个 8 字节整数序列（游戏自己的 `sequenceNew`），交给
+  `try_delete__modelZutilities_u8585`，最后 `sequenceDestroy` 两个序列。目标不在棋盘时
+  `FAILED/TC_COMMAND_ERR_NOT_FOUND`。
+- **可撤销**：`try_delete` 先复制要删的记录、连挂在元件上的导线一起删，再把变更交给游戏的撤销栈。
+  真机（`component-placement`，同一个沙盒）：
+  `state=3 result=0 live=4->3 at(28,10)=0` → `board.undo` 后 `live=3 at(28,10)=1` →
+  `board.redo` 后 `live=3 at(28,10)=0`。低层墓碑删除做不到这件事（撤回不来）。
+- **归属规则**：入队前查元件目录（`tc::component_registry`）里该类型的 `owner_mod`，如果它记在
+  **另一个** Mod 名下，命令 `TC_COMMAND_ERR_ARGUMENT` 直接拒绝（未入队，`request` 保持 0）。
+  目录记不到的**原始电路导入**（Mod 自己用 `tc.component.model` 导入，`examples/circuit-and`、
+  `examples/custom-or` 走的路）没有归属信息，命令照常执行——与 `DUPLICATE_COMPONENT` 一致，
+  这两条路上加载器不承担"这是谁的元件"的判断。
+- **真机门禁**：`component-placement` 用例扩了三步——用总线放一个 `local.editor-demo` 的类型实例
+  （peer 包，公开的自定义 id），删它 → `submit=-2 request=0 still=1`（棋盘不动）；把同一个实例改
+  报成没人注册过的类型 id → `submit=0`、执行 `state=4 result=-5`（NOT_FOUND）。契约、`limits.md`
+  的命令表与 `commands.md` 的 V2 删除一节按实测写；ABI 基线加一条常量记录。
+- **顺手修掉一个真 bug（事务旁路）**：`TCTransactionApiV2.stage` 的校验原先只覆盖 V1 的几条，既没有
+  type 上界，也没有删除命令的归属检查——提交时 steps 逐条走同一个执行器，于是臆造的 type 会被
+  `type<=TC_COMMAND_SIM_RESET ? "sim.do" : (undo ? ... : "board.redo")` 这条别名三元式落进 **redo**
+  分支，另一个 Mod 的类型也能借事务删掉。现在 `submit` 与 `stage` 共用 `validateCommand`，transaction
+  不可能放入总线会拒的命令；docs/sdk/transactions.md 按此更新。
+
+## 未发布：字体资源服务化（render V8 的真机验证与一个真 bug）
+
+计划 §10.2 把"字体资源"列为 M5 剩下的第一项：正文只能用宿主默认字体，斜体/自定义字体得插件自己画
+（`examples/text-box` 就自己造了 atlas/换字体的 `FontOverride` 那套）。这一轮把 V8 的字体半真正跑起来：
+
+- **一个真 bug（已修）**：这个构建的 ImGui 用 **32 位 `ImWchar`**（它自己的默认区间表是
+  `20 00 00 00 / ff 00 00 00 / 0`），而宿主把 SDK 的 `TCComponentRenderFontRangeV1`（`uint32_t` 对）
+  **按 16 位对**交给 atlas → 字形按另一组区间建成 → `measure_font` 还有度量（回退字形），
+  但 `text_font` 一个顶点都不产生。现在按 32 位对编码。
+- 真机门禁 `tests/text-box-playtest.ps1 -Font`（隔离沙箱，进 `tests/test-catalog.json`）：示例 Mod 用
+  `load_font` 加载游戏自带的 CJK 面（BMP 全区间）与 UI 面（拉丁），断言两个面都被接受并报出
+  句柄/native/revision；相对路径与超长区间被 `ERR_ARGUMENT` 拒绝；同一 key 再加载不变句柄且
+  `revision=2`，释放后重载是全新句柄且 `revision=1`；`measure_font` 对面给出不同度量
+  （CJK 42.6 px vs UI 62.4 px）；绘制路径本身用宿主默认面做像素断言（同一位置 102 个像素）。
+- **仍未关闭**：由宿主加载的自定义面画出来仍是 0 像素（同一位置 `text_font(0,…)` 有 102 像素），
+  而该 atlas 纹理作为一张图片四边形是能画出来的（151 像素）、`measure_font` 也按面返回度量。
+  结论：这个构建里字体 atlas 的纹理 id 绑定还有一层没找对，下一步从
+  `ImFontAtlas_SetTexID` 之外的后端路径查起。文档（services.md / limits.md / verification.md）
+  按"资源半已验、绘制半未验"如实标注，不做已发布承诺。
+
+## 未发布：实例与生命周期补完（放置、编译、解绑）
+
+计划 §21 的 M2 只剩"`on_clone`、`on_load/on_save`（都已交付）、move/rotate/resize 与编译类回调"。
+这一轮把后面两条补上，并明确区分销毁与解绑：
+
+- `TCComponentLifecycleV1` 追加 `on_move` / `on_rotate` / `on_resize` / `on_compile` / `on_unbind`
+  （按 `size` 生效，老调用方一个字节都没变）；
+- `TCLogicIOV2` 追加**放置尾巴**：`cell_x` / `cell_y`（板面格）、`rotation`（顺时针 1/4 圈，就是
+  棋盘记录里的方向字节）、`half_width` / `half_height`（占位半宽/半高，板面格）。老回调按
+  `io->size` 判断是否可读；
+- 宿主每帧读一次棋盘记录，只在**变化**时派发 move/rotate（第一次读数只是基线，编译不算移动）；
+  逐实例占位写入处派发 resize；生成器产出这次编译的代码之后派发 compile；`releaseInstances(nullptr)`
+  派发 unbind 而不是 destroy；
+- 新相位：`TC_LOGIC_MOVE=9`、`TC_LOGIC_ROTATE=10`、`TC_LOGIC_RESIZE=11`、`TC_LOGIC_COMPILE=12`、
+  `TC_LOGIC_UNBIND=13`。ABI 基线 1657 → 1672。
+
+**真机证据**（`tests/pin-shape-playtest.ps1 -Shape wide9`，隔离沙箱）：
+
+```text
+pin-shape: wide9 on_compile instance=3689348814741910323 phase=12
+pin-shape: geometry instance resize=0 (half=3,2)
+pin-shape: wide9 on_resize instance=3689348814741910323 cell=-5,20 rotation=0 half=3.000000,2.000000
+pin-shape: wide9 on_unbind instance=3689348814741910323 phase=13
+```
+
+**仍未关的门**：`on_move` / `on_rotate` 的宿主派发由离线 `tests/native-component.cpp` 断言
+（基线、移动、旋转、footprint 不变不重复通知），但"棋盘记录真的被改了"这一步需要玩家拖动/旋转
+元件——本构建对合成鼠标的棋盘拖动没有反应（与 2026-09-23 的 hitbox 研究结论一致），探针会把
+尝试与结果写进日志，自动门禁待补。`on_compile_failed` 没有可靠信号（编译失败路径不经过生成器），
+因此**不进契约**，留待编译错误模型。
+
+## 未发布：元件属性编辑器补齐到 V3（下拉 / 颜色 / 自定义行 / 校验 / 面板约束）
+
+玩家要求："先把属性编辑器补齐"、"界面不能超过游戏底部面板大小"、"排版要完善"、"收起底部面板时
+不再渲染、再拉起时 UI 与已填内容不变"、"窗口变化时自动适应"，以及"底部属性栏默认不显示元件说明
+文字，开发者可选打开"。这一轮把它们全部落地：
+
+### `tc.component.editor` V3
+
+- **枚举下拉**（`TC_COMPONENT_FIELD_DROPDOWN`）：真正的 combo，与 `RADIO` 互斥。
+- **RGBA8 颜色行**（`TC_COMPONENT_FIELD_COLOR_RGBA8`，种类 8）：ImGui 自己的颜色控件，
+  `0xAABBGGRR`；一次拖动 = 一步撤销。
+- **自定义行**（`TC_COMPONENT_FIELD_CUSTOM`，种类 9）：宿主给裁剪画布 + `TCComponentRenderDrawV1`
+  绘制表，Mod 自己画；`TCComponentEditorActionCallbackV1` 把右键菜单、双击、缩放抓手的按下/拖动/
+  松手交给 Mod，事件带屏幕坐标、累计位移与配置快照。
+- **行内校验**（`TCComponentEditorValidateV1`）：提交前把拟提交的整份配置交给 Mod；`ERROR` 拒绝并
+  保留旧字节，`WARNING` 提交并记录，提示画在行下面。
+- **编辑事务**：`begin_edit`/`commit_edit`/`abort_edit` 从编辑器服务转发到 `tc.component.storage` V2；
+  缩放抓手按下即开事务、松手提交，**整段拖动 = 一步撤销**。
+- **难点记录（都靠真机定位）**：ImGui 的 combo 弹窗先出现在指针处、下一帧才翻到字段上方，所以宿主
+  把弹窗和每个选项的矩形写进日志，真机用例等它稳定后再点；自定义行的画布 item 会先抢走 ActiveId，
+  抓手因此永远收不到点击——修法是给画布 `igSetNextItemAllowOverlap`；抓手本身加大到 14 px 起并夹进
+  窗口内，否则行贴底时会被窗口裁掉。
+
+### 面板约束与折叠（玩家要求 1/3/4）
+
+- 行窗口每帧从游戏窗口读面板矩形，**左右上下都夹在面板内**（6 px 边距）：装不下时封顶在面板底边并
+  交给 ImGui 滚动，只有放得下时才把面板上半留给游戏自己的内容。
+- 钩子在折叠状态照常运行，宿主按"标题行以下还剩多少"（< 34 px）判折叠：**完全不画、也不动编辑
+  状态**；重新拉起后行回到原矩形，先前填入的文本（`buffer=`）与预览不变。
+- 面板矩形、字段宽度、窗口封顶每帧重算：窗口变窄时字段收缩而不是被推出面板。
+- `TC_EDITOR_TRACE=1` 的 `window` 行新增 `panel=` 与 `toggle=`（游戏自己的折叠钮矩形），
+  `popup`/`popup item`/`menu item`/`grip` 行公布各弹窗与抓手的矩形，真机用例据此精确点击。
+
+### 说明文字默认不进面板（玩家要求 5）
+
+- V2 定义表尾部新增 `flags`；`description` **默认不写进游戏原型**（游戏把它印在底部面板顶部，
+  正是属性行所在处），设 `TC_COMPONENT_TYPE_SHOW_DESCRIPTION` 才显示。文字仍保留在加载器自己的
+  类型目录（Mods 页）。旧的 V1 表没有 flags 字段、布局也不能长大，保持原行为并在日志里写明。
+
+### 验证
+
+- 离线：`tests/component-editor.cpp`（含 V3 的 kind/flag/表级规则与颜色、下拉互斥等用例）、
+  `build.ps1` 全绿。
+- 真机（隔离沙箱，全部进 `tests/test-catalog.json`）：注册（含两种说明文字结果）、复选框、文本、
+  单选、十六进制、下拉（`RTZ` 并触发 `validator warned`）、下拉被拒（`RNA` 被 `validator refused`、
+  配置不变）、双击、右键菜单（并写回配置）、缩放抓手（`RESIZE_BEGIN/…/END` 且拖动位移进配置）、
+  颜色拖动、折叠/展开（折叠期间零行 trace、展开后同一矩形与同一 buffer）、32 行长表。
+
+### 顺带修掉的两处构建/发布账目
+
+- `dist/releases/0.8.1` 已经发布，但 `compat/profiles.json` 的 `acceptedInstalledLoaders` 只登记到
+  0.8.0，于是安装器的"从已发布加载器升级"用例在 0.8.1 上被当作未知引擎拒绝（host 层红）。
+  已把 0.8.1 的载荷哈希（`7a600aec…`）补进画像与 `src/setup_core.cpp` 的 `accepted[]`，
+  用例恢复 `PASS upgrade from the published 0.8.1 loader`。
+- `examples/float-ops/build-kernel.ps1` 的增量检查没有把 SDK 头当作依赖，改过
+  `sdk/tc_component_types.h`（定义表尾部新增 `flags`）之后 `components.o` 仍是旧布局，离线兼容
+  测试因此报 "definition size mismatch"。现在 SDK 下所有头都进依赖列表，头一动就重编。
+
+## 0.8.1（2026-09-28）：Float Ops 扩到 binary16/binary64，元件栏按格式分层
+
+### 自定义元件输入与渲染／仿真通道 V1（2026-09-28）
+
+- 新增 `tc.component.input`：宿主做局部矩形命中、旋转/缩放坐标变换、逐实例 hover、pointer
+  capture 与 keyboard focus，路由点击/双击/滚轮/拖动、物理键、Unicode 提交和 Windows IME
+  preedit，并用回调返回值消费棋盘输入。
+- 新增 `tc.component.channel`：generation-checked 实例的双向有界队列和双缓冲快照，带序号、
+  DROP_NEWEST/DROP_OLDEST、统计、`ERR_BUSY` 非等待路径，以及实例/场景/Mod 生命周期清理。
+- 新增 C++ SDK 封装、Windows x64 ABI 快照、旋转命中/两实例焦点/中文事件测试，以及 5000 条
+  双线程 FIFO 压力测试。真实输入法候选窗、游戏快捷键穿透和两实例真机手感仍列为发布门禁。
+
+### 研究：关卡接口——Mod 能不能创建新关卡（2026-09-28）
+
+结论（全文与证据在 [research/level-interface.md](research/level-interface.md)）：
+
+- **加载已有关卡**：能（`load_level__modelZutilities_u7740`，加载器已暴露为 `level.load`）。
+- **给已有关卡换内容**：能，且不需要改加载器——关卡内容全在 `campaign/<名字>/`，而加载器的账本
+  允许 Mod 包部署 `campaign/**`（`src/core.hpp` 的 `resource()` 白名单），带备份与事务回退。
+  真机验证（`tests/level-content-playtest.ps1` + `tests/level-content-probe.cpp`）：在隔离副本里把
+  `campaign/sandbox/{meta.txt,circuit.data}` 换成我们自己的对话与板子，游戏进的仍是 `sandbox`，
+  但棋盘是两块 FP32 CONST → ADD → DISP 的我们那套（原版沙盒是空板），开场对话框也来自我们写的
+  meta（原版沙盒没有 `dialogue` 字段）。
+- **用一个新名字建关卡**：**不能只靠放文件夹**。关卡名编译在 exe 里（`always_on`×2、`byte_adder`×2、
+  `binary_racer`×4），而 `load_level` 会先 `contains(campaigns…)` 再 `campaigns[…]` 查表；
+  `find_all_levels` 与关卡树同样由编译表驱动。要新名字就得往游戏内存的战役表插条目（Nim
+  Table/seq + 存档兼容），那是另一项研究。
+- 顺带量到两条规则：**meta.txt 运行时解析**（字段名 `unlocks_components`/`post_mortem`/`hint_kind`…
+  在 exe 里），而**关卡文本按 id 查 `translations/<语言>.txt`**（按文件分节，节内映射文本 id）——
+  所以复用别人关卡的文字 id 会显示"别人的译文"（实测：第一次跑写英文、弹窗出中文）。
+
+### 底部面板：藏掉元件预览图 + 修掉每帧刷屏的诊断日志（2026-09-28）
+
+- **重进沙盒后输入框消失（真 bug，已修）**：玩家报"只有第一次进沙盒时输入框正常，退出重进、
+  再选中元件，输入框就消失"。根因是**窗口绘制顺序**：加载器的属性行窗口用 `NoBackground` 画在
+  游戏面板之上，靠"提交顺序在后面"才可见；而重进关卡时游戏会**重建底部面板窗口**，新窗口排在
+  属性行窗口之后 → 面板的不透明底色把属性行整块盖住（行其实还在提交、也还在 trace 里，所以
+  仅看日志一切正常，只有像素能看出问题）。修法：每帧在 `Begin` 之前调用 `igSetNextWindowFocus()`
+  把行窗口显式提到最前（加载器自己的页面容器早就用同一招）。证据：`tests/float-reentry-driver.cpp`
+  现在会在重进后**截一帧**（`panel.bmp`），修复后那张图里 `值 / 原始位 / 标签` 三行连同输入框
+  都在——机制与修复前的差别是绘制顺序，所以这张图正是这条修复的验收物。
+- **同一处修复的第一版把顶部菜单栏弄坏了**（玩家当天再报"打开底部面板就不能使用顶部菜单栏"）：
+  `igSetNextWindowFocus()` 是**抢焦点**的调用，每帧抢一次会把玩家刚点开的菜单弹窗立刻关掉。
+  现在只在**面板刚出现**的那一帧调用（用帧号差判断，`lastEditorRowFrame`），一次就够——ImGui
+  会保持窗口顺序直到有别的窗口获得焦点，而面板只在关闭时（进关卡）被重建，正好落在帧号断档里。
+  重进后的截图仍显示三行输入框，说明"提到最前"这件事只需一次。
+- **属性行的标签与输入框离得太远（玩家 2026-09-28："输入框和旁边的文字离得太远，不美观"）**：
+  标签列原来是面板宽度的 30%（面板跟屏幕一样宽，于是中间空出一大块）。现在列宽是**量出来的**：
+  先给面板宽度 8% 的紧凑下限，再用 `igGetItemRectMax` 量每个标签的实际宽度去撑开，同一类型的
+  各行共用这个列宽（按 custom id 记忆），输入框则填满该行剩下的宽度。第一版只用量出来的宽度，
+  首帧列宽为 0、输入框压在标签上（截图自查抓到），所以加了那个下限。
+- **不再向游戏注册元件说明（玩家 2026-09-28："去除底部面板中的元件说明"）**：游戏把类型的
+  `description` 印在底部抽屉的标题下面，而那正是属性行的位置。`local.float-ops` 因此把
+  `registered.description` 传 `nullptr`（加载器只在非空时调用 `setPrototypeDescription`，所以
+  面板里连空行都不留）。说明文字本身没丢：`kFamilies` 表里的文本保持原样、README 逐类型记录，
+  只是不再进游戏原型；如果以后想让它在元件栏提示里出现，把这一处改回 `entry.info.description`
+  即可。
+- **属性行的字号与位置（玩家 2026-09-28："这个输入框和对应的文字明显太大了，都挡住上面的元件
+   名称了…排版要好看"）**：行窗口现在用自己的文本缩放（`igSetWindowFontScale(0.78)`，只作用于
+   这个窗口，游戏和其它 Mod 的字号不受影响），输入框的高度随字号一起变小，三行读起来像一个
+   表单；行窗口的顶边另外夹了一道下限——**不能高过抽屉自己的内容起点**（挂钩点就在标题行之后，
+   光标位置就是标题下沿），所以面板变矮时第一行也不会再压住元件名。证据：
+  `tests/float-reentry-game` 重进后截的 `panel.bmp`（`build/panel-smaller-rows.png`）。
+- **输入框宽度（玩家 2026-09-28 同一天追加："这个输入框还是太大了，太宽了，可以适当缩小"）**：
+  上一版让输入框填满整行，于是在跟屏幕等宽的抽屉里变成一条横杠。现在宽度**按文字高度封顶**：
+  上限 `12 × 行文字高度`（`igGetTextLineHeight`；约二十来个拉丁字符，够放 `0x40200000` 与
+  `1.7976931348623157e+308`），下限 `6 ×`，`fullRow` 的字段也走同一个上限——那个标志只表示
+  "控件独占一行"，不再表示"占满面板"。行高、标签列宽与文字缩放（0.78）不变。证据：
+  `build/panel-narrow-fields.png`。
+- **同行字段（INLINE）把标签列顶飞（真 bug，已修）**：上一条的"量标签宽度来定列宽"读的是
+  **上一项的矩形**（`igGetItemRectMax`）。普通行没问题，但 `TC_COMPONENT_FIELD_INLINE` 的标签是
+  画在**左边那个字段之后**的，量到的是"配对待在哪儿"而不是标签有多宽，于是列宽每帧自增：真机日志
+  （`tests/component-editor-rows` 的编辑器演示类型）里列宽 204 → 11981 → … → 八个 trace 帧后
+  1.6 M 像素，输入框被推到屏幕外、点不到（driver 报 "did not finish"），`component-editor-rows` /
+  `-text` / `-hex` 三条真机用例当场变红。
+  修法：列宽与行高**改成问字体**（`igCalcTextSize` / `igGetTextLineHeight`，游戏自己画这些字用的
+  就是这两个），同行字段的第二列另算一个偏移（`pairLabelX` / `pairFieldX`），成对的两个字段拿同样
+  的一半宽度——全程只读文本度量，没有可回灌的状态，所以第一帧就是最终排版。float-ops 的抽屉像素
+  与上一版一致（`值/原始位/标签` 三行、字段 192..612）。同时把 `component-editor-hex` 的断言改对：
+  驱动点是**字段中心**，窄字段里插入点落在旧值中间（`beef` → `0xbeef0010`），用例本来就该断言
+  "值里带着键入的数字"（驱动注释就是这么写的），而不是"以键入的数字结尾"。
+- **元件预览图**：玩家反馈"底部属性栏里可以去掉元件预览图"。一个 Mod 元件没有可编辑原理图，
+  这一点已经决定了工坊按钮的隐藏（V4），预览图是同一个事实的另一个面，所以两者**共用一个开关**：
+   `setFoundryButton(id, false)` 之后，当被选中元件全是该 Mod 的这个类型时，加载器把底部面板
+   画的两处图（`build_custom_component_preview` @0x14038ed85 与 `build_component_description_panel`
+   @0x14039c916/@0x14039d336 的 `igImage` 调用）改成**全透明 tint 提交**：图仍然提交，面板布局
+   与其它控件位置一个字都不动，只是看不见、也不再占视觉空间。元件栏卡片与放置幽灵不受影响。
+   真机门禁 `float-panel-game` 增断言
+   `Component render: the panel preview picture is hidden for the selected Mod component`。
+   （玩家当天第三次追加"清掉引脚图示"之后，面板里那张图所在的**预览块**被整块跳过——见本节末
+   一条；`igImage` 那个 hook 保留，它管的是有原理图的元件那条路径。）
+- **诊断日志刷屏**：`Component panel: the drawer drew, …` 的判断把 `bool shown` 和"上次显示的
+  custom id"直接比较，于是**每帧**都判为变化——一次真机用例写了 453 行，等于每帧一次文件 I/O。
+  现在比较 id 本身，只在选中的类型真正变化时写一行。（这是玩家报"面板有时不跟手"时最值得先排掉的
+  一类噪声。）
+- **引脚图示（玩家 2026-09-28 第三次追加："清掉引脚图示"）**：预览图全透明、说明文字也不再注册之后，
+   抽屉里仍留着一个 `— R`（截图里贴在 `原始位` 行右侧）。这次没有靠猜：先把绘制入口按
+   "调用方模块 + RVA"打日志（`TC_PANEL_TRACE=1`，只在抽屉正画我们元件的那几帧记录），量到它
+   **不在**十个 `igImage` 调用点、也**不在**六个 `render_box` 调用点上——它在 `R` 的真实出处：
+   exe 的 `build_custom_component_preview__presenterZboard95uiZbottom95panelZcommon_u486`
+   （0x38e990），那一支画的就是预览图（`igImage` @0x38ed8a）、引脚短线
+   （`ImDrawList_AddRectFilled` @0x38efac）与引脚标签（`igText` @0x38f0ea）。所以这一版**整块不提交**：
+   detour 只认抽屉那一次调用（0x39dc09 / 返回地址 0x39dc0e），闸门仍是"选中的元件全是该 Mod 的
+   类型且隐藏了工坊按钮"。顺带把"预览图"那条也收进同一个动作里——图就在这一支里，块不提交，图与
+   引脚图示一起消失，抽屉自己的标题、面包屑与花费图标都在抽屉那边，一个像素不动。证据：
+   `build/panel-crop-preview-off.png`（重进后截帧，`R` 不在、三行输入框与标题都在），真机门禁
+   `float-panel-game` 与 `float-reentry-game`。
+
+### 加载器：宽度感知的十进制浮点字段（`TC_COMPONENT_FIELD_FLOAT_WIDTH`）
+
+浮点元件的 FP16/FP64 常量一开始只能写十六进制（`0x2E66` 表示 0.1）——加载器的浮点行是 ImGui 的
+32 位框，宽度写死四字节。这一轮把这个缺口补在**加载器**里，而不是让每个 Mod 自己再抄一遍文本
+解析：
+
+- **新字段种类** `TC_COMPONENT_FIELD_FLOAT_WIDTH = 7`（`sdk/tc_service_api.h`）：`bytes` 为
+  **2/4/8** 字节，按 IEEE-754 binary16/binary32/binary64 解释，其余宽度整表拒绝。
+- **行里显示**的是"能原样解析回该位模式的最短十进制"（逐位加长直到往返成功：binary16 最多 5
+  位、binary32 9 位、binary64 17 位），所以抽屉里的数和棋盘上的数读起来一致；没人手写过的位模式
+  （NaN、次正规、迁移写进去的值）也总有可解析的显示。
+- **输入**接受普通十进制、科学计数法、`inf`/`-inf`/`nan`（任意大小写、可带符号）与 `-0`，**按本
+  宽度正确舍入**；解析器没有整段吃掉的文本（空、`abc`、`1.2.3`、`3.5x`）一律拒绝，配置保持旧
+  字节、输入框恢复成实例真正持有的值，并写一行日志。`min_float`/`max_float` 与 FLOAT 同规则钳位。
+- **binary16 的两个转换自己写**（加载器里没有硬件半精度）：`halfToDouble` 精确，`doubleToHalf`
+  按最近偶数舍入、该溢出到无穷就溢出；因为 double 的 53 位远超"十进制→binary16"两次舍入所需的
+  2p+2 = 24 位，经 double 中转与直接舍入到 binary16 等价。**纯函数**在
+  `tests/component-editor.cpp` 里离线钉住：具名拼写、**全部 65536 个 binary16 模式**的文本↔位模式
+  往返、拒绝与钳位。
+- **ABI 基线 1471 → 1472 条**（只多这一条常量记录，其余未变）。
+- `local.float-ops` 的 FP16/FP64 常量因此和 FP32 一样有两行：`值`（十进制，新种类）+ `原始位`
+  （十六进制，NaN payload 与精确向量的逃生口）+ `标签`。真机门禁 `float-widths-game` 用真实鼠标
+  键盘把 `3.5` 打进 FP16 常量、把 `2.5` 打进 FP64 常量，并回读棋盘（`4.5 0x4480` /
+  `3.5 0x400C000000000000`）。
+- 测试驱动的小修：`tests/float-panel-driver.cpp` 在打字前先按若干次退格清空输入框。第一次真机跑
+  这条用例时，`3.5` 被追加到已经显示 `1` 的框里，提交成了 `13.5`——这不是加载器的 bug，但"重打
+  一个值"必须显式清空才说得清。
+
+位宽那一轮只交付了**内核**（下面一条）；这一轮把元件补齐。定稿的取舍是**一个格式一个元件**
+（`docs/PLAN-float-components.md` §6.4.1）：Mod 元件的引脚宽度在注册时按类型冻结，
+`tc.component.types` 里没有"引脚宽度跟随实例配置"这一项，所以"同一个 Add 用左上角位宽框切换"
+根本表达不出来——把它做成可切换类型只能绕开一半，而且 FP64 二元运算会正好压满 128 位输入预算。
+
+- **65 个元件**：22 个类型族 × binary16/binary32/binary64，唯一的例外是没有 FP64 Fused Multiply
+  Add（三个 64 位输入 192 位 > 加载器每个元件 128 位的输入预算；加载器会在注册时拒绝，所以它
+  根本不注册，而不是注册后不工作）。`components.cpp` 的 `kFamilies` 表一族一行，注册表由它按
+  格式展开一次（`catalogueStore()`）：引脚、描述、回调、配置布局与本体画法都只有一份。
+  身份沿用 `F32…` 惯例推成 `F16…`/`F64…`（`floatTypeId()`，`static_assert` 钉住 22 个既有 id
+  一个字节都没变），引脚宽度按格式给出（16/32/64 的字、1/5/10、1/8/23、1/11/52 的位段），
+  整数侧仍是 32 位。
+- **元件栏按格式分层**：名字从 `浮点/<分类>/<名字>` 变成 `浮点/<格式>/<分类>/<名字>`，
+  也就是 `浮点 ▸ FP16 ▸ 计算 ▸ FP16 Add`。游戏按名字里的 `/` 建目录（
+  `docs/research/palette-categories.md`），所以 65 个元件落在 3×5 个分类节点里，而不是挤在
+  `浮点/计算` 一个节点下。`tests/float-palette-playtest.ps1` 除了一一核对 70 个 id（65 + 5 个
+  M0 探针）之外，还断言三层目录本身存在。
+- **回调怎么知道自己是谁**：`TCComponentTypeDefinitionV2::user` 现在装格式字节，加载器每个阶段
+  都把它交回 `TCLogicIOV2::user`，于是一份回调代码服务三个同族类型（`ioFormat()`）；配置解码
+  用**这个类型自己的**格式校验，另一宽度的 blob 会被拒绝并退回注册默认值，而不是被当成 16 位
+  读进一个 64 位元件（`tests/float-compat.cpp` 用 1.0 + 2^-11 这个 binary16 半 ULP 用例把
+  RNE/RUP 的差别与"外来配置被拒"都钉住了）。
+- **FP16/FP64 常量的输入行是"原始位"**：加载器的十进制浮点行固定是四字节 binary32
+  （`TC_COMPONENT_FIELD_FLOAT`），既不是 binary16 的两字节也不是 binary64 的八字节，所以
+  新宽度的常量用可编辑的十六进制行写（`0x3C00` = binary16 的 1.0，
+  `0x3FF0000000000000` = binary64 的 1.0），标签行照旧。binary64 因此有了自己的
+  `ConstantConfigWide`（`+4` 起 8 字节位模式，标签在 `+12`），FP32 的旧 blob 一个字节不动。
+- **文本层按宽度**：`fp/decimal.hpp` 增加 `format_*_for(format, …)` 四个入口。binary32 走原有的
+  Ryu `f2s`；binary64 用同一份 vendored Ryu 的 **`d2s`**（新 vendored 文件，同一提交）；binary16
+  没有 Ryu 入口，就用它的**精确** binary32 像的小数位，逐位截短到"能原样解析回同一个 binary16"
+  为止——所以 binary16 的 0.1 显示 `0.1`，而不是 binary32 拼法的 `0.099975586`（65504 显示
+  `65500`，与 Ryu 对最大 binary32 打 `3.4028235E38` 同理）。十六进制按格式给 4/8/16 位。
+- **测试**：新增 `tests/float-text.cpp`（22 条具名拼写 + **全部 65536 个** binary16 模式往返 +
+  20000 个 binary64 抽样往返 + 小缓冲安全），`tests/float-compat.cpp` 增加整表检查
+  （22/22/21、每个类型的形状、引脚宽度、配置布局与默认 blob 的宽度字节、2+3=5 在三种格式、
+  FP16 输入的高位不泄漏、Split/Make 逐宽度往返），`icons.cpp`/`build.ps1` 跟着从 22 张图变成
+  65 张。加载器与游戏二进制仍不改。
+- **真机门禁 `float-widths-game`**：一块只有三条 Constant → Add → Display 链（16/32/64 各一条）
+  的棋盘，断言加载器自己的注册行（`…w16` / `…w64`）与三条显示各自格式的文本
+  （`2 0x4000` / `2 0x40000000` / `2 0x4000000000000000`）。这条用例写出来第一次跑就抓到上面那个
+  常量布局 bug：FP16/FP64 常量跟着 binary32 注册了 16 字节布局，逻辑回调退回默认值所以显示正确，
+  但渲染读到 28 字节里的 `0x000000003F800000`，本体印出 `5.263544247e-315`。修法是
+  `layoutOf(family, format)`（只有 Constant 依宽度选布局），并在离线整表用例里补上"默认 blob 是
+  本宽度的 1.0"。
+
+全绿：`examples/float-ops/build.ps1`（binary32 金向量 7571 条、文本层、宽度文本层、整表、
+65 张元件图、打包），以及真机 `float-widths-game`、`float-palette-game`、`float-catalogue-game`、
+`float-m2-game`、`float-package`、`float-icons`（其余 float-* 用例为回归）。
+
+## 未发布：Float Ops 内核扩到 binary16/binary64（位宽的前半程）
+
+浮点元件族的位宽（16/32/64）需要两样东西：一个能算三种格式的内核，和棋盘上那个位宽框变成
+能改它的按钮。这一轮先交付**内核**，并把它的依赖按项目一直用的方法装进仓库：
+
+- `examples/float-ops/fp/format.hpp` / `format.cpp`：binary16 / binary32 / binary64 共用一张
+  `FormatOps` 表。binary32 **不重写**——表里的 32 位条目转调 `fp32.cpp`（有金向量与真机证据的
+  那个内核），16/64 直接走同一份 vendored SoftFloat，共用同一套 `SoftFloatOperation` 的
+  舍入模式与标志作用域；比较、分类、2019 min/max、位操作与 Split/Make 的位段按 `Layout`
+  （符号/指数/尾数位宽）只写一遍，三种格式共用。
+- vendored 子集从「binary32 的 17 个文件」扩到 **68 个**（f16/f64 的算术语义、整数转换与共享
+  助手）。清单仍是**算出来的闭包**而不是手挑：编译整棵上游树 → `nm` 读每个对象的定义/未定义
+  符号 → 从内核入口走引用图；方法与结论记在
+  `examples/float-ops/third_party/berkeley-softfloat-3/README.md`。
+- `tests/float-kernel.cpp` 增加宽度表一节：三种格式的 1/3、0.1+0.2、sqrt、溢出、精确次正规、
+  饱和转换（D2）、有符号零的 min/max、Split/Make 往返，以及**32 位条目与 `fp32.cpp` 逐位一致**
+  的对照。
+
+**还没做**：位宽框的点击（它现在仍画死的 `32`）、元件按实例格式运算，以及 64 位值需要的引脚
+宽度。顺序与取舍见 `docs/PLAN-float-components.md` §7.1/§7.2/§6.4。
+
+## 未发布：`local.float-ops` 改用加载器接口、元件分类进文件夹、去掉工坊按钮
+
+浮点元件族是最大的消费者，但它一直自己在游戏抽屉上画属性行——那正是
+`docs/HANDOFF-component-editor.md` §1 说的"每个 Mod 抄一遍"的配方。这一轮把它收口，顺带做完了
+玩家提的两处排列/按钮改动：
+
+* **属性行改为 `tc.component.editor` V2 的声明式字段表**（`examples/float-ops/editor.cpp`，
+  删掉 `components_ui.cpp` 的整扇行窗口、`panel-rows.txt` 诊断与自己的提交路径）：
+  Constant 是 `值`（float，写它的 binary32 位模式）+ `原始位`（同一四字节的十六进制——NaN/Inf/次正规
+  的逃生口）+ `标签`；Add 是 `舍入模式`（五选一 radio）+ `标签`；Display 是 `显示方式`（四选一）+
+  `标签`；19 个目录类型按是否舍入给 `舍入模式` + `标签`。宿主画行、校验并走 `tc.component.storage`
+  提交：**一次提交 = 一步撤销 + `on_config_changed`**。没有选择权的类型原来的只读说明行取消，
+  那句话改由类型自己的 `description` 承担（游戏面板本来就在标题下印它）。
+* **一条真正的功能性缺口也随之补上**：宿主提交不再经过 Mod 自己的 `writeConfig`，所以
+  "提交后刷新板级求值 + 排队写电路存档"改由类型的 `on_config_changed` 负责；Constant 还要当场
+  发布新值（暂停的板子否则会一直显示旧数字）。`tests/float-compat.cpp` 正好钉住这一条。
+* **元件分类进文件夹**：名字从 `浮点/FP32 Add` 变成 `浮点/<组>/FP32 Add`，五个组是
+  计算（10）、比较（4）、转换（4）、位与拆分（2）、常量与显示（2）；`浮点/M0/…` 五个探针不动。
+  游戏按名字里的 `/` 建目录这一点早已实测（`docs/research/palette-categories.md`），所以
+  `浮点` 下不再是 22 个平铺元件。
+* **去掉底部面板的"在元件工坊编辑"**：22 个类型（含 M0 探针）全部调用 render V4 的
+  `setFoundryButton(..., false)`——Mod 元件没有玩家可编辑的原理图，那个按钮只会打开一个空定义；
+  宿主把它画成透明且不可点，面板布局不变。
+* **测试**：真机沿用同一批驱动，但改读**加载器自己的行轨迹**（`TC_EDITOR_TRACE=1`，
+  `Component editor: row instance=… field=… rect=…`）而不是 Mod 写的文件；两个驱动还补上了
+  "等矩形稳定"和"按窗口可见部分点击"（宿主会把行窗口夹进屏幕，三行类型的最后一行会溢出边界）。
+  顺带修掉一个测试侧的编码坑：Windows PowerShell 按 ANSI 读 `loader.log`，而 Subtract 那行的
+  `value="−"`（U+2212）会解出引号、破坏布局正则——现在显式按 UTF-8 读。
+  跑绿：`float-panel-game`、`float-busy-board-game`、`float-reentry-game`、`float-catalogue-game`、
+  `float-palette-game`、`float-m2-game`、`float-icons`、`float-compat-game`、`float-boundary-game`、
+  `float-pitch-game`，以及离线 `examples/float-ops/build.ps1`（kernel / 文本层 / compat）。
+
+## 未发布：`tc.component.render` V7 —— 元件贴图由加载器持有
+
+元件要在棋盘上画一张图，此前只有"插件自己干完"这条路：自己解 PNG（WIC + COM 单元）、自己
+`create_ui_texture` 上传、再用 `engine_proc` 拿 `ImDrawList_AddImageQuad` 和背景 draw list 自己画。
+`examples/clock` 的取值标记就是这么写的——自己的解码器、自己的 COM、宿主纹理句柄加三个引擎入口，
+而它要的只是"游戏那张位精灵的第 0 行"。
+
+* **新服务版本** `tc.component.render` V7（完整 V6 前缀 + 两个调用）：
+  `load_image(context, key, png_path, out)` 与 `release_image(context, key)`。key 是 Mod 自己的名字
+  （`a-z 0-9 . _ -`，≤64 字节），路径是绝对路径的 PNG，**只读一次**；返回绘制用的 handle、尺寸和
+  `revision`。同一 key 再加载 = 换像素：**handle 不变、revision +1**，旧 GL 对象延后一帧释放。
+* **绘制表 V3**（完整 V2 前缀 + 一个图元）：`image(context, image, quad)`，四角为屏幕像素
+  （ImDrawList 顺序）、四组 uv、`tint`；计入每实例每帧 4096 条配额，受 frame 裁剪框约束。
+  解析不到 `AddImageQuad` 的构建继续发 V2 表，所以"看到 `draw->version >= 3` 才有 `image`"永远成立。
+* **实现**：图片表是纯账本（`src/component_images.hpp`，`tests/component-images.cpp` 离线钉住键规则、
+  handle 稳定性、revision、替换/释放时的回收、每 Mod 16 张 / 16 MiB 配额、跨 Mod 句柄不可见）；
+  GL 对象仍由 `ui_texture::Manager` 持有，owner = 该 Mod，卸载/停用时随其它纹理一起回收；
+  绘制时按"当前回调属于哪个 Mod"在自己的表里解析句柄，插件**永远拿不到 renderer id 或 GL 对象**。
+* **`examples/clock` 迁移**：删掉自己的 WIC 解码器、COM 单元、`create_ui_texture` 调用与三个引擎
+  入口，改用 `load_image` + `draw->image`；老加载器上退回它本来就有的手绘掉落标记。它的
+  `mod.json` 也去掉了不再使用的 `texture` 能力声明。
+* **真机证据**（`clock-period-window`，三条新断言）：加载器日志
+  `Component render: image "bit-sprite" for local.clock is 200x1100 (revision 1)`、Mod 自己的
+  `the game's own bit sprite came from tc.component.render V7`、以及驱动器**用服务替换该图**
+  （`revision 2`）后从帧缓冲读回取值标记的像素、断言它变成替换图的品红。同时断言不出现回退路径。
+* ABI 基线 1415 → **1471** 条（新增记录全属 `TCComponentRenderDrawV3` / `TCComponentRenderQuadV1` /
+  `TCComponentRenderImageV1` / `TCComponentRenderApiV7` 与其常量，现有记录一条未变）。
+
+## 未发布：`tc.component.instances` V2 —— 元件在游戏眼里是哪一个
+
+自定义元件里可以再放一个自定义元件。生成的回调是按**内层实例自己的 64 位 id** 调用的，而玩家点到的、
+游戏自己的选中集与撤销记账认的是**外层元件**；做交互的 Mod 必须把这两个 id 对上。这一对是加载器编译
+遍历时本来就知道的数据，但此前只以 `interactive-map.txt` 这个**诊断文件**的形式落在游戏目录里——
+`examples/clock` 就是往自己插件数据目录上跳三级去读它，任何一次加载器改动换了文件名或位置，那块
+交互就会静默失效。
+
+* **新服务版本** `tc.component.instances` V2（完整 V1 前缀 + 一个调用）：
+  `int (*top_level_id)(context, handle, uint64_t* out)` —— 游戏选中/顶层遍历认的那个 id；直接放在
+  棋盘上的元件就是它自己的 `instance_id`，装在别的自定义元件内部时是外层元件的 id。句柄过期返回
+  `ERR_STALE`，只认 V1 的加载器返回 `ERR_UNAVAILABLE`，**两种失败都保证出参为 0**。
+* **SDK**：`sdk/tc_component_instances.h` 增加 `ApiV2` / `tableV2` / `topLevelId` / `v1(apiV2)`
+  （V1 半视图按字段复制，同一个 `ApiV2` 值可以直接喂给老的五个入口）。
+* **实现**：编译遍历时把每个自定义记录的 `+0x18`（顶层 id；棋盘级元件等于自身的 `+0x08`，已在该构建
+  实测）记在实例绑定上，服务调用只是一次查表——不读棋盘、不阻塞。那条规则单独放在
+  `src/component_container.hpp`，`tests/component-instances.cpp` 离线钉住（含嵌套、两级嵌套、
+  容器字段为 0、非自定义记录不参与、同 id 后写的覆盖先写的）。
+* **`examples/clock` 迁移**：先问服务，只有加载器没有 V2 时才退回读 `interactive-map.txt`；
+  真机用例 `clock-period-window` 继续通过（它点击元件的角标、观察元件自己的输出与选中状态）。
+* ABI 基线 1402 → **1415** 条（新增记录全属 `TCComponentInstancesApiV2`，现有记录一条未变）。
+* `interactive-map.txt` 从此只是诊断文件（节点顺序不变，值改为"容器为 0 时回落到自身 id"）。
+
+## 未发布：修好两个宿主脚手架（`native-host`、`hook-chain`）
+
+`tc.mod.storage` 给 `NativeRuntime` 加了一个 Mod 存储成员，它需要一个真实的存档根目录；
+两个宿主脚手架（`tests/native-host.cpp`、`tests/hook-chain.cpp`）还在传空路径，于是刚进
+`NativeRuntime` 就抛 `filesystem error: cannot make absolute path: Invalid argument []`，
+host 层的这两条用例一直红着（加载器本身不受影响——`loader.cpp` 传的是游戏自己的 profile 目录）。
+现在两个脚手架各自在自己的沙箱目录里建一个 `profile/` 再交给运行时，host 层恢复 4/4。
+
+## 未发布：安装器改成一个窗口（`docs/PLAN-installer-ui.md` 第一刀～第三刀）
+
+旧的安装器是"选 `Turing Complete.exe` → 一个是/否 MessageBox"，玩家看不到它找到了哪份游戏、
+为什么拒绝写入，也看不到操作之后的结果。现在它是一个单窗口的安装中心：左边列出检测到的位置，
+右边显示所选位置的兼容性、加载器状态和安全检查，只有**一个**主操作按钮。
+
+* **拆成五个翻译单元**（计划 §6）：`src/setup.cpp`（入口与无界面模式）、`src/setup_core.*`
+  （inspect / install / uninstall，结构化错误，不弹框）、`src/setup_discovery.*`（Steam 与手动
+  位置、规范化、去重）、`src/setup_state.*`（纯状态→动作规则）、`src/setup_window.*`（窗口）。
+  核心逻辑一行没改：哈希白名单、`no_links`、原子替换、备份校验、拒绝覆盖全部原样保留，
+  `tests/setup.ps1` 原有 6 个用例一次性通过。
+* **状态 → 主动作是纯函数**（计划 §4）：`tc::setup::actions_for` 把快照映射成一个主操作、一个
+  上下文次操作和 `更多操作` 菜单。不兼容 EXE、未知引擎、备份缺失或损坏这四类状态在任何组合下都
+  不会给出安装/修复/升级/卸载；只读目录才出现"使用管理员权限安装"；游戏在运行只会出现
+  "关闭游戏后重试"。`tests/setup-state.cpp` 逐条钉住这个矩阵（含"运行中优先于只读""备份问题优先于
+  提权"两条优先级）。
+* **交互**（计划 §3、§7）：卸载只在 `更多操作` 里，点开是**内联确认区**（"恢复原始引擎，但保留
+  Mod、配置和存档"），没有是/否对话框；工作期间禁用位置切换与关闭窗口，并按阶段显示
+  "正在再次检查游戏 / 正在备份原始引擎 / 正在安装 Mod Loader / 正在验证安装结果"，不显示百分比；
+  成功后不弹 MessageBox，右栏原地变成结果横幅（`[完成] [打开 Mods 文件夹]`）。
+* **失败分两层**：首屏一句可行动的中文（来自 `SetupError`），`更多操作 → 查看技术信息`展开路径、
+  三个实际哈希、三个期望哈希、兼容配置与进程状态，并可一键复制；同时用操作前后的引擎哈希对比给出
+  "游戏文件没有改变：引擎哈希与操作前一致"或"已恢复到操作前的状态"。
+* **扫描与写入都在工作线程**：大文件哈希不再让窗口假死，结果通过窗口消息回到 UI 线程。
+* **提权**：先做一次只读可写性探测（自删除的临时文件，不碰游戏文件），只有确实不可写时主按钮才变成
+  "使用管理员权限安装"，用 `runas` 重新启动同一个 EXE 的无界面模式 `--install "<目录>"`，父窗口等它
+  退出后重新扫描并展示真实结果；取消 UAC 显示"未进行任何更改"，不算失败。
+* **资源**：`src/setup_resources.rc` + `src/setup-manifest.xml` 提供 Per-Monitor V2 的 DPI manifest、
+  `asInvoker` 执行级别和由 `VERSION` 生成的版本块（首次让安装器 EXE 有正确的文件版本），以及
+  `assets/tc-modloader.ico`（由 `tools/make-icon.ps1` 生成，7 种尺寸）——窗口、任务栏和资源管理器
+  从此有自己的图标，而不是通用程序图标。
+* **外观**：默认跟随系统深浅色，高对比度下退回系统颜色；`Segoe UI Variable Text` → `Segoe UI`，
+  中文字体回退交给 GDI；Tab 顺序、方向键换位置、Enter 执行主操作、Esc 取消确认/关闭结果。
+* **无界面模式保持兼容**：`--install <目录>` / `--uninstall <目录>` 的参数与退出码不变（0 成功、
+  1 失败），发布测试与提权路径都走这两个入口；`tests/setup.ps1` 从 6 个用例扩到 10 个，新增
+  "备份缺失拦下写入""备份损坏拦下安装与卸载""卸载保留 mods/ 与 tc-modloader-data/""不完整的游戏
+  目录被拒绝且不产生副作用"。
+
+## 未发布：Mod 全局配置、schema 迁移与统一设置页
+
+* 新增 `sdk/tc_mod_storage.h` 与服务表 `TCModStorageApiV1`：插件用 key 读写不透明 blob，支持
+  计数式读取、原子整值替换、存在检查与删除。
+* 两个隔离 scope：GLOBAL 位于调用 Mod 自己的 `plugin-data/<id>/storage/`；PROFILE 位于当前
+  独立存档内的 `tc-mod-data/<id>/`，因此切换存档会切换数据，复制存档会一起复制。
+* 所有权由 `query_service` 的插件上下文决定，调用方不传 Mod id 或路径；key 只能是最长 64 字节的
+  小写安全名称。每项 1 MiB、每 scope 256 项 / 8 MiB，路径经过重解析点检查。
+* 离线用例覆盖 Mod 间隔离、scope 隔离、空值、覆盖、删除、非法 key、大小限制和 profile 复制；真机
+  用例启动三次并切换 A → B → A，断言全局计数 1/2/3、存档计数 1/1/2。
+* `tc.mod.storage` V2 给每个 key 增加宿主管理的 schema 版本与一次性迁移回调。版本和 payload
+  同在一个 envelope 里原子替换；回调拒绝/异常/越界/竞态均保留旧值，拒绝降级；V1 仍只看 payload。
+* 新增 `tc.mod.settings` V1 与 `sdk/tc_mod_settings.h`：bool/int/float/enum/text 字段由宿主复制、校验，
+  统一页面按 Global / Current save 分组，自动保存、默认值和 Reset，可选回调能拒绝改动。
+* `local.board-grid` 成为完整消费者：旧 `board-grid.txt` / schema 0 `grid=…` 先迁到 schema 1，
+  再把布尔字段交给统一设置页，不再 Hook 游戏自己的 Options 页面。
+
+## 未发布：元件属性行 `tc.component.editor` V1（2026-09-27 第一刀）
+
+计划 §14（声明式属性编辑器）的第一个切片，按用户的"`tc.component.editor` 可以先做"排在最前。
+它把"行窗口盖在游戏元件抽屉上、自己收输入、用 `write_config` 提交"这套配方从每个 Mod 手里收进
+加载器：**类型交一张字段表，宿主画行、收鼠标键盘、提交**。
+
+* **新服务** `tc.component.editor` V1（`sdk/tc_component_editor.h`）：`set_fields` /
+  `clear_fields`，字段种类 bool / int / uint（≤31 位）/ enum / text（2–64 字节）/ float（binary32），
+  带 `READ_ONLY` 与 `HEX` 标志。字段是**配置 blob 的字节偏移**，按小端读写，因此不必匹配 C 结构的
+  padding；越界、未知种类、宽度不对、枚举没有选项只有整表拒绝，日志写明是哪一条。
+* **行为**：行画在 Mod 自己的 `TC_UI_SLOT_BOARD_COMPONENT_PANEL` 之后（没有插槽的类型照样有
+  编辑器）；提交走 `storageWriteConfig` 的同一条路，所以**一次提交 = 一步撤销**并触发
+  `on_config_changed`；编辑期间宿主保留工作副本，提交后按新的 `config_revision` 重新读取。
+  `TC_EDITOR_TRACE=1` 时每秒把每行矩形写进日志，真机用例据此点击。
+* **示例**：`examples/editor-demo`（0 引脚、32 字节配置、五种字段各一个，只交表不写界面）。
+* **证据**：离线模型单测 `tests/component-editor.cpp` 进 `build.ps1`；ABI 基线 1238 → **1281** 条；
+  真机隔离沙箱两条门槛都通过——`tests/component-editor-playtest.ps1`（注册 + 字段表被受限构建
+  接受）与 `-Stage rows`（`tests/component-editor-driver.cpp` 进 sandbox、用命令总线放一个
+  `EDIT_001`、点元件本体打开游戏自己的抽屉、按宿主自己打出的行矩形点中 `enabled` 复选框；文本行
+  再点开字段、打字、回车）。断言落在**元件 Mod 自己的 `on_config_changed`** 上：默认 `enabled=1`
+  被点成 `0`，`label` 从 `"hello"` 变成 `"helloxy"`。三条用例进 `tests/test-catalog.json`。
+* **踩到的坑（已写进 `docs/HANDOFF-component-editor.md` §5）**：`tcmod-cli apply` 是"设定启用
+  集合"而不是追加，两次调用会让第一个 Mod 失效（类型没注册 → 放元件只能返回 `-6`）；
+  `PLACE_COMPONENT` 在目标格已被占用时同样返回 `-6`；抽屉在屏幕底部，行窗口要夹进屏幕，否则
+  下面的行画得出来但点不到。
+* **尚未交付**：下拉/弹窗选择器、颜色字段、可编辑十六进制框、行内校验提示、自定义行绘制，
+  以及把多字段改动合成一步撤销（`tc.component.storage` V2 的 `begin_edit`/`commit_edit` 还没被
+  编辑器用上）。
+
+### 同日第二刀：`tc.component.editor` V2（布局标志、单选、十六进制、滚动）
+
+* **V2 服务表** `TCComponentEditorApiV2`（与 V1 同样的两个调用）：能查到 V2 就说明加载器认下面
+  这些 flag；V1 加载器会忽略它们，所以 Mod 应当先问 V2、拿不到再降级。
+* **布局标志**：`FULL_ROW`（控件占整行）、`INLINE`（与上一字段共用一行）、`SEPARATOR`（本行前
+  一条分隔线）。表级校验：首行不能 INLINE；`FULL_ROW`/`RADIO` 之后不能 INLINE；最多两列；
+  **未知 flag 位拒绝**而不是忽略。
+* **枚举单选** `RADIO`：一把选项铺成一行单选按钮，正是 `examples/float-ops` 今天手画的形状。
+* **可编辑十六进制** `HEX`：UINT 变成 `0x…` 文本框，宽度上限从 31 位提到 **64 位**；解析不了的
+  输入被拒绝、配置保持旧字节并写日志。
+* **滚动**：行窗口按内容高度（上一帧窗口高度 + 滚动范围）夹进屏幕，再用尺寸约束封顶在屏幕内，
+  装不下的部分由 ImGui 滚动——32 行的类型实测 `rows=32 scrollmax=458`，第一行照样点得动。
+* **诊断**：新增 `Component editor: window instance=… rows=… scrollmax=…`，以及画不出行时的
+  `skipped (原因)`（实例没绑定 / 类型没声明 / 配置读不出来）。
+* **示例**：`examples/editor-demo` 现在有两个类型——7 字段的 `EDIT_001`（覆盖全部字段种类与
+  V2 flag）与 32 行的 `EDIT_002`（滚动）。
+* **证据**：离线单测（`tests/component-editor.cpp`：表级规则、未知 flag、HEX 校验与解析、
+  64 位往返、`formatHex` 补零）；ABI 基线 1281 → **1296** 条；真机六条用例
+  （`component-editor`、`-rows`、`-text`、`-radio`、`-hex`、`-long`）全部通过，断言都落在元件
+  自己的 `on_config_changed` 上。
+* **这一刀踩到的坑**（写进 `docs/HANDOFF-component-editor.md` §6）：夹紧要用内容高度；驱动的
+  鼠标点击会抖，重试要在目标点周围补点；游戏的输入框收不到 Home/Delete/Ctrl+A，只有字符能进；
+  `test-catalog.json` 的描述必须保持 ASCII。
+
+### 发布流程：安装器与加载器成对校验 + 已发布旧版本的加载器登记（2026-09-28）
+
+出 0.8.1 这一步时把两个**发布期的坑**堵上了：
+
+* **安装器和它部署的加载器过去没有一致性断言。** `build.ps1` 的顺序（先 `dist\tc-loader.dll`
+  → 再由 `VERSION` 生成 `build\setup-version.rc` → 再 windres 编译 `src\setup_resources.rc`
+  （`101 RCDATA "../dist/tc-loader.dll"`）→ 最后链接安装器）保证了同步，但
+  `tools\release.ps1 -UseExistingBuild` 会整段跳过构建，谁也无法保证 `dist` 里那对文件还是配套的
+  （文档警告过的"手工编译的 DLL 哈希不同"正是这个坑）。现在 `tools\ReleaseTools.psm1` 多了
+  `Assert-TcInstallerMatchesRelease`：从安装器的 PE 资源里抽出 101（RCDATA），与
+  `dist\tc-loader.dll` 逐字节比 SHA-256，并断言安装器的 `FileVersion`/`ProductVersion` 等于
+  `VERSION`。它被 `tools\release.ps1`（暂存之前）与 fast 层的 `release-contract`
+  （`tests\release.ps1`）同时调用，所以"build 一下 + 测试全绿"也会顺手验掉这一对。
+* **已发布版本的加载器哈希要登记，否则老玩家升不上来。** 安装器只认它的白名单
+  （`compat\profiles.json` 的 `acceptedInstalledLoaders` → `src\compat.generated.hpp` 的宏 →
+  `src\setup_core.cpp` 的 `classify()`）；不在名单里的引擎一律读成 `installed_unknown`
+  （界面"未知引擎 / 已禁用安装"，不覆盖也不给卸载）。实测：0.6.0 发布包内嵌的加载器
+  `f609783c…`（4,487,399 B）与 0.8.0 的 `5702228f…`（5,211,697 B）**都不在名单里**——也就是装了
+  0.8.0 的机器无法被 0.8.1 升级。这一版把两条登记进去，并把 `classify()` 改成查表
+  （新增 `TC_LOADER_060_SHA` / `TC_LOADER_080_SHA`）。`tests\setup.ps1` 增加"从已发布的加载器
+  升级"这一相：把历史发布包内嵌的加载器铺进沙箱当 `game_engine.dll`（旁边放原版引擎当备份），
+  要求 `--install` 退出码 0 且部署出来的正是当次的 `dist\tc-loader.dll`——实测
+  `PASS upgrade from the published 0.6.0 loader` / `… 0.8.0 loader`。
 
 ## 0.8.0（2026-09-27）
 

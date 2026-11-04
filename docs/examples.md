@@ -134,6 +134,23 @@ carry_out = (carry_in + A + B) >> 8
   byte-adder: autotest finished cycle=39 verdict=0                   # 关卡 40 周期无失配
   ```
 
+## example.tc-verilog-ram — 从 `.v` 文件注册 RAM
+
+这个示例的 DLL 不包含硬编码逻辑。`native/tc-verilog.json` 声明元件元数据并引用
+`native/ram16x8.v`；首次加载时从 DLL 所在的包缓存读取默认项目，并写入
+`plugin-data/example.tc-verilog-ram/tc-verilog/`。之后保留并读取该工作区中的玩家修改，先完成
+整个项目的校验与编译，再批量注册 V3 元件；源码错误会在日志中给出文件、行和列。
+
+主菜单会新增 **Verilog 编辑器** 页面：文件列表与多行编辑器直接编辑上述持久工作区，“检查语法”
+可只做编译检查，“保存源码”只有在编译成功后才原子写盘，“撤销改动”丢弃尚未保存的改动。文件列表
+上方的 **新建／复制／改名／删除** 才是真正的文件管理器：新建与复制写入可编译模板并登记为新元件，
+改名只移动文件并保留元件身份，删除会同时移除清单条目与 `.v`（最后一个文件不允许删除）；有未保存
+改动时这些按钮不可用。保存后的定义在下次启动生效，页内会显示带真实文件、行列和元件 ID 的诊断。
+
+RAM 是 16×8、上升沿同步写、异步读；`read_enable=0` 时读口输出 Z。Verilog 端口自动成为游戏
+引脚，16 个存储 word 加一个时钟历史 word 自动成为每实例状态。源码、清单和最小插件见
+`examples/tc-verilog-ram/`，构建产物为 `dist/example.tc-verilog-ram.mod`。
+
 ## dev.cost-watch — 代价与延迟观察（只读）
 
 挂钩游戏的代价/分数函数，把界面实际显示的 `gates/delay`、各 kind 的返回值与原型字段

@@ -14,7 +14,7 @@ ties-to-even, correctly rounded to the destination type, locale-independently -
 exactly the contract plan 5.3 asks for. Only the headers are vendored; the
 repository's tests and benchmarks are not.
 
-## `ryu/` - binary32 to shortest decimal text
+## `ryu/` - binary32 and binary64 to shortest decimal text
 
 Upstream: <https://github.com/ulfjack/ryu>
 Commit: `4c0618b0e44f7ef027ebae05d2cc7812048f7c8f` (2026-02-09)
@@ -22,10 +22,18 @@ Licence: Apache-2.0 or BSL-1.0 (both texts are here)
 
 `f2s.c` (plus `common.h`, `digit_table.h`, `f2s_intrinsics.h`,
 `f2s_full_table.h`) produces the shortest decimal string that round-trips
-through binary32. It writes Ryu's own notation (`3.14E0`), so `decimal.cpp`
-reads the digits and the decimal exponent back out of that buffer and renders
-its own formats; the *digits* are Ryu's, which is the part that guarantees
-shortest-round-trip.
+through binary32, and `d2s.c` (plus `d2s_intrinsics.h`, `d2s_small_table.h`,
+`d2s_full_table.h`) does the same for binary64 - the width cut added the second
+formatter when the Mod grew binary64 components.  Both write Ryu's own notation
+(`3.14E0`), so `decimal.cpp` reads the digits and the decimal exponent back out
+of that buffer and renders its own formats; the *digits* are Ryu's, which is the
+part that guarantees shortest-round-trip.
+
+binary16 has no Ryu entry of its own.  Every binary16 value is exactly a binary32
+value, so `decimal.cpp` formats that image and then shortens the digit string
+until it stops round-tripping back to the same binary16 (`shortestOf16`); the
+conversion in the round-trip test is SoftFloat's, under the same
+round-to-nearest-even the project uses everywhere else.
 
 ## Why both directions are separate from the kernel
 

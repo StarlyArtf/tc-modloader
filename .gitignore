@@ -1,8 +1,10 @@
 build/
 dist/
+/pack/
 examples/*/native/*.dll
 __pycache__/
 host.log
 loader.log
 fault.log
 native-logic-source*.txt
+/interactive-map.txt

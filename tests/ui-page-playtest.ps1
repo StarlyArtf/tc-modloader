@@ -188,7 +188,10 @@ try {
   $env:TC_DEMO_OPEN_BUTTON = $taskPreviousButton
   if ($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning) {
     [void]$taskProcess.CloseMainWindow()
-    if (!$taskProcess.WaitForExit(4000)) { Stop-Process -Id $taskProcess.Id }
+    if (!$taskProcess.WaitForExit(4000)) {
+      Stop-Process -Id $taskProcess.Id
+      if (!$taskProcess.WaitForExit(5000)) { throw 'Isolated UI game did not exit' }
+    }
   }
 }
 

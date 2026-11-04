@@ -336,6 +336,37 @@ TCComponentTypesApiV1 typesApi{};
 TCComponentGeometryApiV1 geometryApi{};
 TCComponentGeometryApiV2 geometryApiV2{};
 TCComponentRenderApiV2 renderApi{};
+
+/* ---- font service probe (tc.component.render V8, 2026-09-28) --------------
+
+   The loader owns the atlas, the GPU texture and their lifetime; the Mod keeps
+   only a handle and draws through the frame's own draw table.  With
+   TC_TEXTBOX_FONT=1 the note loads the game's own faces, draws one line with
+   the service font and one with the host's default font at fixed screen
+   positions (inside the capture's inset clip, so the playtest can count ink in
+   each), measures both, and walks the revision path by releasing and re-loading
+   the small face. */
+tc::component_render::ApiV8 fontApi{};
+bool fontServiceReady = false;
+bool fontProbeEnabled = false;
+bool fontProbeReported = false;
+bool fontRevisionReported = false;
+uint64_t fontCjk = 0;
+uint32_t fontCjkRevision = 0;
+/* The face the probe actually *draws* with: the game's own UI font, which is
+   guaranteed to carry the sample text.  The CJK face above is loaded with the
+   full BMP ranges as a coverage/atlas check - the shipped NotoSansSC file is a
+   subset of the game's UI strings, so a sample character may simply not be in
+   it, and a blank line from that face would say nothing about the service. */
+uint64_t fontPlain = 0;
+float fontCjkSize = 22.f;
+float fontProbeX = 900.f, fontProbeY = 230.f;
+
+bool serviceFontPath(const char* name, std::string* out) {
+    if (!host || !host->data_directory_utf8 || !out) return false;
+    *out = std::string(host->data_directory_utf8) + "/../../../asset/font/" + name;
+    return true;
+}
 /* The board overlay computes the exact visible box (including text-driven
    minimums).  The component render callback always has a fresh game handle, so
    it publishes that box as the live native interaction footprint. */
@@ -428,6 +459,89 @@ void renderNoteOutline(void*, const TCComponentRenderFrameV1* renderFrame) {
     if (!renderFrame->draw) return;
     const auto* draw = renderFrame->draw;
     const bool isNote = renderFrame->custom_id == kNoteId;
+    /* Font service probe: two lines at fixed screen positions inside the
+       capture's inset clip - one with the loader-owned face, one with the host's
+       default - plus a bold/italic line to exercise the loader's synthesis.  The
+       playtest counts ink in the rectangles this reports. */
+    /* On the note type itself - it is the one that is certainly still on the
+       board when the frame is captured.  The autotest's own probe instances come
+       and go, so drawing there produced nothing at capture time. */
+    if (fontProbeEnabled && fontServiceReady && fontPlain &&
+        renderFrame->custom_id == kNoteId && (renderFrame->rotation & 3u) == 0u &&
+        /* Only while the capture's inset clip is the one in force: the same
+           condition the reference clip markers use, i.e. a frame whose drawing
+           is known to reach the framebuffer. */
+        closeFloat(renderFrame->clip_min_x, 800.f) &&
+        closeFloat(renderFrame->clip_min_y, 200.f) &&
+        closeFloat(renderFrame->clip_max_x, 1800.f) &&
+        closeFloat(renderFrame->clip_max_y, 850.f)) {
+        const float unit = std::sqrt(renderFrame->axis_x_x * renderFrame->axis_x_x +
+                                     renderFrame->axis_x_y * renderFrame->axis_x_y);
+        const float size = std::max(8.f, unit * 0.6f);
+        /* Right of the component centre: inside the note's own 8x4 box, and
+           outside the +-45 x +-18 window the default-drawing assertion counts. */
+        fontProbeX = renderFrame->origin_x + unit * 1.6f;
+        fontProbeY = renderFrame->origin_y - unit * 1.5f;
+        /* The capture runs with an inset render clip and the camera moves during
+           the autotest, so the three lines are kept inside the clip rectangle
+           the host handed this frame. */
+        const float clipLeft = renderFrame->clip_min_x, clipTop = renderFrame->clip_min_y;
+        const float clipRight = renderFrame->clip_max_x, clipBottom = renderFrame->clip_max_y;
+        if (clipRight - clipLeft > 240.f && clipBottom - clipTop > 90.f) {
+            fontProbeX = std::min(std::max(fontProbeX, clipLeft + 10.f), clipRight - 220.f);
+            fontProbeY = std::min(std::max(fontProbeY, clipTop + 10.f), clipBottom - 80.f);
+        }
+        const char* sample = "Srv font";
+        const int custom = tc::component_render::textFont(
+            *renderFrame, fontPlain, fontProbeX, fontProbeY, size,
+            rgba(255, 255, 255, 255), 0, sample);
+        const int plain = tc::component_render::textFont(
+            *renderFrame, 0, fontProbeX, fontProbeY + size * 1.5f, size,
+            rgba(255, 255, 255, 255), 0, sample);
+        const int styled = tc::component_render::textFont(
+            *renderFrame, fontPlain, fontProbeX, fontProbeY + size * 3.0f, size,
+            rgba(255, 255, 255, 255), TC_COMPONENT_TEXT_BOLD | TC_COMPONENT_TEXT_ITALIC, sample);
+        float customW = 0.f, customH = 0.f, plainW = 0.f, plainH = 0.f;
+        float cjkW = 0.f, cjkH = 0.f;
+        const int measuredCustom = tc::component_render::measureFont(
+            *renderFrame, fontPlain, size, 0, sample, &customW, &customH);
+        const int measuredPlain = tc::component_render::measureFont(
+            *renderFrame, 0, size, 0, sample, &plainW, &plainH);
+        /* The CJK face is a different font, so its metrics differ from the
+           host's UI face - that difference is what proves the drawing really
+           used the face the Mod asked for.  (The UI face above is the same face
+           the host draws with, so equal widths there are correct.) */
+        const int measuredCjk = fontCjk ? tc::component_render::measureFont(
+            *renderFrame, fontCjk, size, 0, sample, &cjkW, &cjkH) : -99;
+        /* Reported repeatedly (with a few frames between lines): the camera
+           moves during the autotest, so the captured frame is measured against
+           the *last* rectangle - the same rule the default-drawing probe
+           centres follow. */
+        static int fontProbeFrame = 0;
+        if (!fontProbeReported || ++fontProbeFrame % 20 == 0) {
+            fontProbeReported = true;
+            char line[512];
+            std::snprintf(line, sizeof(line),
+                          "PASS text-box font service custom_status=%d plain_status=%d "
+                          "styled_status=%d measure_custom=%d measure_plain=%d measure_cjk=%d "
+                          "custom=%.1fx%.1f plain=%.1fx%.1f cjk=%.1fx%.1f handle=%llu revision=%u "
+                          "rect=%d,%d,%d,%d control=%d,%d,%d,%d",
+                          custom, plain, styled, measuredCustom, measuredPlain, measuredCjk,
+                          static_cast<double>(customW), static_cast<double>(customH),
+                          static_cast<double>(plainW), static_cast<double>(plainH),
+                          static_cast<double>(cjkW), static_cast<double>(cjkH),
+                          static_cast<unsigned long long>(fontPlain), 1u,
+                          static_cast<int>(fontProbeX), static_cast<int>(fontProbeY),
+                          static_cast<int>(fontProbeX + std::max(1.f, customW)),
+                          static_cast<int>(fontProbeY + std::max(1.f, customH)),
+                          static_cast<int>(fontProbeX),
+                          static_cast<int>(fontProbeY + size * 1.5f),
+                          static_cast<int>(fontProbeX + std::max(1.f, plainW)),
+                          static_cast<int>(fontProbeY + size * 1.5f +
+                                           std::max(1.f, plainH)));
+            report(line);
+        }
+    }
     float x[4]{}, y[4]{};
     tc::component_render::localToScreen(*renderFrame, -4.f, -2.f, &x[0], &y[0]);
     tc::component_render::localToScreen(*renderFrame, kFootprintHalfWidth, -kFootprintHalfHeight,
@@ -2709,6 +2823,12 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
     keepFoundryButton = GetEnvironmentVariableA("TC_TEXTBOX_FOUNDRY_BUTTON", foundrySetting,
                                                 sizeof(foundrySetting)) > 0 &&
                         foundrySetting[0] != '0';
+    {
+        char fontSetting[8]{};
+        fontProbeEnabled = GetEnvironmentVariableA("TC_TEXTBOX_FONT", fontSetting,
+                                                   sizeof(fontSetting)) > 0 &&
+                           fontSetting[0] != '0';
+    }
     char blockInputSetting[8]{};
     if (GetEnvironmentVariableA("TC_TEXTBOX_BLOCK_BOARD_INPUT", blockInputSetting,
                                 sizeof(blockInputSetting)) > 0 &&
@@ -2900,6 +3020,102 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* out) {
         }
     }
     worldToScreen = alias<V2 (*)(V2)>("board.world_to_screen");
+    /* The font service (render V8): the loader builds the atlas, uploads the
+       GPU texture, keeps the decoded copy and owns the lifetime - the note
+       holds a handle.  Unavailable on an older loader: the note then keeps the
+       game's own font table, which is what it shipped with. */
+    {
+        tc::component_render::ApiV8 renderApiV8{};
+        fontServiceReady = tc::component_render::tableV8(h, &renderApiV8);
+        if (fontServiceReady) fontApi = renderApiV8;
+        report(fontServiceReady ? "text-box: font service (render V8) available"
+                                : "text-box: this loader has no font service (render V8)");
+    }
+    if (fontProbeEnabled && fontServiceReady) {
+        const TCComponentRenderFontRangeV1 cjkRanges[] = {
+            {0x20, 0x7e}, {0x3000, 0x30ff}, {0x4e00, 0x9fff}};
+        std::string path;
+        TCComponentRenderFontV1 font{};
+        font.size = sizeof(font);
+        font.version = TC_COMPONENT_RENDER_FONT_VERSION_1;
+        if (serviceFontPath("NotoSansSC_Regular.ttf", &path)) {
+            const int status = tc::component_render::loadFont(
+                fontApi, "note-cjk", path.c_str(), fontCjkSize, cjkRanges, 3, &font);
+            fontCjk = status == TC_COMPONENT_RENDER_OK ? font.font : 0;
+            fontCjkRevision = font.revision;
+            report("text-box: font service CJK face status=" + std::to_string(status) +
+                   " handle=" + std::to_string(font.font) + " native=" +
+                   std::to_string(static_cast<int>(font.native_size)) + " revision=" +
+                   std::to_string(font.revision));
+        }
+        /* The face the drawing probe uses: the game's own UI font, whose Latin
+           coverage is guaranteed. */
+        {
+            const TCComponentRenderFontRangeV1 latin[] = {{0x20, 0x7e}};
+            TCComponentRenderFontV1 plain{};
+            plain.size = sizeof(plain);
+            plain.version = TC_COMPONENT_RENDER_FONT_VERSION_1;
+            if (serviceFontPath("NoroshiCode_Regular.ttf", &path)) {
+                const int status = tc::component_render::loadFont(
+                    fontApi, "note-plain", path.c_str(), fontCjkSize, latin, 1, &plain);
+                fontPlain = status == TC_COMPONENT_RENDER_OK ? plain.font : 0;
+                report("text-box: font service UI face status=" + std::to_string(status) +
+                       " handle=" + std::to_string(plain.font) + " native=" +
+                       std::to_string(static_cast<int>(plain.native_size)) + " revision=" +
+                       std::to_string(plain.revision));
+            }
+        }
+        /* Error paths: a relative path and a missing file are refusals, not
+           crashes, and both leave the previous handle alone. */
+        TCComponentRenderFontV1 refused{};
+        refused.size = sizeof(refused);
+        const int relative = tc::component_render::loadFont(
+            fontApi, "bad-relative", "asset/font/NotoSansSC_Regular.ttf", fontCjkSize,
+            cjkRanges, 3, &refused);
+        const TCComponentRenderFontRangeV1 tooMany[TC_COMPONENT_RENDER_MAX_FONT_RANGES + 1]{};
+        const int ranges = tc::component_render::loadFont(
+            fontApi, "bad-ranges", path.c_str(), fontCjkSize, tooMany,
+            TC_COMPONENT_RENDER_MAX_FONT_RANGES + 1, &refused);
+        report("text-box: font service refusals relative=" + std::to_string(relative) +
+               " ranges=" + std::to_string(ranges) + " (want " +
+               std::to_string(TC_COMPONENT_RENDER_ERR_ARGUMENT) + ")");
+        /* The revision path on the small face: release, load again - the handle
+           stays and the revision goes to 2. */
+        const TCComponentRenderFontRangeV1 latinRange[] = {{0x20, 0x7e}};
+        std::string smallPath;
+        TCComponentRenderFontV1 small{};
+        small.size = sizeof(small);
+        small.version = TC_COMPONENT_RENDER_FONT_VERSION_1;
+        if (serviceFontPath("NoroshiCode_Bold.ttf", &smallPath)) {
+            const int first = tc::component_render::loadFont(
+                fontApi, "note-small", smallPath.c_str(), 18.f, latinRange, 1, &small);
+            const uint64_t firstHandle = small.font;
+            const uint32_t firstRevision = small.revision;
+            /* Re-loading the same key *without* releasing keeps the handle and
+               advances the revision - that is the documented replace path. */
+            const int again = tc::component_render::loadFont(
+                fontApi, "note-small", smallPath.c_str(), 18.f, latinRange, 1, &small);
+            const bool handleStable = small.font == firstHandle;
+            const uint32_t replacedRevision = small.revision;
+            /* Releasing and loading again is a fresh resource: a new handle, a
+               revision that starts over. */
+            const int released = tc::component_render::releaseFont(fontApi, "note-small");
+            const int third = tc::component_render::loadFont(
+                fontApi, "note-small", smallPath.c_str(), 18.f, latinRange, 1, &small);
+            if (!fontRevisionReported) {
+                fontRevisionReported = true;
+                report("text-box: font service revision first=" + std::to_string(first) +
+                       " revision=" + std::to_string(firstRevision) + " released=" +
+                       std::to_string(released) + " reload=" + std::to_string(again) +
+                       " handle_stable=" + (handleStable ? std::string("1") : std::string("0")) +
+                       " revision_after=" + std::to_string(replacedRevision) +
+                       " fresh=" + std::to_string(third) + " fresh_handle=" +
+                       (small.font && small.font != firstHandle ? std::string("1")
+                                                               : std::string("0")) +
+                       " revision_reset=" + std::to_string(small.revision));
+            }
+        }
+    }
     if (!boardSelection.load(h))
         report("text-box: the game's selection set is unavailable; the note draws no selection hint");
     /* The game's own deselect entry: the drag case uses it after it moved the

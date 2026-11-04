@@ -1,5 +1,6 @@
 # True-game case for the Float Ops editor rows in the game's own component
-# drawer (examples/float-ops/components_ui.cpp).
+# drawer (the fields are declared in examples/float-ops/editor.cpp; the loader
+# draws and commits them).
 #
 # The player's report this case exists for: "after selecting a float component,
 # the input box and the checkbox in the bottom panel do nothing".  Everything
@@ -159,6 +160,8 @@ $taskPreviousDriverFallback = $env:TC_FLOAT_FALLBACK
 $taskPreviousBodies = $env:TC_FLOATOPS_BODIES
 $taskPreviousSelect = $env:TC_FLOAT_SELECT
 $taskPreviousKeys = $env:TC_FLOAT_KEYS
+$taskPreviousRows = $env:TC_FLOAT_ROWS
+$taskPreviousTrace = $env:TC_EDITOR_TRACE
 # The game decides for itself which board it opens at startup, and a launch that
 # never showed the fixture board says nothing about the Mod, so the launch is
 # retried before the assertions run.
@@ -168,10 +171,12 @@ for ($taskAttempt = 1; $taskAttempt -le $taskAttempts; ++$taskAttempt) {
   try {
     $env:USERPROFILE = $taskProfile
     $env:APPDATA = Join-Path $taskProfile 'AppData\Roaming'
-    # The Mod's own trace: what ImGui answered about the panel window and about
-    # each row, which is what separates "the panel ate the click" from "the row
-    # was never the window under the mouse".
+    # The rows are the loader's now (tc.component.editor), so the driver reads
+    # their rectangles from the loader's own trace instead of a file this Mod
+    # used to write.  TC_FLOAT_ROWS carries the log path the driver parses.
     $env:TC_FLOATOPS_UI = '1'
+    $env:TC_EDITOR_TRACE = '1'
+    $env:TC_FLOAT_ROWS = $taskLog
     # The Mod's per-instance layout line, which is where the label it shows on the
     # board is read back from.
     $env:TC_FLOATOPS_LAYOUT = '1'
@@ -203,6 +208,8 @@ for ($taskAttempt = 1; $taskAttempt -le $taskAttempts; ++$taskAttempt) {
     $env:TC_FLOATOPS_BODIES = $taskPreviousBodies
     $env:TC_FLOAT_SELECT = $taskPreviousSelect
     $env:TC_FLOAT_KEYS = $taskPreviousKeys
+    $env:TC_FLOAT_ROWS = $taskPreviousRows
+    $env:TC_EDITOR_TRACE = $taskPreviousTrace
     if ($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning) {
       [void]$taskProcess.CloseMainWindow()
       if (!$taskProcess.WaitForExit(4000)) { Stop-Process -Id $taskProcess.Id -ErrorAction SilentlyContinue }
@@ -227,40 +234,43 @@ function Assert-TaskContains([string]$Needle) {
   }
 }
 
-Assert-TaskContains 'float-ops: the editor lives in the game''s component drawer'
-Assert-TaskContains 'Component panel: the game''s component drawer is hooked for Mod editor rows'
+Assert-TaskContains 'float-ops: 65 type(s) declared their property rows to the loader (tc.component.editor V2)'
 Assert-TaskContains 'DRIVER: the target instance is'
-Assert-TaskContains 'float-ops: the drawer is editing instance'
-Assert-TaskContains 'DRIVER: the Mod''s panel rows:'
+Assert-TaskContains 'Component editor: window instance=0x'
+Assert-TaskContains 'Component editor: row instance=0x'
 Assert-TaskContains 'DRIVER: hovering the label field'
 Assert-TaskContains 'DRIVER: clicked the label field'
 Assert-TaskContains ('DRIVER: typed "' + $Keys + '" and pressed Enter')
 Assert-TaskContains 'DRIVER: done'
+# The bottom panel's own art for a Mod component is hidden with the foundry button
+# (both say "this type has no schematic behind it"), so a selected float part shows
+# only the game's header and the loader's property rows.  The artwork lives in one
+# place - the panel's preview block - and the block is what painted the component's
+# picture *and* its pin pictograms ("— R"), so the player's two reports ("底部元件
+# 属性栏中可以去掉元件预览图" and "中间这里还有引脚标识没删掉") share the one
+# takeover: the preview block is not submitted for a Mod-owned selection.  The
+# igImage hook stays armed for the description panel's own picture sites (they are
+# the path a component *with* a schematic takes), so the case checks both lines.
+Assert-TaskContains 'Component render: panel preview control armed'
+Assert-TaskContains 'Component render: panel preview block control armed'
+Assert-TaskContains 'Component render: the panel preview block (pin pictogram) is hidden for the selected Mod component'
 
-# The rows have to be reachable: the Mod's own window over the row area is the
-# hovered window, and the row's widget is live under the cursor.  The same
-# trace records what the game's own drawer answered for the same frames - it is
-# the measurement that says the rows cannot live in it (docs/sdk/ui.md).
-$taskHover = @($taskLines | Where-Object { $_ -match 'float-ops panel trace:' -and $_ -match 'windowHovered=1' })
-if ($taskHover.Count -eq 0) {
-  throw "The Mod's row window never reported itself hovered; inspect $taskLog"
-}
-$taskLive = @($taskLines | Where-Object { $_ -match 'float-ops panel trace:' -and $_ -match 'live=1' })
-if ($taskLive.Count -eq 0) {
-  throw "No row's widget was ever hovered by ImGui; inspect $taskLog"
-}
+# The host owns the rows, so the commit is the host's line: the loader logs the
+# field it wrote on which instance (one commit = one undo step and the type's
+# on_config_changed fires, both of which the component-editor cases cover for
+# the service itself).
+Assert-TaskContains ('Component editor: committed field "label" on instance 0x')
 
-# The row's own field commits the edit; no window pops up over the board, which
-# is what the player asked for ("the extra box is not needed").
-Assert-TaskContains 'float-ops: the label field was committed after editing'
-$taskPopup = @($taskLines | Where-Object { $_ -match 'editor window|opened the .* editor|###TCFloatOps' })
+# And no window of the Mod's own may appear over the board: the old row window is
+# gone, which is half the point of moving to the declared rows.
+$taskPopup = @($taskLines | Where-Object { $_ -match '###float-ops-rows|float-ops: the drawer is editing' })
 if ($taskPopup.Count -ne 0) {
-  throw "An editor window appeared although the rows edit in place (inspect $taskLog)"
+  throw "The Mod still owns a row window although the loader draws the rows (inspect $taskLog)"
 }
 
 # What the player typed has to reach the instance's configuration and the board.
-Assert-TaskContains ('float-ops: instance 0x')
-Assert-TaskContains ('label "' + $Keys + '" (written)')
+# The commit line above is the write; the Mod's own layout trace is the board
+# showing the new name (TC_FLOATOPS_LAYOUT=1).
 Assert-TaskContains ('name="' + $Keys + '"')
 
 # A write that could not find its instance is the player's "写入元件配置失败", so

@@ -48,8 +48,37 @@ try {
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
       (Join-Path $taskRoot 'tests\float-kernel.cpp') $taskObjects -o $taskKernelTest
     if ($LASTEXITCODE) { throw 'Float Ops kernel test did not compile' }
-    & $taskKernelTest
-    if ($LASTEXITCODE) { throw 'Float Ops kernel test failed' }
+    $taskPreviousCpu = $env:TC_FLOATOPS_CPU
+    try {
+      foreach ($taskCpuMode in @('0', '1')) {
+        $env:TC_FLOATOPS_CPU = $taskCpuMode
+        & $taskKernelTest
+        if ($LASTEXITCODE) { throw "Float Ops kernel test failed (TC_FLOATOPS_CPU=$taskCpuMode)" }
+      }
+    } finally {
+      $env:TC_FLOATOPS_CPU = $taskPreviousCpu
+    }
+
+    $taskHardwareTest = Join-Path $taskBuild 'float-hardware-test.exe'
+    & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
+      (Join-Path $taskRoot 'tests\float-hardware.cpp') $taskObjects -o $taskHardwareTest
+    if ($LASTEXITCODE) { throw 'Float Ops CPU backend test did not compile' }
+    $taskPreviousCpu = $env:TC_FLOATOPS_CPU
+    try {
+      foreach ($taskBackend in @(
+        @{ Value = $null; Expected = 'cpu' },
+        @{ Value = '1'; Expected = 'cpu' },
+        @{ Value = '0'; Expected = 'software' }
+      )) {
+        $env:TC_FLOATOPS_CPU = $taskBackend.Value
+        & $taskHardwareTest --backend $taskBackend.Expected
+        if ($LASTEXITCODE) { throw 'Float Ops backend selection test failed' }
+      }
+    } finally {
+      $env:TC_FLOATOPS_CPU = $taskPreviousCpu
+    }
+    & $taskHardwareTest
+    if ($LASTEXITCODE) { throw 'Float Ops CPU backend test failed' }
 
     $taskDecimalTest = Join-Path $taskBuild 'float-decimal-test.exe'
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
@@ -57,6 +86,15 @@ try {
     if ($LASTEXITCODE) { throw 'Float Ops text-layer test did not compile' }
     & $taskDecimalTest
     if ($LASTEXITCODE) { throw 'Float Ops text-layer test failed' }
+
+    # The width cut's own text case: every binary16 pattern, a binary64 sample and
+    # the named spellings of all three formats (tests/float-text.cpp).
+    $taskWidthTest = Join-Path $taskBuild 'float-text-test.exe'
+    & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
+      (Join-Path $taskRoot 'tests\float-text.cpp') $taskObjects -o $taskWidthTest
+    if ($LASTEXITCODE) { throw 'Float Ops width text test did not compile' }
+    & $taskWidthTest
+    if ($LASTEXITCODE) { throw 'Float Ops width text test failed' }
 
     $taskTest = Join-Path $taskBuild 'float-compat-test.exe'
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
@@ -102,8 +140,10 @@ try {
   & $taskIconTool $taskIcons | Out-Host
   if ($LASTEXITCODE) { throw 'Float Ops icon generation failed' }
   $taskIconCount = @(Get-ChildItem -LiteralPath $taskIcons -Filter '*.png').Count
-  if ($taskIconCount -ne 22) {
-    throw "Expected the 22 catalogue pictures, the generator wrote $taskIconCount"
+  # Every registered type gets a picture: 22 families, minus the FP64 FMA, times
+  # the three widths (plan 6.4.1).
+  if ($taskIconCount -ne 65) {
+    throw "Expected the 65 component pictures, the generator wrote $taskIconCount"
   }
 
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mod.json') -Destination $taskStage

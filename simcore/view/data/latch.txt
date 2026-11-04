@@ -1,0 +1,10 @@
+# Cross-coupled NANDs driven by a level input: a loop with a defined state.
+# Pressing Space in the viewer walks the input pattern and the latch flips,
+# which is the part a picture of static boxes cannot tell you.
+component index=0 kind=0x3f x=-8 y=0 rotation=0 word30=0 word40=2
+component index=1 kind=0x06 x=0 y=0 rotation=0 word30=2 word40=1
+component index=2 kind=0x06 x=10 y=0 rotation=0 word30=2 word40=1
+wire index=0 from=-8,-1 to=-1,-1 width=1 slot=256
+wire index=1 from=2,0 to=9,-1 width=1 slot=258
+wire index=2 from=12,0 to=-1,1 width=1 slot=260
+wire index=3 from=-8,1 to=9,1 width=1 slot=262

@@ -7,6 +7,372 @@
 | 单元／模型测试 | `build.ps1` 内编译并执行 | 游戏对象模型、组件模型、时序图算法、宿主契约（能力表与版本约束） |
 | 脚本集成测试 | `node tests/run.js`、`tests/native.ps1`、`tests/saves.ps1`、`tests/setup.ps1` | 包部署/恢复/补丁、原生 Hook、存档隔离、安装器 |
 
+## 逐输出组合依赖：单周期 RV32I 与内置寄存器堆（2026-10-05）
+
+这轮要证明的不是"注册 API 接受了新字段"，而是**游戏看到的依赖图真的变了**：外部用游戏内置
+寄存器堆时，`rs1_addr`/`rs2_addr`/`rd_addr` 只依赖 `instr`，不再依赖寄存器堆读回来的数据，
+于是"读数据 → 内核 → 读地址 → 寄存器堆 → 读数据"这个假环在拓扑上不存在。
+
+| 门禁 | 断言 | 结果 |
+|---|---|---|
+| `tools/verilog-dependencies.cpp` × `tests/fixtures/rv32i_single_cycle.v` | 5 进 17 出、`clocked no`；输出掩码逐项列出（见下表） | PASS |
+| `tests/tc-verilog.cpp` | 同一份 RV32I 源码：`masks[0]==0x1`、`masks[1..3]==0x2`、`masks[5]==0x1f`；`Component` 定义带 `TC_COMPONENT_TYPE_OUTPUT_DEPENDENCIES`、`output_dependency_count==17` | PASS |
+| `tests/native-component.cpp` | 精确内壳的节点形状（收集器 + 私有依赖门 + 独立驱动）；RV32I 的 5 进 17 出表编码出 83 个节点、39 个依赖门（保守路径只有 4 门/48 节点） | PASS |
+| 加载器完整 DLL / Mod 包 | `build.ps1` 构建 `dist/tc-loader.dll`、`dist/example.tc-verilog-ram.mod`（仅既有 warning） | PASS |
+| 真机 `tests/tc-verilog-deps-playtest.ps1` | 沙盒启动游戏，加载器日志收到 `registered custom 0x2927d7c021863f27 inputs=5 outputs=17 … deps=0x1,0x2,0x2,0x2,0xf,0x1f,0x7,…` | PASS |
+
+离线表（`build/verilog-dependencies.exe tests/fixtures/rv32i_single_cycle.v`）：
+
+| 输出 | 依赖的输入 | 掩码 |
+|---|---|---|
+| `imem_addr` | `pc` | `0x1` |
+| `rs1_addr` / `rs2_addr` / `rd_addr` | `instr` | `0x2` |
+| `dmem_addr` | `pc` `instr` `rs1_data` | `0x7` |
+| `rf_we` / `dmem_re` / `dmem_we` / `dmem_wdata` / `dmem_wstrb` / `pc_next` / `pc_we` / `retire` / `trap` / `trap_cause` / `trap_value` | `pc` `instr` `rs1_data` `rs2_data` | `0xf` |
+| `rd_wdata` | `pc` `instr` `rs1_data` `rs2_data` `dmem_rdata` | `0x1f` |
+
+`dmem_addr` 不含 `dmem_rdata` 是关键的第二条：数据存储器那侧
+（`dmem_rdata → 内核 → dmem_addr → 内存`）也不再成环，只有写回值 `rd_wdata` 才读内存返回。
+
+真机注册行（沙盒 `loader.log`，`tc-verilog-deps-*`）：
+
+```
+Native logic: registered custom 0x2927d7c021863f27 inputs=5 outputs=17 in0=(-2,-2,w32) ...
+  shape=5in/17out v3 state=18 deps=0x1,0x2,0x2,0x2,0xf,0x1f,0x7,0xf,0xf,0xf,0xf,0xf,0xf,0xf,0xf,0xf,0xf
+```
+
+时钟模块不再是这个边界：它们沿用公开输出的精确锥，并通过下一节的隐藏 tick 独立提交状态。
+
+## 时钟模块：精确输出锥 + 隐藏 tick（2026-10-05）
+
+时钟模块要同时满足两件事：公开输出只能暴露真实的组合依赖，CYCLE 状态又必须每周期恰好提交一次。
+实现把二者拆开：每个公开驱动在 REFRESH 中按自己的 mask 调用；额外生成一个**输出不接任何引脚**的
+全输入汇点，在 CYCLE 中调用完整回调。它能读取所有输入并提交 PC/寄存器状态，但没有从它返回公开
+输出的边，所以不会进入游戏的组合环检测。
+
+离线门禁覆盖：
+
+| 门禁 | 断言 | 结果 |
+|---|---|---|
+| `tests/tc-verilog.cpp` | `auto_counter` 同时带精确依赖与 `TC_COMPONENT_TYPE_CLOCKED_TICK`；状态输出 mask 为 0 | PASS |
+| `tests/native-component.cpp` | 隐藏全输入锥与公开锥分离；V3 每个输出/tick 的 `tc_zin`、`tc_is`、`tc_io` 临时名唯一 | PASS |
+
+真机门禁 `tests/pin-shape-playtest.ps1 -Shape clocked` 使用 V3 的 3 进 2 出定义，日志为
+`deps=0x7,0x7 tick=hidden`。`full_adder` 上回调满足 `calls = cycle+1`，状态字每周期恰好加一，
+三个输入全部到达，两个输出正确。
+
+玩家原始复现也直接通过：`D:/p/rv32i/rv32i.v` 注册为 3 进 9 出、62 个状态字，依赖为
+`0x0,0x2,0x2,0x2,0x2,0x2,0x2,0x2,0x2 tick=hidden`。修复前游戏每帧重编译（几十秒产生数百份
+相同源码）；修复后只产生正常的 4 份源码，模拟从 cycle -1 推进到 cycle 51。
+
+这一真机复现还发现并固定了第二个问题：精确 V3 多输出原先在同一生成函数里重复声明
+`tc_zin1` / `tc_io1`（宽输入还会重复 `tc_is…`），JIT 拒绝后界面同样显示循环依赖。现在变量名按
+输出编号（`o0`、`o1`…）和隐藏 tick（`t`）区分；单独去掉 tick 仍可复现旧失败，说明它不是依赖图
+本身的环，而是代码生成名称冲突。
+
+## 原生逻辑 2048 位输入桥（2026-10-05）
+
+这轮验证的目标不是只让注册 API 接受更大的数字，而是证明最高输入字确实穿过游戏生成代码与
+JIT 外调进入 Mod 回调。
+
+| 门禁 | 断言 | 结果 |
+|---|---|---|
+| `tests/native-component.cpp` | 32×64=2048 位接受、超过 2048 位拒绝；16 个 128 位分块必须同周期且完整；cycle=-1 的偏置编码；V3 value/drive 双平面；32 输出槽不重叠且不越过状态区边界 | PASS |
+| `tests/tc-verilog.cpp` | 32 个 64 位输入端口可编译；第 33 个端口拒绝 | PASS |
+| 加载器完整 DLL | `src/loader.cpp` 连同 MinHook/miniz 静态对象构建为 `dist/tc-loader.dll` | PASS（仅既有 warning） |
+| 真机 `tests/pin-shape-playtest.ps1 -Shape wide2048` | 游戏导入 32in/1out 元件、绑定两个实例；仅第 32 路非零，回调记录 `inputs=32 nonzero=1 first=0 last=81985529216486895`（即 `0x0123456789ABCDEF`） | PASS，cycle 0/1 均命中 |
+
+真机用例把标记值接在第 32 个 64 位输入上，所以它覆盖的是总 payload 的第 1985–2048 位；若桥仍只传
+旧的 128 位，`last` 必为 0，脚本会失败。
+
+## 浮点元件族 M6：binary16/binary64（2026-09-27）
+
+位宽那一轮只把**内核**扩到三种格式；这一轮把元件补齐，并定下"一个格式一个元件"
+（`docs/PLAN-float-components.md` §6.4.1）：Mod 元件的引脚宽度是注册期按类型冻结的，
+`tc.component.types` 没有"引脚宽度跟随实例配置"，所以 FP16/FP32/FP64 Add 是三个类型。
+
+### 离线（`examples/float-ops/build.ps1`，fast 层）
+
+| 门禁 | 断言 | 证据 |
+|---|---|---|
+| binary32 金向量 | 7571 条向量的值与五位 flags 逐位一致（原有） | `PASS float-ops binary32 kernel: 7571 vectors matched bit for bit …` |
+| 文本层（binary32） | 93 条解析 + 383 条格式化 + 19935 对往返（原有） | `PASS float-ops text layer: …` |
+| **按宽度的文本** | 22 条具名拼写（FP16/FP32/FP64 的 shortest/scientific/hex，含 ±0、±inf、nan、各自的最大有限值）、**全部 65536 个 binary16 模式**逐个往返、20000 个随机 binary64 模式往返、小缓冲不越界 | `tests/float-text.cpp` → `PASS float-ops width text: 22 named spellings …, 65536 binary16 patterns round-tripped, 19987 binary64 patterns round-tripped, small buffers safe` |
+| **整张表** | 70 个定义（65 个元件 + 5 个 M0 探针）；22/22/21 分布；每个类型的引脚宽度属于本格式、有本格式的字脚（Make Bits 例外，它的三个输入就是位段）、配置布局与注册的一致、默认 blob 第 0 字节 = 本类型宽度、3.0 引脚通道 | `tests/float-compat.cpp` |
+| **按格式运算** | 2+3=5 在三种格式各跑一遍并比对 R 与 Flags；FP16 输入的高半字垃圾位不参与运算；FP16 的 1.0 + 2^-11（binary16 半 ULP）在 RNE/RUP 下给出 0x3C00/0x3C01，把"实例自己的舍入模式确实到达内核"钉住；同一实例收到一份写着 32 的配置时**退回注册默认**（表现为 RNE 的 0x3C00），不会按外来宽度运算 | 同上 |
+| **Split/Make 逐宽度** | -1.5 在 16/32/64 下拆成 1/exp/sig、再拼回原位模式；位段引脚宽度 = 1/5/10、1/8/23、1/11/52 | 同上 |
+| 元件图 | 65 张 PNG，逐张量本体/引脚/文字 | `tests/float-icons.ps1` |
+
+binary16 的最短十进制由"精确 binary32 像 + 逐位截短直到仍能往返"得到，因此 0.1 显示 `0.1`、
+最大有限值 65504 显示 `65500`（与 Ryu 对最大 binary32 打 `3.4028235E38` 同一条"最短且能往返"
+规则）；binary64 用同一份 vendored Ryu 的 `d2s`，是真正的 shortest-round-trip。
+
+### 真机（game 层）
+
+- `float-palette-game`：游戏自己的菜单树里 `自定义 ▸ 浮点 ▸ {FP16,FP32,FP64} ▸ {计算,比较,转换,
+  位与拆分,常量与显示}`，70 个 id 一一核对，且没有哪个 id 出现在别处。这一条同时证明"三层目录"
+  是游戏按名字里的 `/` 自己建的（Mod 不画元件栏、不改存档）。
+- `float-widths-game`（**这一轮新加的真机门禁**，三个阶段）：一块只有三条 Constant → Add → Display 链的棋盘
+  （`tests/float-fixture.cpp --widths`），每条链一种格式。断言加载器自己的注册行给出
+  `0x4631364144445f31 … w16` 与 `0x4636344144445f31 … w64`，以及三个显示各按自己的格式显示
+  `1.0 + 1.0`：`2 0x4000`、`2 0x40000000`、`2 0x4000000000000000`。**这条用例第一次跑就抓到一个真
+  bug**：`kFamilies` 的 Constant 行只有一个 `layout` 字段，FP16/FP64 常量因此也注册了 binary32 的
+  16 字节布局——逻辑回调因为尺寸不符退回默认值（所以显示是对的），但渲染回调读到 28 字节里的
+  `0x000000003F800000`，本体上印出 `5.263544247e-315`。修法是 `layoutOf(family, format)`：
+  只有 Constant 依宽度选布局，binary32 保持归档的 16 字节，两个新宽度用 28 字节的
+  `ConstantConfigWide`；离线整表用例同时补上"默认 blob 是**本宽度**的 1.0"这条断言，这样同类错误
+  不必等到真机。
+  第 2、3 阶段用 `tests/float-panel-driver.cpp` 的真实鼠标键盘驱动抽屉：选中 FP16 常量、点 `值` 行、
+  键入 `3.5` 回车 → 断言声明行是 `value(float16), bits(uint), label(text)`、提交行是
+  `committed field "value" … value=3.5`、棋盘显示 `4.5 0x4480`；FP64 常量同样键入 `2.5` →
+  `3.5 0x400C000000000000`。这证明的是加载器自己新加的 `TC_COMPONENT_FIELD_FLOAT_WIDTH`
+  （见 [sdk/services.md](sdk/services.md)）把键入的十进制正确舍入成了 16/64 位模式，而不是只把
+  文本存下去。
+
+  顺带记录一个测试侧教训：第一次跑第 2 阶段时，输入框里原本显示 `1`，驱动把 `3.5` 追加上去提交成
+  `13.5`；驱动因此改成"先退格清空再打字"（加载器本身没有 bug，但"替换一个值"必须显式清空）。
+
+### 重进沙盒后输入框消失：绘制顺序，不是渲染失败（2026-09-28）
+
+玩家报"只有第一次进沙盒时输入框正常，退出重进、再选中元件，输入框就消失"。查下来的机制值得记：
+属性行画在加载器自己的窗口里、**没有背景**，靠"提交顺序在游戏面板之后"才浮在上面；而重进关卡时
+游戏会**重建底部面板窗口**，它排到了属性行窗口之后，于是面板的不透明底色把属性行整块盖住。行仍然
+在提交、`TC_EDITOR_TRACE` 也照常打印——**日志全绿、像素全黑**，这也是它躲过 `float-reentry-game`
+整轮断言的原因（那条用例只读行轨迹）。
+
+修法：`drawComponentEditorRows` 在 `Begin` 之前调用 `igSetNextWindowFocus()`，把行窗口每帧显式
+提到最前（加载器自己的页面容器为同一个原因早就这么做）。
+
+证据链：`tests/float-reentry-driver.cpp` 在重进后**截一帧**（`glReadPixels` → `panel.bmp`，
+与 `tests/icon-probe.cpp` 同一手法），修复前那张图里属性行不可见、修复后 `值 / 原始位 / 标签`
+三行连同输入框都在。这条用例现在同时留下日志与图片两种证据。
+- `float-m2-game` / `float-catalogue-game`：FP32 垂直切片与 19 个目录类型的真机外观/抽屉行为不变
+  （回归）。
+
+### 抽屉里的引脚图示：不是 markup 框，是预览块（2026-09-28）
+
+玩家第三条反馈："中间这里还有引脚标识没删掉"，截图里是 `原始位` 行右侧的一个 `— R`。前两次
+（预览图、说明文字）都是**先猜调用点再改代码**，这次先取证：
+
+- 先把绘制入口按**调用方模块 + RVA** 打日志（`TC_PANEL_TRACE=1`，只在抽屉正在画我们元件的那几帧
+  记录）。第一版减错了基址（拿 exe 基址去减一个别处的调用方，量出 `+0x6cf83875d` 这种荒唐值），
+  改成用 `VirtualQuery` 问 Windows 这块地址属于哪个模块之后，量到两件事：`AddText`/`AddLine` 的
+  调用方在加载器自己身上（属性行的字），而 `R` **根本不在** `igImage` 与六个 `render_box` 调用点上
+  ——说明它不是预览图、也不是说明文字里的 markup 框。
+- 再看 exe 的调用清单：抽屉把预览整块交给 `build_custom_component_preview__presenterZboard95uiZ
+  bottom95panelZcommon_u486`（RVA 0x38e990），这一支里画预览图（`igImage` @0x38ed8a）、引脚短线
+  （`ImDrawList_AddRectFilled` @0x38efac）和引脚标签（`igText` @0x38f0ea）——一个 Mod 元件的
+  `— R` 正是最后两项。
+
+修法因此变成**整块不提交**，而不是逐个掐绘制调用：hook 0x38e990 的进入点，只在抽屉的那一次调用
+（0x39dc09，返回地址 0x39dc0e）且"选中的元件全是该 Mod 的类型且隐藏了工坊按钮"时直接返回；原版
+元件的抽屉照旧。抽屉自己的标题、面包屑与花费图标不在这一支里，所以不受影响。
+
+证据：真机 `tests/float-reentry-game` 重进关卡后截的 `panel.bmp`（修复前 `— R` 在、修复后不在，
+三行输入框与标题都在，见 `build/panel-crop-preview-off.png`），日志里的
+`Component render: the panel preview block (pin pictogram) is hidden for the selected Mod component`；
+`float-panel-game` 也断言这一行（原先那条"预览图已隐藏"的断言随之换成它——预览图本来就在这块里，
+图不再提交之后那条日志自然不再出现）。
+
+### 同行字段把标签列顶飞：量错了对象（2026-09-28）
+
+同一天晚些时候修的另一处，和上面同一段代码，值得记的是**它怎么被发现的**：`component-editor-rows`
+（编辑器演示类型，7 行、其中 `mask` 与 `gain` 同行）开始报 "The editor driver did not finish"。
+读它自己的行 trace 就看到数字：字段 x 从 408 一路涨到 12195、1663669 … 八条 trace 帧后是 1.6 M
+像素，输入框早已在屏幕外（窗口还被夹在屏幕里），driver 自然点不到。
+
+根因是上一轮"输入框离文字太远"的修法：标签列宽用 `igGetItemRectMax` 量**上一项的矩形**。普通行
+没问题，但 `TC_COMPONENT_FIELD_INLINE` 的标签画在左边字段之后，量到的是配对的位置而不是标签宽度；
+这个值又决定下一帧字段的位置，于是每帧自增（一个正反馈）。
+
+修法是换成字体度量：`igCalcTextSize`（cimgui 的 `pOut` 形式，和游戏自己调用它的方式一致）量两个
+标签列，`igGetTextLineHeight` 量行高（字段宽度上限按它算），同行字段的第二列用
+`pairLabelX = rowLeft + pairFieldWidth + 10`、`pairFieldX = pairLabelX + secondLabelWidth + 10`
+自己算——排版不再依赖任何"刚提交了什么"。
+
+验证：`component-editor-rows` / `-text` / `-radio` / `-hex` / `-long` 五条真机用例全绿（修复前
+rows/text/hex 三条红且每条烧 180 秒超时）；float-ops 侧 `float-panel-game` / `float-reentry-game` /
+`float-catalogue-game` / `float-widths-game` 也全绿，且抽屉里的行矩形与上一版逐像素相同
+（`192,658,612,699` 起的三行、窗口 `96,658` 530×126），也就是玩家已经看过并认可的那一版排版。
+顺带把 `component-editor-hex` 的断言改对：驱动点字段中心，窄字段里插入点落在旧值中间
+（`beef` → `0xbeef0010`），用例断言"值里带着键入的数字"（驱动注释本来就这么写），而不是"以它结尾"。
+
+## `local.float-ops` 改用加载器接口（2026-09-27）
+
+这一轮把最大的消费者从"自己画属性行"迁到 `tc.component.editor`，并把它的元件分类改成五层文件夹、
+关掉底部面板的工坊按钮。改动落在示例侧（`examples/float-ops/editor.cpp` 新增，
+`components_ui.cpp` 删除），加载器只多用了已有的 V2 编辑器表与 render V4 的
+`set_foundry_button`——两条都在前面的切片里验过，这里验的是**它真的被用上并且行为不变**。
+
+**离线**：`examples/float-ops/build.ps1` 全绿（kernel 7571 向量、文本层 383 格式向量、`float-compat`）。
+其中 `float-compat` 有一条正好覆盖这次迁移的副作用：宿主提交后 Constant 必须**当场**把新值发布到
+输出，否则暂停的板子会一直显示旧数字。
+
+**真机**（全部在隔离沙箱，逐个跑）：
+
+| 用例 | 迁移后验到的东西 |
+|---|---|
+| `float-panel-game` / `float-busy-board-game` | 抽屉里的行是宿主的（`Component editor: row instance=… field="label"`），驱动点它、打字、回车；宿主记 `committed field "label" … value=xy`，板子上 `name="xy"` |
+| `float-catalogue-game` | 19 个目录类型照旧按原版外观绘制；Multiply 的舍入行由宿主画成五选一 radio，点击提交 `committed field "rounding" … value=RUP`；Compare 只有标签行，没有舍入行 |
+| `float-reentry-game` | 值经**宿主的行**写入 → `on_config_changed` 排队电路保存 → 离开关卡再回来，板子与宿主行都回到保存值（60s 的进出关卡用例） |
+| `float-palette-game` | 游戏自己按名字里的 `/` 建目录：`自定义 ▸ 浮点` 下现在有五个分类文件夹，22 个元件 + 5 个 M0 探针都在子树里，别处没有副本 |
+| `float-m2-game` / `float-icons` | M2 垂直切片与 22 张缩略图照旧；`float-m2-game` 现在断言"22 个类型把字段表交给了加载器"与"加载器接受了 Constant 的表（value(float)/bits(uint)/label(text)）" |
+| `float-compat-game` / `float-boundary-game` / `float-pitch-game` | 行为、宽输出边界与占位回归 |
+
+两个测试侧的新规则值得记下来（都写进了驱动注释）：宿主会把行窗口**夹进屏幕**，所以三行类型
+（Constant 的 值/原始位/标签）最后一行会溢出窗口边界——驱动必须**等矩形稳定**再点，并点"窗口可见
+部分"；另外 `loader.log` 里含 Mod 自己的板面文本（Subtract/Negate 的 `−` 是 U+2212），
+Windows PowerShell 按 ANSI 读会把字节对解成引号、破坏布局正则，必须显式 `-Encoding UTF8`。
+
+## `tc.component.render` V7：元件自己画的图片（2026-09-27）
+
+缺口是"元件要在棋盘上贴图，只能插件自己解 PNG、自己建纹理、自己拿 ImGui 的 draw list 画"
+（`examples/clock` 的取值标记原本就是这条链）。V7 把图片的所有权收进加载器，并给绘制表加了
+图元 `image`。验收分三层。
+
+**离线层**（`tests/component-images.cpp`，随 `build.ps1` 执行）：
+
+```text
+PASS component images: keys, handle stability, revisions, retirement, quota and per-Mod
+isolation are pinned
+```
+
+钉住的是纯账本：key 字符集与长度、handle 从加载器计数器来且**重载同一 key 时不变**、`revision`
+递增、替换与释放都通过回调回收旧纹理、每 Mod 16 张 / 解码 16 MiB 的配额（越界时表一个字节都不改）、
+以及"另一个 Mod 的 handle 在自己表里查不到"这条隔离。纹理本身仍由 `ui_texture::Manager` 持有
+（owner = 该 Mod），它自己的 64 张 / 128 MiB 上限继续生效。
+
+**ABI 层**：`tools/abi.ps1` 通过，基线 1415 → **1471** 条；新增记录全属
+`TCComponentRenderDrawV3`、`TCComponentRenderQuadV1`、`TCComponentRenderImageV1`、
+`TCComponentRenderApiV7` 与三个常量，现有记录一条未变。
+
+**真机层**（`tests/clock-period-playtest.ps1`，用例 `clock-period-window`）：`examples/clock` 已把它的
+位精灵从"自研解码 + 宿主纹理 + 引擎入口"迁到 V7，驱动器（同一个插件的 driver 构建）再用服务把该图
+**替换成一张品红 PNG**，然后从帧缓冲读回取值标记中心那一个像素。三条新断言都写进了脚本：
+
+```text
+Component render: image "bit-sprite" for local.clock is 200x1100 (revision 1)
+clock: the game's own bit sprite came from tc.component.render V7 (200x1100, revision 1)
+CLOCK-DRIVER: replaced the clock's own image through tc.component.render V7 (revision 2, 100x100)
+CLOCK-DRIVER: the value mark's pixel is rgba(255,0,255,255) after the replacement image was loaded
+CLOCK-DRIVER: PASS the box opened the window, "8" + Enter set the period from 1 to 8, and the instance configuration carries 8
+```
+
+这一条同时证明了三件事：加载器确实加载并持有该图（第一行）、Mod 走的是服务而不是自己的解码链
+（第二行；脚本还断言不出现回退提示）、以及**服务换图后棋盘上的像素真的变了**（第三、四行：品红
+只有替换图才有，手绘回退的掉落标记是红/绿）。用例原有断言（角标点击 → 数值窗 → 配置写入）
+照常通过，说明迁移没有改变可见行为。
+
+复现：`./build.ps1` → `tools/abi.ps1` → `tools/test.ps1 -Tier game -Name clock-period-window -NoBuild`。
+沙箱与截图在 `build/clock-period-*`（脚本自己找最新的那个）。
+
+## `tc.component.instances` V2：元件在游戏眼里是哪一个（2026-09-27）
+
+自定义元件内部可以再放一个自定义元件，于是"回调按内层实例 id 调用"与"游戏按外层元件记账"之间有
+一道缝。加载器编译遍历时就知道这一对，但此前只以 `interactive-map.txt` 诊断文件的形式落盘，
+`examples/clock` 只能往自己数据目录上跳三级去读它。这一轮把它做成正式调用（`top_level_id`）。
+
+**离线层**（`tests/component-instances.cpp`，随 `build.ps1` 执行）：
+
+```text
+PASS component instances: the container rule and the V2 wrapper are pinned
+```
+
+两条规则分别钉住：① `src/component_container.hpp` 的映射规则——棋盘级元件映射到自身、嵌套元件映射
+到容器、容器字段为 0 时绝不回落到 0、非自定义记录（0x03/0x2e）不参与、同 id 后写的记录覆盖先写的；
+② SDK 封装——成功时原样返回、`out == NULL` 是参数错、句柄过期返回 `ERR_STALE` **且出参清零**、
+只认 V1 的加载器返回 `ERR_UNAVAILABLE`，以及 `v1(apiV2)` 的 V1 半视图确实转发全部五个老入口。
+
+**真机层**（`tests/clock-period-playtest.ps1`，用例 `clock-period-window`，隔离沙箱）：
+
+```text
+[dev.clock-driver] interactive: enumerate(0x434c4f4b5f303031) status=0 written=1 total=1
+[dev.clock-driver] interactive: 1 top level id(s) from tc.component.instances V2
+[dev.clock-driver] CLOCK-DRIVER: tc.component.instances V2 reports top level id 0x9c5 for the clicked clock
+[dev.clock-driver] CLOCK-DRIVER: PASS the box opened the window, "8" + Enter set the period from 1 to 8, and the instance configuration carries 8
+```
+
+这一轮给用例加了三条硬断言，所以"悄悄退回读诊断文件"也算失败：
+
+1. 元件自己的刷新必须真的从服务拿到**非零**个顶层 id（上面的 `1 top level id(s)` 那一行）；
+2. 驱动器在点击前直接问一次服务，要求棋盘上的时钟返回**它自己的实例 id**（`0x9c5`），
+   与它随后驱动出来的行为互相印证；
+3. 日志里不得出现 `this loader has no tc.component.instances V2` 或任何 `interactive-map` 读取行。
+
+顺带修的一处弱点：父 id 缓存原来每 30 帧刷新一次，而绑定第一个实例的编译正好可能落在两次之间——
+现在空表每 5 帧重试，一旦有内容就回到慢刷新（日志里那行 `enumerate ... written=0` 就是编译前的
+第一次询问，随后变成 `written=1`）。
+
+## 安装器窗口（`docs/PLAN-installer-ui.md`，2026-09-27）
+
+安装器是唯一会写游戏文件的程序，所以这一轮的验收分成三层：**纯函数矩阵**、**真实目录夹具**、
+**真窗口人工检查**。
+
+### 1. 状态 → 主动作（`tests/setup-state.cpp`，离线，随 `build.ps1` 执行）
+
+计划 §4 要求"界面不直接根据某一个文件是否存在来猜按钮"。做成纯函数之后，整个矩阵可以逐条钉住：
+
+```text
+PASS installer state: the action matrix, the safety text and the discovery rules are pinned
+```
+
+覆盖的是：原始引擎→安装、当前版本→修复、已知旧版本→升级（按钮上写着要装的版本号）、游戏在运行→
+只重试、以及**七种必须拒绝的状态**（不支持的 EXE、未知引擎、读不出的目录、仍在检查、备份缺失、
+备份损坏、兼容游戏配未知引擎）都不得出现安装/修复/升级/提权，也不得给出可用的卸载。两条优先级
+单独钉住：游戏在运行时先关游戏（不提权）；备份有问题时提权也不能覆盖。另外验证只读目录是唯一会
+出现"使用管理员权限安装"的状态，`加载器行`/`安全检查`文字与色调的数量一致，不兼容的游戏不会
+声称"备份已就绪"，以及卸载按钮永远不是与主按钮同等醒目的次按钮。
+
+同一个测试还钉住发现规则：Valve 描述符的 token 化、旧版 `"1" "E:\Games\Steam"` 与新版
+`"path" "F:\Library"` 两种库写法（中间夹一个 `apps` 嵌套块也不会错位）、相对路径按基准目录解析、
+大小写与结尾分隔符不产生第二行、重复位置保留第一次的写法。
+
+### 2. 磁盘状态夹具（`tests/setup.ps1`，host 层）
+
+11 个用例，每个状态都从**新拷贝的固定游戏**开始，所以前一个用例不可能污染后一个：
+
+```text
+PASS install and byte-identical engine backup
+PASS repeated install
+PASS uninstall restores exact engine
+PASS repeated uninstall
+PASS unsupported EXE rejected without modifying engine
+PASS unsupported engine rejected without overwrite
+PASS missing backup blocks install without touching the engine
+PASS invalid backup blocks install and uninstall
+PASS uninstall keeps mods and loader data
+PASS an incomplete game directory is refused without side effects
+PASS a refused write keeps the engine and cleans its staging file
+```
+
+后五条是这一轮新增的：删掉 `tc_game_engine.dll` 后 `--install` 必须退出码 1 且**引擎哈希一字不变**；
+把备份追加几个字节后安装与卸载都必须被拒；正常卸载后引擎字节等同于固定原版，而 `mods/` 与
+`tc-modloader-data/` 仍在原处；只有 `Turing Complete.exe`、没有引擎的目录被拒绝且不产生
+`tc_game_engine.dll` 或 `mods/`；把 `game_engine.dll` 设成只读让系统拒绝替换后，退出码 1、
+引擎哈希不变，并且**暂存文件 `game_engine.dll.tc-tmp` 被清掉**（这一条顺带修掉了旧的
+`tc::atomic` 失败后留下暂存文件的问题），之后卸载仍能正常恢复。
+
+权限失败里"目录不可写→提权"这一半没法在无头环境里自动化（它需要一个真实的 UAC 交互），
+但它调用的正是 `--install "<目录>"` 这条无界面路径，也就是上面这 11 个用例覆盖的那条路径；
+取消 UAC 的分支读的是 `ShellExecuteEx` 的 `ERROR_CANCELLED`，不写任何文件。
+
+### 3. 真窗口人工检查（2026-09-27，175% 缩放，深色主题）
+
+用驱动脚本（`BM_CLICK` 打按钮、键盘驱动 `更多操作` 弹出菜单）拍了四种状态的截图并逐项核对：
+
+| 状态 | 看到的 | 结论 |
+|---|---|---|
+| 兼容·已安装当前版本 | 左栏"命令行 / D:\p / ● 兼容"，右栏 2.1.334（受支持的构建）、已安装 0.8.0、三条安全检查、`修复安装`/`打开 Mods 文件夹`/`更多操作` | 与计划 §3 的层级一致 |
+| 卸载确认 | 安全检查整块被琥珀色确认区替换："卸载 Mod Loader？恢复原始引擎，但保留 Mod、配置和存档。确认后立即开始，中途不能取消。"，按钮变成 `确认卸载并恢复`/`取消` | 内联确认，未使用是/否对话框 |
+| 修复后的结果 | 绿色结果横幅"安装已修复"，正文含版本、备份结论与下一步；按钮 `完成`/`打开 Mods 文件夹` | 成功后不弹 MessageBox，原地变状态 |
+| 备份缺失（游戏兼容，只是备份不在了） | 加载器行"缺少原始引擎备份"，安全检查第二行琥珀色"找不到原始引擎备份，已禁止覆盖"，主按钮 `已禁用安装`（不可点） | 破坏性动作确实不存在 |
+| 技术信息 | 详情区整块换成路径、exe/引擎/备份的实际与期望 SHA-256、兼容配置、进程与目录可写性，11 行全部可见不截断 | `更多操作 → 复制技术信息` 的内容与它一致 |
+
+同一轮还确认了：`更多操作` 弹出菜单在按 Esc 后确实消失（`GetClassName == "#32768"` 的菜单窗口
+不再可见），方向键/Enter/Esc 的键盘路径可用，窗口按 DIP 布局（初始 980×660 DIP，最小 820×560 DIP），
+标题栏与任务栏显示的是安装器自己的图标（`assets/tc-modloader.ico`，`RT_GROUP_ICON` 100），
+嵌入的加载器与本次构建的 `dist/tc-loader.dll` 字节一致（`RT_RCDATA` 101，5329070 字节）。
+
 ## 浮点元件族 M2 垂直切片（2026-09-25）
 
 M2 的判据是 `docs/PLAN-float-components.md` §6.1、§7 与 §10.2：十进制 → 运算 → 人读结果 的
@@ -1427,6 +1793,142 @@ component placement redo state=3 result=0 components=4 live=3 restored=1
 元件留下 kind 0 的墓碑而不是缩短序列**（所以 `components` 仍是 4、`live` 才是 2）。低层删除也
 遵循同一墓碑规则；这三条直接影响所有"数元件/做撤销"的 Mod，已写进文档。
 
+### 命令 V2：可撤销删除元件与类型归属（真机）
+
+同一个 `component-placement-playtest` 在事务与 undo/redo 之后接着做删除：命令按
+`kind == 0x4e`、记录 `+8` 的实例 id、`+0x188` 的自定义 id 找到序列下标，造两个 Nim 序列
+（要删的 index、空导线列表）交给游戏自己的 `try_delete__modelZutilities_u8585`，只用公开 V3/V4
+回读判定：
+
+```text
+component delete command submit=0 request=4 instance=4113078775706014949
+component delete command state=3 result=0 live=3->2 at(28,10)=0
+component delete undo state=3 result=0 live=3 at(28,10)=1
+component delete redo state=3 result=0 live=2 at(28,10)=0
+```
+
+删除、撤销、重做三段都是"棋盘真的变了"而不是返回值：`live` 由 3 降到 2、`(28,10)` 查不到记录；
+一次 `board.undo` 把元件放回同一格（`at(28,10)=1`、`live` 回到 3），`board.redo` 再拿走。这正是
+低层 `board_delete_component`（墓碑、无撤销条目）做不到的——同一次运行里它的读数是
+`live=1->0 found=0` 且没有撤销条目。
+
+**序列的构造方式也是这一轮踩出来的坑**：这个构建的 Nim 序列变量是"计数 + payload 指针"两字头，
+而 payload 带 8 字节前缀——元素 i 在 `payload + i*8 + 8`（游戏自己的 `newSeq__modelZboardZboard_u5624`
+与 `add__modelZsave95mongerZcommon_u5717` 都按这个偏移写）。把元素写在头部的 `+8`（也就是 payload
+指针本身）会让游戏读到野指针、当场挂住（进程还在、帧不再来、没有任何日志）——这是本条命令第一次
+真机运行的失败形态。
+
+**归属规则的两半也各有真机证据**（同一沙盒装了第二个包 `local.editor-demo`）：
+
+```text
+component delete peer placement state=3 result=0 instance=1428633168808807934 at(12,10)=1
+component delete foreign type submit=-2 request=0 still=1 live=2->3
+component delete unknown type submit=0 request=8
+component delete unknown type state=4 result=-5 at(12,10)=1 live=3
+```
+
+先用总线放一个 peer Mod 的类型实例；删它（`custom_prototype_id` = peer 的类型）时命令**连队都没进**
+（`submit=-2`、`request` 保持 0、`still=1` 说明棋盘没动）；把同一个实例改报成一个没人注册过的类型 id，
+命令正常入队并在棋盘回读处以 `NOT_FOUND` 失败。契约（`sdk/tc_command_api.h`）与
+[sdk/commands.md](sdk/commands.md)、[reference/limits.md](reference/limits.md) 按这两条写：
+目录记在别的 Mod 名下的类型拒绝，目录没有记录的类型（Mod 自己用 `tc.component.model` 导入的电路）
+不做归属判断，与 `DUPLICATE_COMPONENT` 一致。
+
+`stage` 与 `submit` 共用同一份形状校验（`src/native.hpp` 的 `validateCommand`），所以事务也不能
+把总线会拒的命令塞进去：同一次运行里，事务里 stage 另一个 Mod 的类型、以及一个超出 type 范围的
+臆造 type，都在 stage 处得到 `-2`，`still=1` 说明棋盘始终没动。
+
+```text
+component delete transaction validation begin=0 foreign=-2 bogus=-2 still=1
+```
+
+这条断言对应的是一次真 bug 修复：改之前 `stageTransaction` 只查了 V1 那几条（有 type 下界没有上界，
+也没有删除命令的归属检查），而提交时 steps 逐条走 **同一个执行器**——于是臆造的 type 会被
+`sim.do / board.undo / board.redo` 的别名三元式落进 `board.redo` 分支，另一个 Mod 的类型也能借事务
+删掉。
+
+### `tc.component.compose` V2：内部网表 builder、嵌套与原版复用（真机，M4 第二～四刀）
+
+第一刀把原型表变成目录；这一轮让 Mod 真的拿原版零件拼元件：一个**组合类型**没有回调，定义
+本身就是内部电路。判据分三层，全部来自同一次真机运行
+（`tests/component-composite-playtest.ps1`，探针 `tests/composite-probe.cpp`，关卡 `and_gate_3`）：
+
+```text
+Component compose: composite 0x414e44335f303031 imported from 2 node(s), 3 in/1 out, declared delay=2
+composite: and3 custom=0x414e44335f303031 in=3 out=1 gates=2 delay=2
+composite: catalogue custom=0x414e44335f303031 implementation=1 capabilities=13 active=1 in=3 out=1
+Component compose: composite 0x4e455354335f3031 imported from 1 node(s), 3 in/1 out, declared delay=2
+composite: nested custom=0x4e455354335f3031 in=3 out=1 gates=2 delay=2
+composite: refusals broken=1 status=an inner input pin is not driven: node builtin/AND pin 1 has no wire driving it
+Component compose: cloned metadata of 'builtin/AND' onto dev.composite-probe/0x4e455354335f3031 flags=3
+composite: clone prototype name="AND" description="[T] when both inputs are [T]"
+Component compose: alias of 'builtin/AND' refused (this build dispatches by kind byte; use clone_metadata + a composite node)
+composite: alias status=-9
+byte-adder: autotest finished cycle=7 verdict=1
+```
+
+- **游戏真的编译了网表**：`gates=2`。探针在定义里故意声明 1 个门；游戏解析时按内部电路重算，
+  得到 2（两个 AND 节点）。声明值被忽略、重算值出现，说明它确实走了节点与导线，而不是照抄声明。
+  同一行里的 `delay=2` 是探针声明、游戏原样保留的那个字段（这个构建的解析器信任它）。
+- **行为正确**：夹具棋盘 `build/nl_and3board.data` 把 `and_gate_3` 关卡的三条输入与输出接到这个
+  实例上，**游戏自己的关卡测试**判 `verdict=1`。探针同时第二次读 `sim_get_test_state` 复核。
+- **嵌套可用**：第二个组合类型以第一个组合类型为唯一内部节点（`node()` 里给它的 `type_id`），
+  导入成功、代价同样是 2。
+- **校验与拒绝**：一个把第二个输入悬空的网表在 `commit` 处被拒，`status()` 是
+  `an inner input pin is not driven: node builtin/AND pin 1 has no wire driving it`。
+- **复用三路径**：`clone_metadata` 把 `builtin/AND` 的名字与说明抄到组合类型上，游戏存的原型
+  名字/说明随之改变（说明就是游戏自己的 `[T] when both inputs are [T]`）；完整别名
+  `alias()` 返回 `-9`（`UNSUPPORTED`）——本构建没有让新 id 走原版分发的入口，所以契约明确拒绝，
+  而不是发一个只有外观的空壳。
+
+离线半边 `tests/component-netlist.cpp`（`build.ps1` 内执行）把同一个 AND3 网表编码出来的字节，
+逐字段对照**游戏已经接受过的夹具定义** `build/nl_def_and3.data`：节点、引脚序号、词宽、值序列、
+导线端点全部一致，头部（自定义 id、缓存代价对）也一致；同时逐条验证 builder 承诺的拒绝项
+（空网表、引脚越界、重复驱动、悬空 sink、无状态组合环、布线冲突），以及"经过有状态零件的环
+合法"。编解码器共用一个 `Writer`（`src/component_definition.hpp`），所以这条对照也是"我的字节
+与夹具的字节同源"的证明。
+
+### `tc.component.compose`：原版类型目录（真机，M4 第一刀）
+
+计划 M4 的第一件交付是"稳定原版类型目录"。这一轮把它做成 `tc.component.compose` V1：引导时读一遍
+原型表，给每个 kind 一条记录（稳定拼写、名字、声明引脚、两个标志），并宣称它就是"这个构建里
+`get_prototype()` 会接受的集合"。这个宣称不能自己证明自己，所以门禁的做法是**让两个互相独立的
+读表者在同一次会话里各读一遍，再逐条比对**：`tests/kind-list-probe.cpp` 走 SDK 的 `TCGameModel`
+封装，服务走加载器自己的 `prototypeGet` + `board_pins::decodePin`。用例
+`component-compose`（`tests/component-compose-playtest.ps1`）把一个沙盒里同时装上这两个探针，
+跑一次游戏，然后：
+
+```text
+Component compose: built-in catalogue 125 kinds, 41 with no declared input pin, 104 with a shape
+compose count=125
+compose find kind=0x04 status=0 name="AND" in=2 out=1 in0=(-1,-1,w1) in1=(-1,1,w1) out0=(2,0,w1)
+compose spelling "builtin/AND" status=0 kind=0x04 name="AND"
+compose spelling "builtin/and" status=0 kind=0x04 name="AND"
+compose spelling "builtin/Delay Line" status=0 kind=0x0d name="Delay Line"
+compose spelling "builtin/Delay Line#2" status=0 kind=0x37 name="Delay Line"
+compose duplicates name="Output" kinds=0x28,0x3a,0x44,0x45,0x49,0x4a,0x4b ids=builtin/Output,…,builtin/Output#7
+compose duplicates name="Splitter" kinds=0x11,0x2f,0x63,0x64,0x6d,0x6e ids=builtin/Splitter,…,builtin/Splitter#6
+compose nameless status=0 kind=0x7b name="" in=0 out=0
+compose refusals unknown-kind=-4 unknown-id=-4 pin-range=-3 bad-direction=-2 short-buffer=-2
+The catalogue and the pin probe agree on 125 built-in kinds
+```
+
+最后一行是重点：脚本自己解析两份 dump（`kinds.txt` 与 `compose.txt`），要求 kind 集合完全相同、
+名字相同、输入/输出脚数相同、每根被报告的引脚 `(x, y, 原始字宽)` 相同。第一次跑就抓到了一个真实的
+解析坑——`kinds.txt` 的 kind 用 Nim 的十六进制拼写（`0x4`，不补零），按字符串当键会漏掉 16 个
+kind（125 vs 109）；按数值归一化后两边完全一致。
+
+同一批日志也把"表里到底有什么"钉了下来，这是下一刀（内部网表 builder）的输入：
+
+- **125 个 kind 里 17 个名字重复**（`Output` ×7、`Input` ×6、`Splitter` ×6，
+  `Word Maker`/`Concatenator`/`Maker` ×3，其余 ×2），所以"按名字找零件"必须靠按 kind 升序分配的
+  `#n` 编号；
+- **21 个槽位没有名字**（`0x7b` 是全零槽），它们是合法 kind，只能按 `builtin/0x<kind>` 找；
+- **41 个 kind 一个输入脚都不声明**（有状态族与纯源都在里面）——`NO_DECLARED_INPUTS`；
+- **104 个 kind 带 shape**——`HAS_SHAPE`（将来 `clone_builtin_metadata` 要读的东西）；
+- 引脚字宽有三种：数字（如 AND 的 `w1`）、`0x7fff…ff` 自动标记、以及两个 Splitter 用的
+  `0x7fff…fe`/`…fd`（语义未核实，按 raw 报出）。
+
 ### 生命周期结构变化事件（真机）
 
 同一个 `game-handle-probe` 用例在**自身事务完成后**（避免与 stop+save 事务抢同帧导致 CONFLICT）
@@ -1953,6 +2455,88 @@ NOT + 关卡 IO）由 `tests/and-component-fixture.cpp` 生成。断言三条：
 
 ## 实例、状态与生命周期（M2，2026-09-22）
 
+### 字体资源服务化（render V8，2026-09-28）
+
+**契约**：`load_font` / `release_font`（每 Mod 8 个面、TTF ≤16 MiB、`native_size` 4–512、BMP 区间
+≤16 段）、绘制表 V4 的 `text_font` / `measure_font`、逐实例图片 `load_instance_image` /
+`release_instance_image`、设备世代 `set_device_callback` / `device_generation`。
+
+**修掉的真 bug**：本构建的 ImGui 用 **32 位 `ImWchar`**。证据是 `ImFontAtlas_GetGlyphRangesDefault`
+返回表的原始字节（运行日志里打出来的）：
+
+```text
+Font trace: default glyph ranges bytes 20 00 00 00 ff 00 00 00 00 00 00 00
+```
+
+宿主原来按 16 位对编码 SDK 的区间 → atlas 按错误的区间建字形 → `text_font` 不产生顶点。现在按
+32 位对编码。
+
+**已验（真机，隔离沙箱，pinned build）**：`tests/text-box-playtest.ps1 -Font`（示例 Mod 从
+`data_directory_utf8/../../../asset/font/` 取游戏自带字体）。
+
+```text
+[local.text-box] text-box: font service (render V8) available
+Component render: font "note-cjk" for local.text-box loaded (revision 1)
+[local.text-box] text-box: font service CJK face status=0 handle=1 native=22 revision=1
+Component render: font "note-plain" for local.text-box loaded (revision 1)
+[local.text-box] text-box: font service UI face status=0 handle=2 native=22 revision=1
+[local.text-box] text-box: font service refusals relative=-2 ranges=-2 (want -2)
+Component render: font "note-small" for local.text-box loaded (revision 1)
+Component render: font "note-small" for local.text-box loaded (revision 2)
+[local.text-box] text-box: font service revision first=0 revision=1 released=0 reload=0 handle_stable=1 revision_after=2 fresh=0 fresh_handle=1 revision_reset=1
+[local.text-box] PASS text-box font service custom_status=0 plain_status=0 styled_status=0 measure_custom=0 measure_plain=0 measure_cjk=0 custom=62.4x16.9 plain=62.4x16.9 cjk=42.6x16.9 handle=2 revision=1 rect=1249,616,1312,633 control=1249,642,1312,659
+PASS text-box font service pixels default=102 custom=0
+```
+
+这段覆盖：服务可达、两个面被接受、句柄/宽度/度量按面区分（CJK 42.6 vs UI 62.4）、拒绝路径
+（相对路径与超长区间都是 `-2`）、替换与释放的两种生命周期语义（`revision=2` / 新句柄
+`revision=1`），以及 `text_font` 的**绘制管线**（同一位置用宿主默认面画出来 102 个像素）。
+
+**仍未通过（明确记录）**：由宿主加载的自定义面**画不出像素**——同一位置 `text_font(句柄,…)` 为 0，
+`text_font(0,…)` 为 102；而该 atlas 纹理作为一张 `AddImageQuad` 图片画出来有 151 个像素，
+`measure_font` 也按面给出度量。也就是说 atlas 建好了、纹理可渲染、度量正确、绘制管线通，缺的是
+"字体 atlas 的纹理 id 怎么被这个构建的后端接受"。下一步从 `ImFontAtlas_SetTexID` 之外找，并在同一
+用例里把 `custom=` 也变成断言。
+
+### M2 补完：放置、编译与解绑（2026-09-28）
+
+契约：`TCComponentLifecycleV1` 追加 `on_move` / `on_rotate` / `on_resize` / `on_compile` /
+`on_unbind`（按 `size` 生效），`TCLogicIOV2` 追加放置尾巴
+`cell_x`/`cell_y`/`rotation`/`half_width`/`half_height`；新相位 `TC_LOGIC_MOVE=9` /
+`ROTATE=10` / `RESIZE=11` / `COMPILE=12` / `UNBIND=13`。ABI 基线 1657 → 1672。
+
+**已验（离线）**：`tests/native-component.cpp` 在同一套假绑定上驱动新的派发——第一次
+`updateInstanceGeometry` 只做基线（不发通知）、格点变了发 move、方向字节变了发 rotate；
+`updateInstanceFootprint` 发 resize 且同一矩形不重复发；`notifyCompile` 发 compile；最后
+`releaseInstances(nullptr, …)` 对每个在场实例发 unbind 而 `on_destroy` 计数不变。
+
+**已验（真机，隔离沙箱，pinned build）**：`tests/pin-shape-playtest.ps1 -Shape wide9`。探针在真机上
+依次做四件事：编译（`on_compile`）、用 `tc.component.geometry` V2 的逐实例矩形改第二个实例的占位
+（`on_resize`，新值从放置尾巴读出）、尝试用合成鼠标拖动与候选按键旋转（记录结果，见下）、最后
+`load_level("sandbox")` 离开棋盘（`on_unbind`）。
+
+```text
+[dev.pin-shape-probe] pin-shape: wide9 on_compile instance=2459565876494606882 phase=12
+[dev.pin-shape-probe] pin-shape: wide9 on_compile instance=3689348814741910323 phase=12
+[dev.pin-shape-probe] pin-shape: geometry resize requested for the second instance
+[dev.pin-shape-probe] pin-shape: wide9 on_resize instance=3689348814741910323 cell=-5,20 rotation=0 half=3.000000,2.000000
+[dev.pin-shape-probe] pin-shape: geometry instance resize=0 (half=3,2)
+[dev.pin-shape-probe] pin-shape: moving instance at 1152,1311 by two cells (unit=25.599976)
+[dev.pin-shape-probe] pin-shape: instances moves=0 rotations=0 screen=1152,1311 (dragged from 1152,1311); a synthetic board drag is not acted on by this build (see docs/research/component-hitbox-path.md), so the move/rotate gate stays open
+[dev.pin-shape-probe] pin-shape: wide9 on_unbind instance=3689348814741910323 phase=13
+[dev.pin-shape-probe] pin-shape: leaving the board for sandbox
+```
+
+**仍未通过**：`on_move` / `on_rotate` 的真机门禁。探针把真实指针钉在元件中心、按帧推进拖动、同时向
+ImGui 的 IO 注入移动与按键（PostMessage 与 `ImGuiIO_AddMousePosEvent`/
+`ImGuiIO_AddMouseButtonEvent` 两种方式都试过），并先经命令总线提交 `SIM_STOP`（玩家编辑的是暂停中
+的棋盘）；元件的屏幕位置始终不变（`screen=1152,1311` 与拖动前一致），于是棋盘记录没有变化、两条
+回调没有触发。这与 [research/component-hitbox-path.md](research/component-hitbox-path.md) §4/§5 的
+结论一致：**本构建对合成鼠标的棋盘拖动没有反应**（那一轮的可拖结论来自真人手测）。派发逻辑本身由
+上面的离线用例覆盖；真机门禁需要一个真人拖动的录像/截图，或先把合成输入这条研究做完。
+`on_compile_failed` 也未交付：编译失败的路径不经过生成器（`add_circuit_code`），当前构建没有可靠的
+失败信号，因此它没有进契约。
+
 **离线层**（fast 层 `build` 里的 `tests/native-component.cpp`）：手工建两个绑定并断言
 `on_create` 各触发一次且写进的状态可见；`enumerate` 给出 2 个句柄、generation 不同、缓冲不够时
 `ERR_RANGE` 且 `total` 正确；`info` 报出状态字数与脚数；`reset` 只影响目标实例（另一个的状态
@@ -2468,6 +3052,8 @@ reject   : launch 1/2 -> config_changes=0
 | `native-component-playtest.ps1` | 声明式 8 输入／8 输出：重复输入次序、最后两个输出接关卡、重复 ID／非法描述拒绝、40 周期无失配 |
 | `native-component-playtest.ps1 -Single` | 声明式 1 输入／1 输出字节元件：`double_number` 16 周期全部通过 |
 | `kind-list-playtest.ps1` | 枚举 125 个内置元件的 kind／名称／引脚（`build/kinds.txt`） |
+| `component-compose-playtest.ps1` | `tc.component.compose` V1（原版类型目录）：拼写／重名编号／无名槽位／查找与拒绝，并把目录 dump 与同一会话里 `kind-list` 探针的 dump 逐条比对（125 条全一致） |
+| `component-composite-playtest.ps1` | `tc.component.compose` V2（内部网表 builder）：注册"用两个原版 AND 拼的三输入 AND"、嵌套一个组合类型、拒绝悬空网表、克隆原版元数据、把完整别名判为不可用，并让 `and_gate_3` 关卡用游戏自己的测试判分（`gates=2`、`verdict=1`） |
 | `kind-list-playtest.ps1`（引脚封装回归） | 探针改用 `tc::prototypeInput/OutputPinPoint()` 与 `...PinWordSize()` 后，真机重新 dump 的 126 行与改动前逐行一致：名字／引脚数／偏移／字宽全同，证明 SDK 隐藏的 `TCPin* + 8` 锚点算术与手写实现等价（[research/board-object-fields.md](research/board-object-fields.md) §2） |
 | `ui-playtest.ps1` | 界面封装：真实 `mod-inspector` 包的面板在 ImGui 帧内绘制，视口/鼠标返回值合理 |
 | `waveform-playtest.ps1` | 关卡波形：驱动器进入 `and_gate` 并运行，断言采样行＝关卡自带测试、VCD 内容、以及面板矩形内的泳道颜色像素（`-Example` 只验证发行包注册） |
@@ -2811,3 +3397,448 @@ red   ghost 4  0 44 1696 / red   after 1  0 3 424
 
 **结论**：发布产物（0.8.0 的安装器/玩家包/源码包）与 fast、host 两层以及真机冒烟（元件存档持久化）
 都通过；game 层的这 6 条待办集中在**驱动程序的首页编号**与**用例取数路径**，下一次真机维护时一并处理。
+
+## 元件属性编辑器 V3：下拉 / 颜色 / 自定义行 / 校验 / 面板约束（2026-09-28，全部验证）
+
+玩家要求："先把属性编辑器补齐"、"界面不能超过游戏底部面板大小"、"排版要完善"、"收起底部面板时
+不再渲染、再拉起时 UI 与已填内容不变"、"窗口变化时自动适应"、"底部属性栏默认不显示元件说明文字，
+开发者可选打开"。这一节的证据按能力分列，命令都是
+`powershell -NoProfile -ExecutionPolicy Bypass -File tests\component-editor-playtest.ps1 …`。
+
+**已验（离线）**：`tests/component-editor.cpp`（由 `build.ps1` 运行）钉住 V3 的字段种类
+（`COLOR_RGBA8` = 4 字节、`CUSTOM` = 0 字节）、flag（`DROPDOWN` 与 `RADIO` 互斥、`RESIZE_HANDLE`
+只能给 CUSTOM、自定义行的绘制/菜单/抓手只能挂 CUSTOM）、颜色的小端往返与显示、以及原有的宽度感知
+浮点与表级布局规则。`tools/abi.ps1` 基线 **1296 → 1657** 条（新增记录属于 `TCComponentEditorApiV3`、
+`TCComponentFieldV2`、`TCComponentEditorActionV1`、`TCComponentEditorCustomRowV1`、
+`TCComponentTypeDefinitionV2` 的尾部字段与常量）。
+
+**已验（真机，注册与说明文字）**：
+
+```text
+[local.editor-demo] Component V2: type 0x454449545f303031 keeps its description out of the game's panel (set TC_COMPONENT_TYPE_SHOW_DESCRIPTION to show it)
+[local.editor-demo] Component V2: type 0x454449545f303032 shows its description in the game's panel (TC_COMPONENT_TYPE_SHOW_DESCRIPTION)
+Component editor V3: type 0x454449545f303031 edits enabled(bool), period(uint), mode(enum), gain(float), mask(uint), label(text), scale(float), format(enum), color(color-rgba8), preview(custom)
+PASS component editor registration: the type and its field table are accepted by the pinned build
+```
+
+**已验（真机，四种控件形状）**：复选框（`committed field "enabled" … value=off`）、文本（点开打字 +
+回车 → `label="helloxy"`）、单选（`committed field "format" … value=Float`）、十六进制
+（`committed field "mask"` 带键入的数字）。
+
+**已验（真机，下拉与校验）**：`-Row mode -Gesture dropdown -Choice 1` 打开 combo、点选项并提交；
+`-Choice 4` 走被拒绝的选项。两行都由宿主的校验路径给出：
+
+```text
+Component editor: committed field "mode" on instance 0x2f57feb8a7fb5f9f value=RTZ
+Component editor: validator warned for field "mode" on instance 0x2f57feb8a7fb5f9f: RTZ is lossy in this demo
+Component editor: validator refused field "mode" on instance 0x37e2b90a609bccb9: the demo refuses RNA
+```
+
+被拒的那次**没有** `committed field "mode"` 行（用例显式断言），配置保持旧字节。
+
+**已验（真机，自定义行）**：`-Row preview -Gesture double/menu/grip`：
+
+```text
+[local.editor-demo] editor-demo: custom action kind=1 id=1 delta=0.000000,0.000000
+[local.editor-demo] editor-demo: custom action kind=3 id=0 delta=0.000000,0.000000
+[local.editor-demo] editor-demo: custom action kind=5 id=0 delta=0.000000,0.000000
+[local.editor-demo] editor-demo: instance 0x396af55f507bba9a config changed … grip=17,8 format=Bin
+DRIVER: PASS the driver clicked the preview row's resize grip …
+```
+
+菜单项改配置（`enabled` 由 1 变 0）、抓手把累计位移写进配置；抓手按住/拖动/松手落在同一个
+`storage` 编辑事务里（宿主在按下时 `begin_edit`、松手 `commit_edit`）。
+
+**已验（真机，颜色拖动）**：`-Row color -Gesture wiggle` 在颜色控件上拖过，存储值从注册默认
+`0xff40a0ff` 变成例如 `#ff40adff`（用例断言"至少有一次与默认不同"）。
+
+**已验（真机，面板约束）**：每个 rows 用例都从 `TC_EDITOR_TRACE=1` 的 `window` 行里取
+`panel=`（游戏底部面板矩形）并断言行窗口与被点击的行都在它里面，例如
+
+```text
+Component editor: window instance=0x… pos=204,1266 size=867,328 rows=10 scrollmax=232 panel=0,1200,2560,1602 toggle=13,1213,93,1253
+```
+
+**已验（真机，折叠/展开）**：`-Row label -Keys xy -Fold` 先打字不提交，点游戏自己的折叠钮，
+停约 2.5 秒（期间宿主一次行 trace 都没有），再展开：
+
+```text
+Component editor: the drawer is folded (1px under its title); the rows are not drawn until it opens again
+Component editor: the drawer is open again; the rows return to the same place
+DRIVER: PASS the drawer folded with no rows drawn, and unfolding brought the label row back at the same rectangle with "helloxy" still in it
+```
+
+断言三条：折叠期间行 trace 计数为 0（驱动自己数）、展开后同一实例同一字段的矩形逐像素相同、
+`buffer="helloxy"` 原样回来（随后回车才把 `label` 提交成 `"helloxy"`）。
+
+**用例清单**（都进 `tests/test-catalog.json`，`-Tier game`）：`component-editor`、
+`component-editor-rows`、`component-editor-text`、`component-editor-radio`、
+`component-editor-hex`、`component-editor-dropdown`、`component-editor-dropdown-refused`、
+`component-editor-double`、`component-editor-menu`、`component-editor-grip`、
+`component-editor-color`、`component-editor-panel`、`component-editor-long`。
+
+## 元件属性编辑器 V4：色块条 / 混合取色 / 校验标记 / 暂存表（2026-09-29，全部验证）
+
+V3 收尾时留下的三件——"颜色以外的取色形状""校验提示图标化""多字段确认 / 取消对话框"——在这一版
+补齐。做法全是加法：字段描述符仍是 `TCComponentFieldV2`，V3 的表一字未改，新形状挂在新位和一个新的
+表级调用上。命令都是
+`powershell -NoProfile -ExecutionPolicy Bypass -File tests\component-editor-playtest.ps1 …`。
+
+**已验（离线）**：`tests/component-editor.cpp` 新增三组断言——颜色字面量的解析与格式化
+（`#RRGGBB` / `#RRGGBBAA` / `#RGB` 展开 / `0x` 前缀 / 空白 / 五种非法输入）、`COLOR_PALETTE` 与
+`COLOR_HEX` 只许挂在颜色上、`VALIDATION_ICON` 任意种类可用、表级开关的未知位与"CONFIRM + CUSTOM
+行"拒绝；还有一条**版本位集**断言：同一张表用 `TC_COMPONENT_FIELD_KNOWN_FLAGS` 通过、用
+`TC_COMPONENT_FIELD_V3_KNOWN_FLAGS` 被拒（`unknown flags`）。
+`tools/abi.ps1` 基线 **1763 → 1785** 条：新增 22 条全部属于 `TCComponentEditorApiV4` 与 V4 常量，
+`TCComponentEditorApiV3` 的成员偏移逐条未变；`TC_COMPONENT_FIELD_KNOWN_FLAGS` 从 255 变为 2047 是
+**有意的**（它一直是"当前这一版"的别名），V3 那一版的值以新名字 `TC_COMPONENT_FIELD_V3_KNOWN_FLAGS`
+= 255 冻结。
+
+**已验（真机，注册）**：`Component editor V4: type 0x454449545f303031 edits … palette(color-rgba8),
+preview(custom)` 与 `Component editor V4: type 0x454449545f303033 edits active(bool), count(uint),
+channel(enum) table=confirm` 都被接受；后者的表级开关若不被认，加载器会在同一行写明拒绝原因。
+
+**已验（真机，色块条）**：`-Row palette -Gesture swatch -Choice 2`。宿主逐块发布矩形，驱动点它：
+
+```text
+Component editor: swatch instance=0x6cb71bd1cd931eb1 field="palette" index=2 rect=569,1597,621,1649
+DRIVER: aiming at swatch 2 rect=569,1597,621,1649 click=595,1623
+Component editor: committed field "palette" on instance 0x… value=#ffe040
+[local.editor-demo] editor-demo: instance 0x… config changed … palette=0xff40e0ff
+```
+
+`palette=0xff40e0ff` 正是第三条色块 `#ffe040` 的打包值（`R=0xff, G=0xe0, B=0x40`），即"点哪块存哪块"，
+不是近似。
+
+**已验（真机，混合取色行）**：`-Row palette -Gesture select -Keys beef`。这一行的文本框就是行 trace
+报出的矩形；驱动先在框上按住左键从左拖到右（**这个构建里 Home/Delete/Ctrl+A 到不了 ImGui，鼠标选中
+却能**），再输入并回车，所以落盘的是干净的键入值而不是"接在旧值后面"的字符串：
+
+```text
+Component editor: row … field="palette" rect=799,1475,1131,1516 value="#0000c0" active=1 focused=1
+DRIVER: typed "beef" into the palette row and pressed Enter
+[local.editor-demo] editor-demo: instance 0x… config changed … palette=0x0000beef
+Component editor: committed field "palette" on instance 0x… value=#efbe0000
+```
+
+（`0x0000beef` 与 `#efbe0000` 是同一个打包值的两种写法：`R=0xef, G=0xbe, B=0, A=0`。）
+对照组是"不选中直接点"：插入点落在字符命中处、四个字符接在 `0xffc00000` 后面成为 12 位十六进制，
+被解析器拒绝并保留旧字节（`field "palette" … is not a colour ("0xffc00000beef")`）——这也正是驱动要
+先选中再打字的原因。
+
+**已验（真机，校验标记）**：`-Row mode -Gesture dropdown -Choice 4 -Hover`。先走被拒绝的选项让这一行
+真的带着消息，驱动再按宿主发布的矩形把指针停上去：
+
+```text
+Component editor: validator refused field "mode" on instance 0x…: the demo refuses RNA
+Component editor: validation icon instance=0x… field="mode" status=-1 rect=882,1377,915,1411
+DRIVER: resting the pointer on the mode row's validation marker at 898,1394
+Component editor: validation tip instance=0x… field="mode" status=-1 message="the demo refuses RNA"
+```
+
+即消息没丢：位置从"行下面一整行文字"变成"控件末尾 33×34 px 的标记"，内容在 tooltip 与日志里都在。
+
+**已验（真机，暂存表 Apply）**：`-Type staged -Dialog apply`。类型 `EDIT_003` 的表是用
+`TC_COMPONENT_EDITOR_TABLE_CONFIRM` 声明的，驱动先点复选框、再在下拉里选一个选项，然后按 Apply：
+
+```text
+Component editor: staged field "active" on instance 0x… value=off
+Component editor: dialog instance=0x… apply=204,1554,292,1595 cancel=292,1554,397,1595 pending=1
+Component editor: staged field "channel" on instance 0x… value=Alpha
+Component editor: dialog instance=0x… apply=204,1554,292,1595 cancel=292,1554,397,1595 pending=2
+DRIVER: clicked Apply at 248,1574 with pending=2
+[local.editor-demo] editor-demo: staged instance 0x… config changed active=0 count=7 channel=Alpha
+Component editor: applied 2 staged field(s) on instance 0x… in one step
+```
+
+三条断言把它钉死：两次编辑都只报 `staged field`（没有 `committed field`，V3 的表会各写一次）、
+按钮发布 `pending=2`（宿主自己数的待写字段）、Apply 之后**只有一条** `config changed` ——
+那个类型自己的回调一次报出两个新值，也就是"一次写 = 一步撤销"。
+
+**已验（真机，暂存表 Cancel）**：`-Type staged -Dialog cancel` 走同一串，最后按 Cancel：
+
+```text
+DRIVER: clicked Cancel at 344,1574 with pending=2
+Component editor: cancelled 2 staged field(s) on instance 0x…
+Component editor: dialog instance=0x… pending=0
+```
+
+用例显式断言整个日志里**没有** `editor-demo: staged instance … config changed`：取消的整批一次都没
+碰到配置。
+
+**用例清单**（都进 `tests/test-catalog.json`，`-Tier game`）：`component-editor`、
+`component-editor-rows`、`component-editor-text`、`component-editor-radio`、
+`component-editor-hex`、`component-editor-dropdown`、`component-editor-dropdown-refused`、
+`component-editor-double`、`component-editor-menu`、`component-editor-grip`、
+`component-editor-color`、`component-editor-panel`、`component-editor-long`、
+`component-editor-swatch`、`component-editor-color-hex`、`component-editor-validation-icon`、
+`component-editor-confirm`、`component-editor-confirm-cancel`。
+
+一次跑完（`tools/test.ps1 -Name 'component-editor*' -NoBuild -KeepGoing`）：
+
+```text
+[1/18] component-editor                PASS  注册（含 V4 表与 table=confirm）
+[2/18] component-editor-rows           PASS  点复选框 → committed → enabled=0
+[3/18] component-editor-text           PASS  文本行打字 → 回车 → label="xy"
+[4/18] component-editor-radio          PASS  单选行最后一个选项 → format=Float
+[5/18] component-editor-dropdown       PASS  下拉选 RTZ（含 warning）
+[6/18] component-editor-dropdown-refused PASS 选 RNA 被拒、配置不变
+[7/18] component-editor-double         PASS  自定义行双击
+[8/18] component-editor-menu           PASS  自定义行右键菜单
+[9/18] component-editor-grip           PASS  缩放抓手（一步撤销）
+[10/18] component-editor-color         PASS  V3 颜色控件拖动
+[11/18] component-editor-panel         PASS  面板夹紧 + 折叠/展开
+[12/18] component-editor-hex           PASS  十六进制框打字
+[13/18] component-editor-long          PASS  32 行滚动
+[14/18] component-editor-swatch        PASS  V4 色块条点选
+[15/18] component-editor-color-hex     PASS  V4 混合取色框（先选中再打字）
+[16/18] component-editor-validation-icon PASS V4 校验标记 + tooltip
+[17/18] component-editor-confirm       PASS  V4 暂存表 Apply（一次写）
+[18/18] component-editor-confirm-cancel PASS V4 暂存表 Cancel（零写入）
+Result: 18 passed, 0 failed
+```
+
+同一轮回归里 `-Tier fast -NoBuild`（17 条，含 `build`、`sdk-abi`）、`-Tier host`
+（`native-host`/`hook-chain`/`installer`/`compatibility-game`）与
+`float-panel-game`（编辑器的真实消费者）都是 0 失败。
+
+## 元件属性行 `tc.component.editor` V1（2026-09-27，全部验证）
+**已验（离线）**：`tests/component-editor.cpp` 由 `build.ps1` 运行，钉住
+`TCComponentFieldV1` / `TCComponentEditorApiV1` 的字段偏移与大小、五种字段的接受与拒绝
+（越界、未知种类、宽度、枚举无选项、UINT 超过 31 位、文本过小/过大）、小端配置往返、
+范围钳位与日志文本、枚举回绕、文本截断与终止符、浮点位型（含 NaN）与"写到配置末尾之外
+被拒绝且不改字节"。`tools/abi.ps1` 的基线从 1238 → **1281** 条（新增 43 条），全部属于
+`TCComponentFieldV1`、`TCComponentEditorApiV1` 与对应常量。
+
+**已验（真机，隔离沙箱，pinned build）**：`tests/component-editor-playtest.ps1` 把
+`dist/local.editor-demo.mod` 装进沙箱并启动游戏，断言加载器接受了这个类型的字段表：
+
+```text
+Native logic: registered custom 0x454449545f303031 inputs=0 outputs=0 shape=0in/0out v2 state=0
+Component editor: type 0x454449545f303031 edits enabled(bool), period(uint), mode(enum), label(text), scale(float)
+[local.editor-demo] editor-demo: declared 5 editor fields for type 0x454449545f303031
+PASS component editor registration: the type and its field table are accepted by the pinned build
+```
+
+这一条覆盖的是"服务在真实构建上能被 Mod 查到、所有权与配置尺寸校验按预期通过、游戏照常起来"；
+它**没有**覆盖行绘制、鼠标/键盘输入与提交。
+
+**已验（真机，行驱动）**：`tests/component-editor-playtest.ps1 -Stage rows` 与驱动
+`tests/component-editor-driver.cpp`。驱动挂 `handle_update_wire` 拿 model、自己进 sandbox、用命令
+总线放一个 `EDIT_001`、点元件本体打开游戏自己的抽屉、从 `TC_EDITOR_TRACE=1` 的行矩形里取目标行、
+用真实鼠标点它（文本行再打字 + Enter）。三条断言：宿主画出了那一行、宿主提交且没有被拒绝的写入、
+元件 Mod 自己的 `on_config_changed` 报出新值。
+
+```text
+DRIVER: the game's own placement helper returned true at 46,6
+DRIVER: asked for one editor-demo component at 30,0 (request 1)
+DRIVER: the placement command succeeded
+DRIVER: the component is on the board as instance 0x3979605f587d8649
+Component editor: row instance=0x3979605f587d8649 field="enabled" rect=972,1409,1023,1460 active=0 focused=0
+DRIVER: clicked the enabled row at 997,1434
+[local.editor-demo] editor-demo: instance 0x3979605f587d8649 config changed enabled=0 period=16 mode=RNE label="hello" scale=1
+Component editor: committed field "enabled" on instance 0x3979605f587d8649 value=off
+
+Component editor: row instance=0x6458… field="label" rect=972,1478,1842,1529 active=1 focused=1 buffer="hello"
+DRIVER: typed "xy" into the label row and pressed Enter
+[local.editor-demo] editor-demo: instance 0x6458… config changed enabled=1 period=16 mode=RNE label="helloxy" scale=1
+Component editor: committed field "label" on instance 0x6458… value=helloxy
+```
+
+两条用例登记在 `tests/test-catalog.json`（`component-editor-rows`、`component-editor-text`），注册
+门槛是 `component-editor`。第一次尝试的三个坑（`apply` 覆盖启用集合、占用格上的 -6、行窗口越过
+屏幕底边）记在 [HANDOFF-component-editor.md](HANDOFF-component-editor.md) §5，抄这个用例时先看那一段。
+
+### V2：布局标志、单选、十六进制与滚动（2026-09-27 同日第二刀，全部验证）
+
+六条用例全部登记在 `tests/test-catalog.json`，`tools/test.ps1 -Name 'component-editor*'` 一次跑完：
+
+```text
+[1/6] component-editor        PASS  注册 + 含 V2 flag 的字段表被接受
+[2/6] component-editor-rows   PASS  点复选框 → committed → on_config_changed enabled=0
+[3/6] component-editor-text   PASS  点文本行（active=1 focused=1）→ 打字 → 回车 → label="xy"
+[4/6] component-editor-radio  PASS  点单选行最后一个选项 → mode=RNA
+[5/6] component-editor-hex    PASS  十六进制框打字 → 回车 → mask=0x…beef
+[6/6] component-editor-long   PASS  32 行：window … rows=32 scrollmax=458，f0 点击提交
+Result: 6 passed, 0 failed
+```
+
+长表那一条的关键证据是宿主自己的窗口行——它同时说明"窗口被封顶在屏幕内"和"剩下的内容能滚到"：
+
+```text
+Component editor: window instance=0x572dd4bbc2a7f2c1 pos=204,8 size=833,1576 rows=32 scrollmax=458
+Component editor: row instance=0x572dd4bbc2a7f2c1 field="f0" rect=972,8,1023,59
+[local.editor-demo] editor-demo: long instance 0x572dd4bbc2a7f2c1 config changed f0=0 f31=1 ones=31
+Component editor: committed field "f0" on instance 0x572dd4bbc2a7f2c1 value=off
+```
+
+这一刀新踩到的四个坑（夹紧要按内容高度、驱动点击会抖、游戏的输入框收不到编辑键、
+`test-catalog.json` 必须 ASCII）记在 [HANDOFF-component-editor.md](HANDOFF-component-editor.md) §6。
+
+## Mod 配置三刀：storage V1/V2 + settings V1（2026-09-27，全部验证）
+
+**离线存储**：`tests/mod-storage.cpp` 直接驱动宿主存储实现与 SDK 包装，覆盖 GLOBAL/PROFILE 分离、
+两个 Mod 的同名 key 隔离、先问长度再读取、短缓冲、空值与缺失的区别、原子覆盖、删除、非法 scope/key、
+单值上限，以及复制 profile 后 PROFILE 数据跟随而 GLOBAL 仍来自安装目录。V2 另覆盖 schema 0 → 2、
+V1 写入保留版本、回调拒绝不改旧值、拒绝降级、缺失 key 直接用默认值建到目标版本。
+
+**离线设置**：`tests/mod-settings.cpp` 覆盖五种字段、字段/存储 key 唯一性、范围与默认值校验、enum
+上限，以及持久化文本的严格解码（越界、NaN、非法 bool/enum 都拒绝）。两条都由 `build.ps1` 执行；
+全量构建通过，ABI 基线为 **1402** 条。
+
+**真机**：`tests/mod-storage-playtest.ps1` 构建 `dev.mod-storage-probe`，插件在 `tc_mod_load` 中先把
+GLOBAL/PROFILE 两个 `runs` 迁到 schema 1，再声明一个全局 bool 与一个存档级 text 字段。隔离沙箱
+启动真实游戏三次并把 `saves.ini` 切成 A → B → A；测试环境还自动打开宿主设置页，要求其内容容器
+真实绘制：
+
+```text
+mod storage probe: global=1 profile=1
+mod storage probe: global=2 profile=1
+mod storage probe: global=3 profile=2
+Mod settings registered: dev.mod-storage-probe fields=2
+home button settings ...
+Opened UI page tc.modloader/settings (auto)
+UI page content tc.modloader/settings ...
+PASS tc.mod.storage V2 migration + tc.mod.settings page registration across A -> B -> A restarts
+```
+
+最后解 envelope 后读取三份 payload，要求 GLOBAL=`3`、profile A=`2`、profile B=`1`。这条门槛证明
+迁移/设置服务在初始化期可用、重启可读回、profile 不串数据，而且统一入口与页面容器在真实构建上可画。
+
+## 0.8.1 发布：安装器是"成对的"，老版本加载器要登记（2026-09-28）
+
+`VERSION` 提到 0.8.1 之后跑 `tools\release.ps1 -AllowDirty -TestTier host` 出包，这一轮顺手把两个
+发布期的坑补成门禁，两处都留了可复核的数字：
+
+**① 安装器与它部署的加载器成对校验。** 新函数 `Assert-TcInstallerMatchesRelease`
+（`tools\ReleaseTools.psm1`）用 `FindResource/LoadResource/LockResource` 抽安装器的 101 RCDATA，
+和 `dist\tc-loader.dll` 比 SHA-256，并要求安装器的 `FileVersion`/`ProductVersion` 等于 `VERSION`。
+它被暂存前的 `tools\release.ps1` 与 fast 层 `release-contract` 同时调用。实测输出：
+
+```text
+Installer: embeds dist\tc-loader.dll (7a600aec...), version 0.8.1
+PASS release contract: the installer embeds dist\tc-loader.dll (7a600aec...) and carries version 0.8.1
+```
+
+发布目录里三项也互相印证（`SHA256SUMS.txt` 逐项复核通过）：
+
+```text
+dist\tc-loader.dll                          7a600aecd63e6891...cab8bfbf   5,371,761 B
+dist\TCModLoader-Setup.exe                  dd271185108def33...843d9e90   9,391,301 B
+dist\releases\0.8.1\TCModLoader-Setup.exe   dd271185108def33...843d9e90   （与上面同一份）
+dist\releases\0.8.1\TCModLoader-0.8.1-win64.zip 内 TCModLoader-Setup.exe 同哈希
+已装机 D:\p\game_engine.dll                  7a600aecd63e6891...cab8bfbf   （与 dist 加载器一致）
+```
+
+**② 已发布版本的加载器登记进白名单。** `compat\profiles.json` 的 `acceptedInstalledLoaders` 新增
+`TC_LOADER_060_SHA`（0.6.0 发布包内嵌的 `f609783c…`，4,487,399 B）与 `TC_LOADER_080_SHA`
+（0.8.0 的 `5702228f…`，5,211,697 B）；`src\setup_core.cpp` 的 `classify()` 改成查这张表。这两条
+哈希是用同一套资源抽取法从 `dist\releases\0.6.0|0.8.0\TCModLoader-Setup.exe` 里量出来的——也是
+玩家装了那两版之后磁盘上真实的 `game_engine.dll`。新增的真机相（`tests\setup.ps1` 第三相）把历史
+发布包内嵌的加载器铺进沙箱当 `game_engine.dll`、旁边放原版引擎当备份，要求 `--install` 退出码 0
+且部署结果等于当次加载器：
+
+```text
+PASS upgrade from the published 0.6.0 loader
+PASS upgrade from the published 0.8.0 loader
+```
+
+**这一轮跑的层**：fast 16/16（含 build、`compatibility-contract`、`sdk-abi`、`release-contract`）、
+host 4/4（`native-host`、`hook-chain`、`installer`、`compatibility-game`）。**game 层没有重跑**
+（本轮之前 `float-panel-game`、`float-reentry-game`、`float-widths-game`、`float-catalogue-game`、
+`float-busy-board-game` 与 `component-editor-*` 五条都已单独跑绿，但那不等于整层结果）。
+`dist\releases\0.8.1\release.json` 记录 `dirty: true`（工作区未提交），所以这一份是**本地产物**，
+要发出去得先提交再重跑一次发布。
+# `tc.component.input` / `tc.component.channel` V1（2026-09-28）
+
+本轮新增两条宿主服务，并把 ABI 记录加入 `abi/windows-x64.json`：
+
+- `tests/component-input.cpp`：90° 旋转后的局部矩形命中、enter/down、逐实例 pointer capture 与
+  keyboard focus、越界拖动 begin/end、物理键、UTF-8 中文码元提交，以及实例消失后的 stale 清理；
+- `tests/component-channel.cpp`：render→sim FIFO、count-only 与短缓冲不出队、DROP_NEWEST / DROP_OLDEST、
+  序号和 drop 统计、双缓冲 snapshot revision、owner 隔离与生命周期清理；另以生产/消费双线程交付
+  5000 条消息，在 `FULL/BUSY` 时重试并逐条断言 FIFO；
+- `tools/abi.ps1`：1586 条 Windows x64 ABI 记录一致；
+- loader smoke build：`src/loader.cpp + src/proxy.def` 成功链接，新增的字符/滚轮入口保持原导出序号。
+
+尚未写成“真机通过”：两实例交互、游戏快捷键消费、真实中文输入法候选窗/取消组合，以及
+仿真/渲染并发压力。最终中文提交路径接在 ImGui Unicode 注入入口；preedit 路径从游戏窗口的
+`WM_IME_*` 读取 `GCS_COMPSTR` 并交付 BEGIN/UPDATE/END，离线事件序列通过，但仍需真实输入法门禁。
+
+## 沙盒仿真器：存储家族与最后一批原版元件（2026-09-30，全部验证）
+
+上一轮的盘点说还剩 19 个内置 kind 进不了 simcore 的网表（
+[research/simcore-kind-coverage.md](research/simcore-kind-coverage.md) §4）。这一轮把三组测量一次
+做完，依据是**游戏自己编译出来的程序**（`TC_MODLOADER_DUMP_SOURCE=1`），不是黑盒扫输入输出。
+
+**已验（离线，器件与网表）**：`simcore/tests/simcore-tests.cpp` 新增两组用例，`simcore.ps1`
+**357/357**、`view-tests.ps1` **188/188**：
+
+- `testStorageFamily()`：一块合成板，寄存器 `0x27`（enable 在 (-3,-1)、数据在 (-3,0)）、
+  计数器 `0x26`（reset 在 (-3,-1)）、延迟线 `0x37`（数据在 (-3,0)）。断言三件事：
+  几何按原型表的隐藏列表接通、三者各自成为器件、以及**时序**——寄存器在 enable 低时保持、
+  该锁存的那一拍才变；延迟线晚一拍；计数器每个周期加一、reset 归零。它还断言
+  `BuildResult::cycle_token` 确实被创建（存储件靠它每个周期锁存一次）。
+- `testWordSplitter()`：字宽 Splitter `0x2f`（"2n 位劈成两个 n 位"）把它解码成高/低两半，
+  未定输入位只污染自己那一半。
+
+**已验（离线，覆盖率工具）**：`python tools/kind-coverage.py` 现在报
+`MISSING from simcore: 1`，唯一剩下的 `0x50` 有理由登记在案——**游戏自己拒绝放置它**
+（`kind-oracle` 返回 `place state=4 result=-6`），因此它不可能出现在任何棋盘上。
+
+**已验（真机，隔离沙盒）**：`tests/sandbox-storage-playtest.ps1`（目录条目 `sandbox-storage`）。
+它用 `tools/kind-fixture.py --standalone` 写一块"常量 `0x2e` 驱动寄存器 + 计数器 + 延迟线"的板子，
+部署成沙盒关卡，然后断言加载器**不再拒绝**并且绑定的器件清单里三个都在：
+
+```text
+sandbox-sim: bound board -> nets=2 devices=4 sources=0 observed=0 cycles=0
+sandbox-sim: devices -> u2_0_register, u3_2_counter, u4_1_delay, u1_constant
+PASS sandbox storage: the constant, register, counter and delay line become four devices
+```
+
+对照：这一步之前，同一块板子会被整块拒绝，原话是
+
+```text
+sandbox-sim: cannot run this board: component 3 (Counter) has 2/1 pins in its record but the prototype has 0/1
+```
+
+——记录算的是**总数**（含隐藏脚），这正是这一轮把 `KindPins` 拆成
+`input_count`（总数）与 `declared_inputs`（声明数）的原因。
+
+**这一轮没量到、并且写清楚的**（§7.5）：`0x5a` Static Value 的"值"存在哪个字段仍是开放问题；
+`0x57` Halt 在沙盒里按观察者处理（沙盒没有"停"这个概念）；`0x29`/`0x3b` 关卡地图件要跟随关卡
+值，得先有"关卡值"这一层，当前输出恒 0；查看器的冻结几何表还没带上隐藏脚（查看器侧的下一件）。
+
+## 沙盒仿真器：自定义元件（kind 0x4E）（2026-09-30，全部验证）
+
+**已验（真机，玩家自己的板子）**：`tests/sandbox-custom-playtest.ps1`（目录条目
+`sandbox-custom`）。它把玩家存档里的 `schematics/architecture/Symphony/circuit.data`
+（含 `Symphony/DEC`、`ALU`、`cond`、`count`、`ADDRDECODER-3` 五种自制元件）与
+`schematics/foundry/**` 复制进隔离存档，进沙盒跑一次。同一块板子在这一轮之前是
+
+```text
+sandbox-sim: cannot run this board: component 7 has kind 0x4E with no pin geometry
+```
+
+（`Symphony/DEC` 是 1 进 7 出，而几何回调的上限是 8 进 4 出。）现在它是：
+
+```text
+sandbox-sim: bound board -> nets=130 devices=103 sources=3 observed=3 cycles=0
+sandbox-sim: devices -> u3_load32, …, u147_wordsplit32, u140_screen, …
+PASS sandbox custom components: the player's board with foundry components binds
+```
+
+**已验（离线）**：`simcore` **358/358**、`simcore-view` **188/188**；新增
+`tools/definition-layout.py` 用来复核定义数组里的字段偏移，`tests/custom-prototype-probe.cpp`
+把自定义原型与它的两个定义数组整块 dump 出来（只读）。
+
+**机制**：在构建网表之前展平——读自定义原型的组件数组（`+0xe0`/`+0xe8`）与导线数组
+（`+0x100`/`+0x108`，元素格式与棋盘记录相同，元素起点在指针 `+8`），把内部件与内部线整体
+平移到远端坐标，按序号把定义的边界脚接到实例的引脚上；内部网用宿主没有的状态槽，
+因此不会被写回。测量、布局表与"还没做"的部分见
+[research/custom-components.md](research/custom-components.md)。
+
+**回归**：`sandbox-storage`、`sandbox-sim`、`sandbox-sim-ring` 三条真机用例在改动后复跑仍全绿。
+
+**未验证**：展平后的**数值**与游戏逐周期一致（本轮证明的是"能建表、能跑"）；Mod 注册的
+原生元件（`local.float-ops` 这类，行为是 C++ 回调而不是电路）仍按未知件报出。

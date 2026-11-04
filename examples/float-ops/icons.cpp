@@ -323,14 +323,12 @@ int main(int argc, char** argv) {
             if (!renderIcon(*family, id, path)) status = 1;
             else std::printf("icon %s\n", path);
         };
-        emit(floatops::kConstantId);
-        emit(floatops::kAddId);
-        emit(floatops::kDisplayId);
-        const floatops::internals::CatalogueType* catalogue =
-            floatops::internals::kCatalogue;
-        const size_t count = sizeof(floatops::internals::kCatalogue) /
-                             sizeof(floatops::internals::kCatalogue[0]);
-        for (size_t index = 0; index < count; ++index) emit(catalogue[index].info.id);
+        /* Every type the Mod registers, from the one table: the three that
+           shipped first are rows of it now, and the widths tripled them. */
+        const std::vector<floatops::internals::CatalogueType>& catalogue =
+            floatops::internals::catalogueStore().types;
+        for (const floatops::internals::CatalogueType& type : catalogue)
+            emit(type.info.id);
     }
     Gdiplus::GdiplusShutdown(token);
     return status;

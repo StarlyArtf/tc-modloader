@@ -15,22 +15,28 @@
 #include "../examples/byte-adder/plugin.cpp"
 #undef tc_mod_load
 
+#include <array>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+#include "jit-code-dump.hpp"
 
 #include "../sdk/tc_component_types.h"
 #include "../sdk/tc_component_instances.h"
 #include "../sdk/tc_component_storage.h"
+#include "../sdk/tc_component_geometry.h"
+#include "../sdk/tc_component_render.h"
+#include "../sdk/tc_command_api.h"
 
 /* ---------------------------------------------------------------------------
    Wide definitions: how many pins will the game's importer actually take?
 
-   The bridge's own limit is eight pins per direction (its payload is two 64-bit
-   words, so the *total* input width is what really caps packing), but that says
-   nothing about the game.  A definition with more pins is built here byte by
+   Callback inputs now follow the game's measured 32-pin boundary through staged
+   payloads.  A definition with more pins is still built here byte by
    byte - the same v14 layout src/component_definition.hpp writes, minus its
    eight-pin guard - and imported with the mod's own component model, so the
    answer is the importer's, not ours.  See docs/research/custom-component-pins.md.
@@ -141,16 +147,25 @@ static int (*realRegister)(void*, const TCNativeComponentDefinition*);
 constexpr uint64_t kSourceId = 0x535243305F303031ULL;  /* "SRC0_001" */
 constexpr uint64_t kSinkId = 0x534E4B305F303031ULL;    /* "SNK0_001" */
 constexpr uint64_t kWide9Id = 0x574944395F303031ULL;   /* "WID9_001" */
+constexpr uint64_t kWide2048Id = 0x57323034385F3031ULL; /* "W2048_01" */
+constexpr uint64_t kWideSourceId = 0x5736345352433031ULL; /* "W64SRC01" */
 
 static std::atomic<int> sourceCalls{0};
 static std::atomic<int> sinkCalls{0};
 static std::atomic<int> wide9Calls{0};
+static std::atomic<int> wide2048Calls{0};
+static std::atomic<int> wide9Rotations{0};
+static std::atomic<int> wide9Moves{0};
+static std::atomic<int> wide9Resizes{0};
 static std::atomic<int64_t> sourceLastCycle{-2};
 static std::atomic<int64_t> sinkLastCycle{-2};
 static std::atomic<int64_t> wide9LastCycle{-2};
+static std::atomic<int64_t> wide2048LastCycle{-2};
 static void (*wrappedFrame)(void*, const TCFrame*) = nullptr;
 static bool tookOver = false;
 static int64_t probeTarget = 0;
+static bool benchmarkUncapped = false;
+static bool benchmarkSubmitted = false;
 
 /* Once a second: where the level runner actually is.  "The callback ran once
    and then nothing" reads very differently from "the simulation never left
@@ -175,6 +190,245 @@ static std::string describeInstances(tc::component_instances::Api& api,
                                      tc::component_instances::Handle* kept, int keep);
 static int wide9BoardIndex(int ordinal);
 
+/* ---- placement lifecycle: the input the probe drives ----------------------
+
+   TC_LOGIC_MOVE is the player's own drag, so the probe does what a player does:
+   it finds the game window, asks the game where a cell is on screen and drags
+   the component.  TC_LOGIC_ROTATE depends on whatever input this build uses to
+   rotate a component; the probe tries the candidates in order and the log says
+   which one the game acted on (the poll only fires when the record's direction
+   byte really changed). */
+struct ProbePoint { float x, y; };
+using ProbeWorldToScreen = ProbePoint (*)(ProbePoint);
+static ProbeWorldToScreen probeWorldToScreen = nullptr;
+static HWND probeWindow = nullptr;
+static float probeScaleX = 1.f, probeScaleY = 1.f;
+static int probeClientWidth = 0, probeClientHeight = 0;
+static bool probeInputArmed = false;
+static int probeMovePhase = 0;
+static uint64_t probeMoveInstance = 0;
+static tc::component_geometry::ApiV2 probeGeometryV2{};
+static bool probeGeometryReady = false;
+static bool probeResizePending = false;
+static int probeResizeStatus = -99;
+static int probeResizeCount = 0;
+/* Where the second instance is on screen, taken from its own render frame: the
+   frame the host hands a Mod already carries the board-to-screen transform, so
+   the drag does not have to re-derive it. */
+static float probeSecondX = 0.f, probeSecondY = 0.f, probeSecondUnit = 0.f;
+static bool probeSecondSeen = false;
+static float probeMoveStartX = 0.f, probeMoveStartY = 0.f;
+static bool probeStopRequested = false;
+/* The board's own input path reads ImGui's IO, which is also what the hitbox
+   probes inject into; posted window messages move the pointer but are not what
+   the board's drag logic samples. */
+static void* (*probeGetIo)() = nullptr;
+static void (*probeAddMousePos)(void*, float, float) = nullptr;
+static void (*probeAddMouseButton)(void*, int, bool) = nullptr;
+static LPARAM probeLastClient = 0;
+/* The render callback is the one place the host hands out a live game handle for
+   an instance, so that is where the per-instance footprint change is made. */
+static void probeRenderCallback(void*, const TCComponentRenderFrameV1* frame) {
+    if (!frame) return;
+    if (!secondHandle.instance_id || frame->instance_id != secondHandle.instance_id) return;
+    probeSecondX = frame->origin_x;
+    probeSecondY = frame->origin_y;
+    /* One board cell in screen pixels: the length of the frame's local x axis. */
+    probeSecondUnit = std::sqrt(frame->axis_x_x * frame->axis_x_x +
+                                frame->axis_x_y * frame->axis_x_y);
+    probeSecondSeen = probeSecondUnit > 1.f;
+    if (!probeResizePending || !probeGeometryReady) return;
+    probeResizeStatus = tc::component_geometry::setInstanceFootprint(
+        probeGeometryV2, frame->component, 3.f, 2.f);
+    probeResizePending = false;
+    ++probeResizeCount;
+    log("pin-shape: geometry instance resize=" + std::to_string(probeResizeStatus) +
+        " (half=3,2)");
+}
+
+static BOOL CALLBACK probeFindWindow(HWND candidate, LPARAM data) {
+    DWORD owner = 0;
+    GetWindowThreadProcessId(candidate, &owner);
+    if (owner != GetCurrentProcessId() || !IsWindowVisible(candidate)) return TRUE;
+    RECT rect{};
+    if (!GetClientRect(candidate, &rect) || rect.right < 320 || rect.bottom < 240) return TRUE;
+    *reinterpret_cast<HWND*>(data) = candidate;
+    return FALSE;
+}
+static void armProbeInput() {
+    if (probeInputArmed) return;
+    probeInputArmed = true;
+    EnumWindows(&probeFindWindow, reinterpret_cast<LPARAM>(&probeWindow));
+    if (probeWindow) {
+        SetWindowPos(probeWindow, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetForegroundWindow(probeWindow);
+    }
+    if (host->resolve_alias) {
+        void* transform = host->resolve_alias(host->context, "board.world_to_screen");
+        std::memcpy(&probeWorldToScreen, &transform, sizeof(transform));
+    }
+    auto getIo = reinterpret_cast<void* (*)()>(host->engine_proc(host->context, "igGetIO"));
+    probeGetIo = getIo;
+    void* addPosition = host->engine_proc(host->context, "ImGuiIO_AddMousePosEvent");
+    std::memcpy(&probeAddMousePos, &addPosition, sizeof(probeAddMousePos));
+    void* addButton = host->engine_proc(host->context, "ImGuiIO_AddMouseButtonEvent");
+    std::memcpy(&probeAddMouseButton, &addButton, sizeof(probeAddMouseButton));
+    int displayW = 0, displayH = 0;
+    if (getIo) {
+        const auto* io = static_cast<const unsigned char*>(getIo());
+        float display[2]{};
+        if (io) std::memcpy(display, io + 8, sizeof(display));
+        displayW = static_cast<int>(display[0]);
+        displayH = static_cast<int>(display[1]);
+    }
+    RECT client{};
+    if (probeWindow && GetClientRect(probeWindow, &client) && displayW > 1 && displayH > 1) {
+        probeClientWidth = client.right;
+        probeClientHeight = client.bottom;
+        probeScaleX = static_cast<float>(client.right) / static_cast<float>(displayW);
+        probeScaleY = static_cast<float>(client.bottom) / static_cast<float>(displayH);
+    }
+}
+static LPARAM probeClientPoint(float gameX, float gameY) {
+    const int clientX = static_cast<int>(gameX * probeScaleX);
+    const int clientY = static_cast<int>(gameY * probeScaleY);
+    POINT screen{clientX, clientY};
+    if (probeWindow) ClientToScreen(probeWindow, &screen);
+    SetCursorPos(screen.x, screen.y);
+    probeLastClient = MAKELPARAM(clientX, clientY);
+    return probeLastClient;
+}
+static void probePress(float gameX, float gameY) {
+    const LPARAM point = probeClientPoint(gameX, gameY);
+    PostMessageW(probeWindow, WM_MOUSEMOVE, 0, point);
+    Sleep(30);
+    PostMessageW(probeWindow, WM_LBUTTONDOWN, MK_LBUTTON, point);
+}
+static void probeDrag(float gameX, float gameY) {
+    PostMessageW(probeWindow, WM_MOUSEMOVE, MK_LBUTTON, probeClientPoint(gameX, gameY));
+}
+static void probeRelease(float gameX, float gameY) {
+    PostMessageW(probeWindow, WM_LBUTTONUP, 0, probeClientPoint(gameX, gameY));
+}
+static void probeKey(WORD virtualKey) {
+    const LPARAM data = static_cast<LPARAM>(MapVirtualKeyW(virtualKey, MAPVK_VK_TO_VSC) << 16);
+    PostMessageW(probeWindow, WM_KEYDOWN, virtualKey, data);
+    Sleep(40);
+    PostMessageW(probeWindow, WM_KEYUP, virtualKey, data);
+}
+static void probeWheel(float gameX, float gameY, int notches) {
+    const int clientX = static_cast<int>(gameX * probeScaleX);
+    const int clientY = static_cast<int>(gameY * probeScaleY);
+    POINT screen{clientX, clientY};
+    if (probeWindow) ClientToScreen(probeWindow, &screen);
+    SetCursorPos(screen.x, screen.y);
+    const WORD delta = static_cast<WORD>(notches > 0 ? WHEEL_DELTA : -WHEEL_DELTA);
+    for (int index = 0; index < std::abs(notches); ++index)
+        PostMessageW(probeWindow, WM_MOUSEWHEEL, MAKEWPARAM(0, delta),
+                     MAKELPARAM(screen.x, screen.y));
+}
+static void probeIoMove(float gameX, float gameY) {
+    /* Both halves at once: the real pointer (the board's own drag code reads the
+       system cursor) and ImGui's IO (what its widgets read).  The hitbox probes
+       found the same split - the cursor has to be pinned over the component and
+       the button state injected into the IO the game samples. */
+    if (probeWindow) probeClientPoint(gameX, gameY);
+    if (probeGetIo && probeAddMousePos) probeAddMousePos(probeGetIo(), gameX, gameY);
+}
+static void probeIoButton(bool down) {
+    if (probeWindow && probeAddMouseButton)
+        PostMessageW(probeWindow, down ? WM_LBUTTONDOWN : WM_LBUTTONUP,
+                     down ? MK_LBUTTON : 0, probeLastClient);
+    if (probeGetIo && probeAddMouseButton) probeAddMouseButton(probeGetIo(), 0, down);
+}
+
+/* The component handle of one instance, looked up the way every other board
+   reader does: capture the objects, then match the component's own id. */
+static bool probeComponentHandle(uint64_t instanceId, TCGameHandle* out) {
+    TCBoardApiV3 captureApi{};
+    TCBoardApiV4 boardApi{};
+    if (!host || !host->query_service || !out) {
+        log(std::string("pin-shape: geometry lookup unavailable (host=") +
+            (host ? "set" : "null") + " query=" +
+            (host && host->query_service ? "set" : "null") + " out=" +
+            (out ? "set" : "null") + ")");
+        return false;
+    }
+    if (host->query_service(host->context, TC_SERVICE_BOARD, TC_BOARD_API_VERSION_3,
+                            &captureApi, sizeof(captureApi)) != TC_SERVICE_OK) {
+        log("pin-shape: geometry board V3 unavailable");
+        return false;
+    }
+    if (host->query_service(host->context, TC_SERVICE_BOARD, TC_BOARD_API_VERSION_4,
+                            &boardApi, sizeof(boardApi)) != TC_SERVICE_OK) {
+        log("pin-shape: geometry board V4 unavailable");
+        return false;
+    }
+    TCGameHandle board{};
+    if (tc::currentGameHandle(host, TC_GAME_OBJECT_BOARD, &board) != TC_HANDLE_OK) {
+        log("pin-shape: geometry no current board handle");
+        return false;
+    }
+    TCBoardObjectSnapshotV1 snapshot{};
+    snapshot.size = sizeof(snapshot);
+    snapshot.version = TC_BOARD_OBJECT_SNAPSHOT_VERSION_1;
+    TCBoardObjectBuffersV1 buffers{};
+    buffers.size = sizeof(buffers);
+    buffers.version = TC_BOARD_OBJECT_SNAPSHOT_VERSION_1;
+    int status = tc::captureBoardObjects(&captureApi, &board, &snapshot, &buffers);
+    std::vector<TCGameHandle> handles;
+    if (status == TC_SNAPSHOT_ERR_CAPACITY || snapshot.component_count) {
+        handles.assign(static_cast<size_t>(snapshot.component_count), TCGameHandle{});
+        buffers.components = handles.data();
+        buffers.component_capacity = handles.size();
+        status = tc::captureBoardObjects(&captureApi, &board, &snapshot, &buffers);
+    }
+    if (status != TC_SNAPSHOT_OK) {
+        log("pin-shape: geometry capture failed status=" + std::to_string(status) +
+            " count=" + std::to_string(snapshot.component_count) +
+            " written=" + std::to_string(snapshot.component_written));
+        return false;
+    }
+    if (!snapshot.component_written)
+        log("pin-shape: geometry capture returned no components (status=" +
+            std::to_string(status) + " count=" + std::to_string(snapshot.component_count) + ")");
+    for (uint64_t index = 0; index < snapshot.component_written; ++index) {
+        TCComponentInfoV1 info{};
+        info.size = sizeof(info);
+        if (tc::readComponent(&boardApi, &handles[index], &info) != TC_SNAPSHOT_OK) continue;
+        if (info.id == instanceId)
+            log("pin-shape: geometry found instance " + std::to_string(instanceId) +
+                " at " + std::to_string(info.x) + "," + std::to_string(info.y));
+        if (info.id != instanceId) continue;
+        *out = handles[index];
+        return true;
+    }
+    return false;
+}
+/* Where an instance's cell is on screen, and how many pixels one board cell is
+   worth (sampled from the game's own transform, so the drag moves whole cells). */
+static bool probeComponentPoint(uint64_t instanceId, float* outX, float* outY, float* unit) {
+    if (!probeWorldToScreen || !probeWindow) return false;
+    TCGameHandle component{};
+    if (!probeComponentHandle(instanceId, &component)) return false;
+    TCBoardApiV4 boardApi{};
+    if (host->query_service(host->context, TC_SERVICE_BOARD, TC_BOARD_API_VERSION_4,
+                            &boardApi, sizeof(boardApi)) != TC_SERVICE_OK)
+        return false;
+    TCComponentInfoV1 info{};
+    info.size = sizeof(info);
+    if (tc::readComponent(&boardApi, &component, &info) != TC_SNAPSHOT_OK) return false;
+    const ProbePoint here = probeWorldToScreen(ProbePoint{static_cast<float>(info.x),
+                                                          static_cast<float>(info.y)});
+    const ProbePoint next = probeWorldToScreen(ProbePoint{static_cast<float>(info.x) + 1.f,
+                                                          static_cast<float>(info.y)});
+    const float displayW = probeScaleX > 0.f ? probeClientWidth / probeScaleX : 0.f;
+    *outX = here.x * displayW;
+    *outY = here.y * (probeScaleY > 0.f ? probeClientHeight / probeScaleY : 0.f);
+    *unit = (next.x - here.x) * displayW;
+    return *unit > 1.f;
+}
+
 static void watchFrame(void* user, const TCFrame* frame) {
     static double last = 0;
     if (wrappedFrame) wrappedFrame(user, frame);
@@ -189,11 +443,30 @@ static void watchFrame(void* user, const TCFrame* frame) {
     if (autotestDone || autotestElapsed > 14.0) {
         if (!tookOver) {
             tookOver = true;
-            probeTarget = mod.simulation.cycle() + 12;
+            int64_t extraCycles = 12;
+            if (const char* requested = std::getenv("TC_PIN_SHAPE_BENCHMARK_CYCLES")) {
+                char* end = nullptr;
+                const long long parsed = std::strtoll(requested, &end, 10);
+                if (end != requested && parsed > extraCycles) {
+                    extraCycles = parsed;
+                    benchmarkUncapped = true;
+                }
+            }
+            probeTarget = mod.simulation.cycle() + extraCycles;
             log("pin-shape: probe takes over the run up to cycle=" + std::to_string(probeTarget));
         }
-        if (mod.simulation.cycle() < probeTarget)
+        // Benchmark fixtures may carry the default slow speed. Key 2 is
+        // ctl_cycle_speed_ms in the game's generated CommandIndex enum.
+        if (benchmarkUncapped) mod.simulation.setCommandSetting(2, 1000000000000LL);
+        static const bool benchmarkOnce=[] {
+            const char* value=std::getenv("TC_PIN_SHAPE_BENCHMARK_ONCE");
+            return value && value[0]=='1';
+        }();
+        if (mod.simulation.cycle() < probeTarget &&
+            !(benchmarkUncapped && benchmarkOnce && benchmarkSubmitted)) {
             mod.simulation.run(autotestModel, probeTarget);
+            benchmarkSubmitted=true;
+        }
     }
     /* The instance walk: two instances are on the board, one is reset (only it
        may change), one is deleted, and the handle it left behind must be
@@ -273,8 +546,120 @@ static void watchFrame(void* user, const TCFrame* frame) {
                 log("pin-shape: instances second instance never bound (" +
                     std::to_string(written) + " of " + std::to_string(total) + ")");
             }
-            instancesStage = 1;
+            /* The instance's own rectangle: tc.component.geometry V2 changes it
+               for this one instance, and the type hears TC_LOGIC_RESIZE. */
+            if (probeGeometryReady && secondHandle.instance_id) {
+                /* The resize itself happens in the render callback, which is the
+                   one place a live game handle for the instance is handed out. */
+                probeResizePending = true;
+                log("pin-shape: geometry resize requested for the second instance");
+            } else {
+                log("pin-shape: geometry V2 unavailable; resize not driven");
+            }
+            armProbeInput();
+            probeMoveInstance = secondHandle.instance_id;
+            probeMovePhase = 0;
+            instancesStage = 4;
             instancesStageAt = now;
+        } else if (instancesStage == 4 && now > instancesStageAt + 0.6) {
+            /* The player's own move gesture: press on the component, drag it two
+               cells to the right, release.  The host's per-frame reading of the
+               board record turns that into TC_LOGIC_MOVE. */
+            float x = 0.f, y = 0.f, unit = 0.f;
+            if (probeMovePhase == 0) {
+                /* A player edits a paused board: the game's own input handler
+                   ignores pointer work while the simulation is running, so the
+                   probe asks the command bus for a stop first. */
+                if (!probeStopRequested) {
+                    probeStopRequested = true;
+                    TCGameHandle board{};
+                    TCCommandApiV2 commands{};
+                    if (tc::currentGameHandle(host, TC_GAME_OBJECT_BOARD, &board) == TC_HANDLE_OK &&
+                        host->query_service(host->context, TC_SERVICE_COMMANDS,
+                                            TC_COMMAND_API_VERSION_2, &commands,
+                                            sizeof(commands)) == TC_SERVICE_OK) {
+                        TCCommandV2 stop{};
+                        stop.size = sizeof(stop);
+                        stop.type = TC_COMMAND_SIM_STOP;
+                        stop.subject = board;
+                        uint64_t request = 0;
+                        const int submitted = commands.submit(commands.context, &stop, &request);
+                        log("pin-shape: moving after a SIM_STOP request, submit=" +
+                            std::to_string(submitted));
+                    } else {
+                        log("pin-shape: moving without a SIM_STOP request");
+                    }
+                    instancesStageAt = now;
+                    return;
+                }
+                if (!probeSecondSeen) {
+                    log("pin-shape: move skipped (no component point)");
+                    instancesStage = 1;
+                    instancesStageAt = now;
+                    return;
+                }
+                x = probeSecondX;
+                y = probeSecondY;
+                unit = probeSecondUnit;
+                log("pin-shape: moving instance at " + std::to_string((int)x) + "," +
+                    std::to_string((int)y) + " by two cells (unit=" +
+                    std::to_string(unit) + ")");
+                /* Hover first, then press - the board's own drag path needs to
+                   see the pointer over the component before the button goes
+                   down. */
+                probeIoMove(x, y);
+                probeMoveStartX = x;
+                probeMoveStartY = y;
+                /* A click first: the game moves the component the player has
+                   selected, and a synthetic press that never selects it is just
+                   a miss. */
+                probeIoButton(true);
+                probeMovePhase = 8;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 8) {
+                probeIoButton(false);
+                probeMovePhase = 9;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 9) {
+                probeIoMove(x, y);
+                probeMovePhase = 1;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 1) {
+                probeIoButton(true);
+                probeMovePhase = 2;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 2) {
+                probeIoMove(x + unit * 0.5f, y);
+                probeMovePhase = 3;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 3) {
+                probeIoMove(x + unit, y);
+                probeMovePhase = 4;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 4) {
+                probeIoMove(x + unit * 1.5f, y);
+                probeMovePhase = 5;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 5) {
+                probeIoMove(x + unit * 2.f, y);
+                probeMovePhase = 6;
+                instancesStageAt = now;
+            } else if (probeMovePhase == 6) {
+                probeIoButton(false);
+                probeMovePhase = 7;
+                instancesStageAt = now;
+            } else {
+                log("pin-shape: instances moves=" + std::to_string(wide9Moves.load()) +
+                    " rotations=" + std::to_string(wide9Rotations.load()) +
+                    " screen=" + std::to_string((int)probeSecondX) + "," +
+                    std::to_string((int)probeSecondY) + " (dragged from " +
+                    std::to_string((int)probeMoveStartX) + "," +
+                    std::to_string((int)probeMoveStartY) + "); a synthetic board drag is " +
+                    "not acted on by this build (see docs/research/component-hitbox-path.md), " +
+                    "so the move/rotate gate stays open");
+                instancesStage = 1;
+                instancesStageAt = now;
+            }
         } else if (instancesStage == 1 && now > instancesStageAt + 1.5) {
             const int index = wide9BoardIndex(0);
             const bool removed = deleteComponent && autotestModel && index >= 0
@@ -295,6 +680,52 @@ static void watchFrame(void* user, const TCFrame* frame) {
                 std::to_string(tc::component_instances::validate(instances, forged)) +
                 " (both " + std::to_string(TC_COMPONENT_INSTANCES_ERR_STALE) + " = stale)");
             log("pin-shape: instances stage done");
+            instancesStage = 5;
+            instancesStageAt = now;
+        } else if (instancesStage == 5 && now > instancesStageAt + 1.2) {
+            /* Which input rotates a component in this build?  The probe tries the
+               candidates and reports how many rotations each produced - the poll
+               only fires when the record's direction byte really changed. */
+            static int rotateStep = 0;
+            const float x = probeSecondX, y = probeSecondY;
+            const int before = wide9Rotations.load();
+            if (rotateStep == 0 && probeSecondSeen) {
+                probeKey('R');
+                log("pin-shape: rotate candidate R produced " +
+                    std::to_string(wide9Rotations.load() - before));
+                rotateStep = 1;
+                instancesStageAt = now;
+            } else if (rotateStep == 1 && probeSecondSeen) {
+                probeWheel(x, y, -1);
+                log("pin-shape: rotate candidate wheel produced " +
+                    std::to_string(wide9Rotations.load() - before));
+                rotateStep = 2;
+                instancesStageAt = now;
+            } else {
+                /* Leaving the board is the other half of the lifecycle: the
+                   instances are not deleted, their bindings are dropped, and that
+                   is TC_LOGIC_UNBIND. */
+                using LoadLevel = void (*)(void*, const tc::TCNimString*);
+                auto loadLevel = reinterpret_cast<LoadLevel>(host->resolve_symbol(
+                    host->context, "load_level__modelZutilities_u7740"));
+                if (loadLevel && mod.game.raw_new_string) {
+                    tc::TCNimString name{};
+                    const std::string target = "sandbox";
+                    mod.game.raw_new_string(&name, static_cast<int64_t>(target.size()));
+                    name.length = target.size();
+                    std::memcpy(static_cast<unsigned char*>(name.data) + 8, target.c_str(),
+                                target.size());
+                    static_cast<unsigned char*>(name.data)[8 + target.size()] = 0;
+                    loadLevel(autotestModel, &name);
+                    log("pin-shape: leaving the board for " + target);
+                } else {
+                    log("pin-shape: could not load another level for the unbind case");
+                }
+                instancesStage = 6;
+                instancesStageAt = now;
+            }
+        } else if (instancesStage == 6 && now > instancesStageAt + 2.0) {
+            log("pin-shape: instances placement stage done");
             instancesStage = 3;
         }
     }
@@ -372,6 +803,30 @@ static void wide9Callback(TCLogicIOV2* io) {
     if (io->state && io->state_words) io->state[0] = io->state[0] + 1;
 }
 
+/* Maximum staged input shape: input 31 is driven by a known 64-bit source while
+   the first 31 pins are unconnected.  Seeing that last word intact proves data
+   beyond the direct 128-bit payload crossed the 16-call staging sequence. */
+static void wide2048Callback(TCLogicIOV2* io) {
+    if (io->outputs && io->output_count) io->outputs[0] = 0;
+    if (io->phase != TC_LOGIC_CYCLE) return;
+    const int calls = wide2048Calls.fetch_add(1) + 1;
+    if (io->cycle == wide2048LastCycle.exchange(io->cycle)) return;
+    uint32_t nonzero = 0;
+    for (uint32_t i = 0; io->inputs && i < io->input_count; ++i)
+        if (io->inputs[i]) ++nonzero;
+    log("pin-shape: wide2048 cycle=" + std::to_string(io->cycle) +
+        " inputs=" + std::to_string(io->input_count) +
+        " nonzero=" + std::to_string(nonzero) +
+        " first=" + std::to_string(io->inputs && io->input_count ? io->inputs[0] : 0) +
+        " last=" + std::to_string(io->inputs && io->input_count ? io->inputs[io->input_count - 1] : 0) +
+        " calls=" + std::to_string(calls));
+}
+
+static void wideSourceCallback(TCLogicIOV2* io) {
+    if (io->outputs && io->output_count)
+        io->outputs[0] = 0x0123456789abcdefULL;
+}
+
 /* Registers the nine-input shape through the V2 service (not through
    register_component, whose callback struct carries eight pins). */
 /* Lifecycle: the host announces an instance when it first binds it and before
@@ -387,10 +842,46 @@ static void wide9Destroy(TCLogicIOV2* io) {
         " phase=" + std::to_string(io->phase) +
         " state=" + std::to_string(io->state && io->state_words ? io->state[0] : 0));
 }
-static const TCComponentLifecycleV1 wide9Lifecycle = {
-    sizeof(TCComponentLifecycleV1), TC_COMPONENT_LIFECYCLE_VERSION_1,
-    &wide9Create, &wide9Destroy
-};
+/* The placement tail of TCLogicIOV2 (2026-09-28): where the instance sits, which
+   way it points and how big it is.  Move / rotate / resize are board edits the
+   player (or the host) performed, and the three callbacks read the new values
+   from that tail.  The tail is gated by `size`, so an older loader's IO simply
+   does not carry it. */
+static void logPlacement(const char* what, TCLogicIOV2* io) {
+    const bool tail = io && io->size >= offsetof(TCLogicIOV2, half_height) +
+                                      sizeof(io->half_height);
+    log(std::string("pin-shape: wide9 ") + what + " instance=" +
+        std::to_string(io ? io->instance_id : 0) +
+        (tail ? " cell=" + std::to_string(io->cell_x) + "," + std::to_string(io->cell_y) +
+                    " rotation=" + std::to_string(io->rotation) +
+                    " half=" + std::to_string(io->half_width) + "," +
+                    std::to_string(io->half_height)
+              : std::string(" (no placement tail)")));
+}
+static void wide9Move(TCLogicIOV2* io) { ++wide9Moves; logPlacement("on_move", io); }
+static void wide9Rotate(TCLogicIOV2* io) { ++wide9Rotations; logPlacement("on_rotate", io); }
+static void wide9Resize(TCLogicIOV2* io) { ++wide9Resizes; logPlacement("on_resize", io); }
+static void wide9Compile(TCLogicIOV2* io) {
+    log("pin-shape: wide9 on_compile instance=" + std::to_string(io->instance_id) +
+        " phase=" + std::to_string(io->phase));
+}
+static void wide9Unbind(TCLogicIOV2* io) {
+    log("pin-shape: wide9 on_unbind instance=" + std::to_string(io->instance_id) +
+        " phase=" + std::to_string(io->phase));
+}
+static const TCComponentLifecycleV1 wide9Lifecycle = [] {
+    TCComponentLifecycleV1 value{};
+    value.size = sizeof(value);
+    value.version = TC_COMPONENT_LIFECYCLE_VERSION_1;
+    value.on_create = &wide9Create;
+    value.on_destroy = &wide9Destroy;
+    value.on_move = &wide9Move;
+    value.on_rotate = &wide9Rotate;
+    value.on_resize = &wide9Resize;
+    value.on_compile = &wide9Compile;
+    value.on_unbind = &wide9Unbind;
+    return value;
+}();
 static const uint8_t wide9DefaultConfig[4] = {7, 2, 3, 4};
 
 static void registerWide9(const TCHost* h) {
@@ -423,6 +914,130 @@ static void registerWide9(const TCHost* h) {
     const int result = tc::component_types::registerDefinition(types, &definition);
     log("pin-shape: wide9 V2 registration (9in/1out) -> " + std::to_string(result) +
         " (" + tc::component_types::errorText(result) + ")");
+}
+
+/* ---- clocked: exact output cones plus one hidden tick ---------------------
+
+   The visible drivers run independently in REFRESH from their declared input
+   cones.  A hidden sink sees the complete input tuple and performs the sole
+   CYCLE call, so state advances once without adding an edge back to any public
+   output.
+
+   This shape is the full_adder board's (three inputs, two outputs), and the
+   callback is a real adder, so the level passes only if every output reaches
+   the board: the tick has to deliver all three inputs (the callback logs the
+   clock it saw) and the carry has to be read back from it.  The state word is a
+   pure call counter, so "one tick per cycle" is a number in the log: a second
+   call per cycle would advance it twice. */
+constexpr uint64_t kClockedId = 0x414444525F303031ULL;   /* the full_adder board */
+std::atomic<uint64_t> clockedCalls{0};
+std::atomic<int64_t> clockedLastCycle{-1};
+
+static void clockedCallback(TCLogicIOV3* io) {
+    if (io->phase == TC_LOGIC_RESET) {
+        if (io->state && io->state_words) io->state[0] = 0;
+        if (io->outputs && io->output_count >= 2) {
+            io->outputs[0] = {0, 1}; io->outputs[1] = {0, 1};
+        }
+        clockedCalls.store(0);
+        clockedLastCycle.store(-1);
+        log("pin-shape: clocked reset instance=" + std::to_string(io->instance_id));
+        return;
+    }
+    const uint64_t clk = io->inputs ? (io->inputs[0].value & 1) : 0;
+    const uint64_t total = io->inputs ? ((io->inputs[0].value & 1) +
+                                         (io->inputs[1].value & 1) +
+                                         (io->inputs[2].value & 1)) : 0;
+    if (io->outputs && io->output_count >= 2) {
+        io->outputs[0] = {total & 1, 1};
+        io->outputs[1] = {(total >> 1) & 1, 1};
+    }
+    /* Refresh runs against a state copy and must not advance anything; only the
+       cycle phase is the tick. */
+    if (io->phase != TC_LOGIC_CYCLE) return;
+    const uint64_t calls = clockedCalls.fetch_add(1) + 1;
+    uint64_t state = 0;
+    if (io->state && io->state_words) {
+        state = ++io->state[0];
+    }
+    if (io->cycle != clockedLastCycle.exchange(io->cycle)) {
+        log("pin-shape: clocked cycle=" + std::to_string(io->cycle) +
+            " calls=" + std::to_string(calls) +
+            " state=" + std::to_string(state) +
+            " clk=" + std::to_string(clk));
+    }
+}
+
+static void registerClocked(const TCHost* h) {
+    tc::component_types::ApiV2 types{};
+    if (!tc::component_types::tableV2(h, &types)) {
+        log("pin-shape: tc.component.types unavailable; clocked not registered");
+        return;
+    }
+    static const TCComponentPinV2 ins[3] = {
+        {"clk","Clock",1,0}, {"a","A",1,0}, {"b","B",1,0}};
+    static const TCComponentPinV2 outs[2] = {{"sum","Sum",1,0}, {"carry","Carry",1,0}};
+    TCComponentTypeDefinitionV3 definition{};
+    definition.size = sizeof(definition);
+    definition.version = TC_COMPONENT_TYPES_VERSION_3;
+    definition.custom_id = kClockedId;
+    definition.type_id = "dev.pin-shape-probe/clocked";
+    definition.name = "Pin shape clocked";
+    definition.description = "clocked adder: one tick per cycle";
+    definition.inputs = ins; definition.input_count = 3;
+    definition.outputs = outs; definition.output_count = 2;
+    definition.state_words = 4;
+    definition.gate_cost = 1; definition.delay = 1;
+    definition.callback = &clockedCallback;
+    static const uint32_t dependencies[2] = {0x7u, 0x7u};
+    definition.flags = TC_COMPONENT_TYPE_OUTPUT_DEPENDENCIES |
+                       TC_COMPONENT_TYPE_CLOCKED_TICK;
+    definition.output_dependencies = dependencies;
+    definition.output_dependency_count = 2;
+    const int result = tc::component_types::registerDefinitionV3(types, &definition);
+    log("pin-shape: clocked V3 registration (3in/2out, one tick per cycle) -> " +
+        std::to_string(result) + " (" + tc::component_types::errorText(result) + ")");
+}
+
+static void registerWide2048(const TCHost* h) {
+    tc::component_types::Api types{};
+    if (!tc::component_types::table(h, &types)) {
+        log("pin-shape: tc.component.types unavailable; wide2048 not registered");
+        return;
+    }
+    static const TCComponentPinV2 sourceOut[1] = {{"out","Output",64,0}};
+    TCComponentTypeDefinitionV2 source{};
+    source.size = sizeof(source); source.version = TC_COMPONENT_TYPES_VERSION_2;
+    source.custom_id = kWideSourceId; source.type_id = "dev.pin-shape-probe/wide64-source";
+    source.name = "Pin shape wide64 source"; source.description = "Known 64-bit source";
+    source.outputs = sourceOut; source.output_count = 1;
+    source.gate_cost = 1; source.delay = 1; source.callback = &wideSourceCallback;
+    const int sourceResult = tc::component_types::registerDefinition(types, &source);
+    log("pin-shape: wide64 source registration (0in/64out) -> " +
+        std::to_string(sourceResult) + " (" + tc::component_types::errorText(sourceResult) + ")");
+
+    std::array<std::string,32> ids{}, labels{};
+    std::array<TCComponentPinV2,32> ins{};
+    for (uint32_t i = 0; i < ins.size(); ++i) {
+        ids[i] = "in" + std::to_string(i);
+        labels[i] = "Input " + std::to_string(i);
+        ins[i] = {ids[i].c_str(), labels[i].c_str(), 64, 0};
+    }
+    static const TCComponentPinV2 outs[1] = {{"out","Output",1,0}};
+    TCComponentTypeDefinitionV2 definition{};
+    definition.size = sizeof(definition);
+    definition.version = TC_COMPONENT_TYPES_VERSION_2;
+    definition.custom_id = kWide2048Id;
+    definition.type_id = "dev.pin-shape-probe/wide2048";
+    definition.name = "Pin shape wide2048";
+    definition.description = "32 x 64-bit inputs, 1 output";
+    definition.inputs = ins.data(); definition.input_count = static_cast<uint32_t>(ins.size());
+    definition.outputs = outs; definition.output_count = 1;
+    definition.gate_cost = 1; definition.delay = 1;
+    definition.callback = &wide2048Callback;
+    const int result = tc::component_types::registerDefinition(types, &definition);
+    log("pin-shape: wide2048 V2 registration (32x64in/1out, 2048 bits) -> " +
+        std::to_string(result) + " (" + tc::component_types::errorText(result) + ")");
 }
 
 /* ---- instances: placement, queries, reset and destroy ---------------------
@@ -537,6 +1152,7 @@ static int registerShapes(void* context, const TCNativeComponentDefinition* sour
 
 extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     if (!h || !plugin) return 1;
+    if (jit_code_dump::install(h)!=0) return 1;
     probeHost = *h;
     realRegister = h->register_component;
     probeHost.register_component = &registerShapes;
@@ -545,12 +1161,23 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         wrappedFrame = plugin->on_frame;
         plugin->on_frame = &watchFrame;
     }
-    if (result == 0) registerWide9(h);
+    if (result == 0) { registerWide9(h); registerClocked(h); registerWide2048(h); }
     if (result == 0) {
         instancesReady = tc::component_instances::table(h, &instances);
         if (!instancesReady) log("pin-shape: tc.component.instances unavailable");
         componentStorageReady = tc::component_storage::table(h, &componentStorage);
         if (!componentStorageReady) log("pin-shape: tc.component.storage unavailable");
+        probeGeometryReady = tc::component_geometry::tableV2(h, &probeGeometryV2);
+        if (!probeGeometryReady) log("pin-shape: tc.component.geometry V2 unavailable");
+        tc::component_render::Api render{};
+        if (tc::component_render::table(h, &render)) {
+            const int callback = tc::component_render::setDrawCallback(
+                render, kWide9Id, &probeRenderCallback, nullptr);
+            if (callback != TC_COMPONENT_RENDER_OK)
+                log("pin-shape: render callback refused status=" + std::to_string(callback));
+        } else {
+            log("pin-shape: tc.component.render unavailable");
+        }
         addComponent = reinterpret_cast<AddComponent>(h->resolve_symbol(
             h->context, "add_component__presenterZutilitiesZhelper95functions_u5918"));
         deleteComponent = reinterpret_cast<DeleteComponent>(h->resolve_symbol(

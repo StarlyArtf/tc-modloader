@@ -243,6 +243,41 @@ inline Fixture busSplit() {
     return fixture;
 }
 
+/* The game's word Mux (kind 0x2a) as a circuit: four-bit A and B, a one-bit
+   select.  The select picks B when it is 1 (`campaign/byte_mux/test.si` is the
+   level that says so), and an unknown select still resolves the bit positions
+   the two branches agree on.  Both rows go through iverilog.
+
+   One delay for both edges on purpose: the sandbox's timing library is "one
+   constant per device" today, and iverilog picks a vector transition's delay
+   in a way this engine does not copy yet - see the note next to probe4. */
+inline Fixture muxWord() {
+    Fixture fixture;
+    fixture.name = "mux_word";
+    NetList& list = fixture.list;
+    const NetId select = list.addNet("sel");
+    const NetId a = list.addNet("a", 4);
+    const NetId b = list.addNet("b", 4);
+    const NetId y = list.addNet("y", 4);
+    const DeviceId mux = list.addDevice(&deviceMux(4, ArcDelay{5, 5}), "u_mux");
+    list.connect(mux, "S", select);
+    list.connect(mux, "A", a);
+    list.connect(mux, "B", b);
+    list.connect(mux, "Y", y);
+    fixture.stimulus = {
+        StimulusEntry{0, select, one("0")}, StimulusEntry{0, a, BitVector::fromText("1010", 4)},
+        StimulusEntry{0, b, BitVector::fromText("1100", 4)},
+        StimulusEntry{20, select, one("1")}, /* B */
+        StimulusEntry{40, select, one("x")}, /* A and B at once: only the agreeing bits survive */
+        StimulusEntry{40, b, BitVector::fromText("1110", 4)},
+        StimulusEntry{60, select, one("0")}, /* back to A */
+        StimulusEntry{80, a, BitVector::fromText("1111", 4)},
+        StimulusEntry{100, select, one("1")}, /* B again */
+    };
+    fixture.end = 140;
+    return fixture;
+}
+
 /* The ring again with every delay set to zero: the engine has to report an
    oscillation instead of spinning.  Nothing to hand to iverilog - it would
    spin as well. */
@@ -301,6 +336,7 @@ inline std::vector<Fixture> all() {
     fixtures.push_back(deltaChain());
     fixtures.push_back(dffShift());
     fixtures.push_back(busSplit());
+    fixtures.push_back(muxWord());
     fixtures.push_back(zeroDelayLoop());
     fixtures.push_back(selfLoop());
     return fixtures;

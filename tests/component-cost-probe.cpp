@@ -303,6 +303,16 @@ static void frame(void*, const TCFrame* value) {
         start_time = value->time_seconds;
     }
     current_time = value->time_seconds - start_time;
+    if (!model && !done) {
+        TCGameHandle board{};
+        board.size = sizeof(board);
+        const void* resolved = nullptr;
+        if (tc::currentGameHandle(host, TC_GAME_OBJECT_BOARD, &board) == TC_HANDLE_OK &&
+            tc::resolveGameHandle(host, &board, &resolved) == TC_HANDLE_OK && resolved) {
+            model = const_cast<void*>(resolved);
+            log("cost-probe: acquired board handle");
+        }
+    }
     if (done || !model || current_time < 5.0) return;
     if (stage == 0) {
         const char* text = level_name.c_str();
@@ -312,6 +322,7 @@ static void frame(void*, const TCFrame* value) {
         name.length = length;
         std::memcpy(static_cast<unsigned char*>(name.data) + 8, text, length);
         static_cast<unsigned char*>(name.data)[8 + length] = 0;
+        log("cost-probe: loading level " + level_name);
         load_level(model, &name);
         // Request the same asynchronous compilation consumed by the board UI.
         // load_level alone never refreshes its cached statistics.

@@ -261,8 +261,11 @@ void saveSchematic() {
     *loaded_level_global = level;
     const char* appdata = std::getenv("APPDATA");
     if (!appdata || !save_this_schematic || !get_command_setting) return;
+    const char* selected = std::getenv("TC_TEST_SAVE_PROFILE");
+    const std::string profile = selected && selected[0] ? selected : "default";
     const auto path = (std::filesystem::u8path(appdata) /
-        "Turing Complete Mods/profiles/default/schematics/not_gate/Default/circuit.data").generic_u8string();
+        "Turing Complete Mods/profiles" / profile /
+        "schematics/not_gate/Default/circuit.data").generic_u8string();
     tc::TCNimString target{};
     mod.game.raw_new_string(&target, static_cast<int64_t>(path.size()));
     target.length = path.size();
@@ -341,6 +344,16 @@ static void frame(void*, const TCFrame* value) {
         start_time = value->time_seconds;
     }
     current_time = value->time_seconds - start_time;
+    if (!model && !done) {
+        TCGameHandle board{};
+        board.size = sizeof(board);
+        const void* resolved = nullptr;
+        if (tc::currentGameHandle(host, TC_GAME_OBJECT_BOARD, &board) == TC_HANDLE_OK &&
+            tc::resolveGameHandle(host, &board, &resolved) == TC_HANDLE_OK && resolved) {
+            model = const_cast<void*>(resolved);
+            log("placeholder-probe: acquired board handle");
+        }
+    }
     if (done || !model || current_time < 5.0) return;
     if (!loaded_level) {
         const char* text = "not_gate";

@@ -267,9 +267,9 @@ cd D:\p\tc-modloader
 
 ## 已知风险与后续优化
 
-1. **高频读取目前加互斥锁。** `tc_dynamic_constant` 每次读取都会锁 `dynamicConstantMutex`。若关卡内
-   的模拟吞吐明显下降，应把 map 的值改为地址稳定的 `std::atomic<uint64_t>` 槽，并在线程本地缓存
-   `componentId -> slot*`；setter 很低频，允许只在建槽时加锁。这个优化尚未实现。
+1. ~~**高频读取目前加互斥锁。**~~ **已修（2026-10-06）**：map 的值已经改成地址稳定且不删除的
+   `std::atomic<uint64_t>` 槽；模拟线程缓存最近一次 `componentId -> slot*`，常见的单常量逐拍路径
+   只做 relaxed atomic load。setter 只在首次建槽时获取 map 锁，既有导出和实时更新语义不变。
 2. **运行时 map 暂不清理。** 元件 id 是 64 位唯一值，当前只会逐渐累积。正常会话规模很小，但长期
    频繁换关后可在仿真 reset/board unload 时清理；清理前要先解决 JIT 并发与悬挂指针语义。
 3. **只改 9–64 位常量。** 8 位及以下故意留给原版纸带；超过 64 位当前 UI 与 bridge 都不支持。

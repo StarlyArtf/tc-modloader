@@ -43,6 +43,7 @@ struct RuntimeConfig {
     bool rotate_pins = true;
     bool include_neighbour_slot = true;
     bool trace = false;
+    std::function<void(const BoardComponent&, MemoryImage&)> initialize_memory;
     /* A register's clock-to-q and a gate's delay come from the timing library in
        S5; until a library is attached every device gets `gate_delay`. */
     Tick cycleTicks() const { return ticks_per_unit * (cycle_units ? cycle_units : 1); }
@@ -62,11 +63,15 @@ public:
     bool bind(const BoardView& board,
               const std::function<bool(const BoardComponent&, KindPins&)>& geometry,
               const RuntimeConfig& config = RuntimeConfig()) {
+        bound_ = false;
+        engine_.reset();
+        notes_.clear();
         config_ = config;
         BuildOptions options;
         options.rotate_pins = config.rotate_pins;
         options.include_neighbour_slot = config.include_neighbour_slot;
         options.gate_delay = config.gate_delay;
+        options.initialize_memory = config.initialize_memory;
         build_ = buildNetList(board, geometry, options);
         for (const BuildNote& note : build_.notes) {
             if (note.fatal) notes_.push_back(note.text);
@@ -94,6 +99,9 @@ public:
     const std::vector<NetId>& sourceNets() const { return build_.source_nets; }
     const std::vector<NetId>& observedNets() const { return build_.observed_nets; }
     const std::vector<NetId>& clockNets() const { return build_.clock_nets; }
+    size_t memoryCount() const { return build_.memories.size(); }
+    MemoryImage& memory(size_t index) { return *build_.memories.at(index).image; }
+    const MemoryImage& memory(size_t index) const { return *build_.memories.at(index).image; }
 
     /* Value the board should show for a net: the engine's bit, or the hold value
        when the engine has it unknown.  `unknownIsZero` is the game-facing
@@ -105,6 +113,12 @@ public:
         if (value[0] == Logic::kOne) return 1;
         if (value[0] == Logic::kZero) return 0;
         return unknown_is_zero ? 0 : 1;
+    }
+
+    uint64_t boardValue(NetId net, bool unknown_is_zero = true) const {
+        const BitVector& value = engine_->netValue(net);
+        if (!value.isKnown()) return unknown_is_zero ? 0 : ~uint64_t{0};
+        return value.toUint64();
     }
 
     /* Advances `ticks` of simulated time.  The source nets are fed from the
@@ -128,11 +142,27 @@ public:
                 for (NetId net : build_.source_nets) {
                     const uint64_t value = read_source(net, build_.slots_of_net[net]);
                     engine_->addStimulus(now, net,
-                                         BitVector(1, (value & 1u) ? Logic::kOne : Logic::kZero));
+                                         memoryVector(value, build_.netlist.net(net).bits));
                 }
                 for (NetId net : build_.clock_nets) {
                     const Logic value = (cycles_ & 1u) == 0 ? Logic::kOne : Logic::kZero;
                     engine_->addStimulus(now, net, BitVector(1, value));
+                }
+                /* The game's compiled memory program runs every cycle even if
+                   Enable/Address/Data are held.  Toggle a private token so the
+                   implicit top-to-bottom port chain does the same. */
+                for (const BuildResult::MemoryBinding& memory : build_.memories) {
+                    if (memory.order_root == kNoNet) continue;
+                    engine_->addStimulus(now, memory.order_root,
+                                         memoryVector(cycles_ & 1u, 8));
+                }
+                /* The storage family latches once per cycle.  Its clock is this
+                   one net per board, toggled exactly at the boundary - which is
+                   the game's own "LATE" phase, the step right before it counts
+                   the cycle. */
+                if (build_.cycle_token != kNoNet) {
+                    engine_->addStimulus(now, build_.cycle_token,
+                                         BitVector(1, (cycles_ & 1u) == 0 ? Logic::kZero : Logic::kOne));
                 }
             }
             if (!engine_->runUntil(now + step)) settled = false;
@@ -195,13 +225,20 @@ public:
         size_t written = 0;
         for (size_t index = 0; index < build_.netlist.netCount(); ++index) {
             const NetId net = static_cast<NetId>(index);
-            uint64_t value = boardByte(net);
+            const uint16_t bits = build_.netlist.net(net).bits;
+            uint64_t value = boardValue(net);
             const bool is_source =
                 std::find(build_.source_nets.begin(), build_.source_nets.end(), net) != build_.source_nets.end();
             if (invert_test_only && !is_source) value ^= 1u;
+            /* A builder that adds a net without giving it a slot list would
+               otherwise make this walk read one vector past the end. */
+            if (net >= build_.slots_of_net.size()) continue;
             for (uint64_t slot : build_.slots_of_net[net]) {
-                write(slot, static_cast<unsigned char>(value & 1u));
-                ++written;
+                const uint16_t bytes = static_cast<uint16_t>((bits + 7u) / 8u);
+                for (uint16_t byte = 0; byte < bytes; ++byte) {
+                    write(slot + byte, static_cast<unsigned char>((value >> (byte * 8u)) & 0xffu));
+                    ++written;
+                }
             }
         }
         return written;

@@ -74,6 +74,26 @@
 **接回来要改什么**：语义与 V2/V3 的 `…(…,1)` 一致，直接调用；真机门禁补一条"调用后按钮像素回来"的
 断言（现成量法：`TC_FOUNDRY_TRACE=1` 报出的矩形 + 数亮像素，默认关掉是 0、保留是 654）。
 
+## 5. `tc.component.compose` V1/V2（原版类型目录 + 内部网表 builder）
+
+**能做什么**：V1 问清这个构建里有哪些内置零件、游戏叫它们什么、每个零件声明了哪些引脚——以及最要紧
+的那件事：**一个稳定的拼写**（`builtin/<名字>`，重名按 kind 升序 `#2`…，无名槽位 `builtin/0x<kind>`）
+对应本构建的哪个 kind 字节。V2 直接**用这些零件拼元件**：`begin/node/connect/commit` 注册一个没有
+回调、由游戏自己编译的组合类型；还能嵌套别的已注册类型，并用 `clone_metadata` 把原版零件的名字/说明/
+代价抄到自己的类型上。
+
+**谁在测它**：真机用例 `component-compose`（目录：与既有引脚表探针的 `kinds.txt` 逐条比对，125 条
+全一致）与 `component-composite`（builder：注册 AND3、嵌套、拒绝坏网表、克隆元数据、把 `and_gate_3`
+关卡交给游戏判分得到 `verdict=1`）；离线 `tests/component-compose.cpp`（拼写/目录 ABI）与
+`tests/component-netlist.cpp`（编码器与校验，对照游戏已接受的夹具字节）。
+
+**为什么没投入使用**：能力齐了，但当前仓库里没有任何**示例 Mod** 在建组合电路——只有开发探针
+（`tests/compose-probe.cpp`、`tests/composite-probe.cpp`）用它。真实的消费者还没有。
+
+**接回来要改什么**：给某个示例（比如 `examples/float-ops` 里那些"用原版节点拼"的候选，或者一个
+新的 `examples/composite-*`）加一段 `begin/node/connect/commit`；有状态零件要连线进网表还得先等
+builder 收下它们的实测输入位置（见 [../HANDOFF-component-m4.md](../HANDOFF-component-m4.md) §5）。
+
 ## 附：当前没有任何脚本使用、只在人工诊断时开的开关
 
 以下都是示例 Mod（`examples/text-box`）的开关，**没有进任何门禁脚本**，只服务于人工研究：
@@ -87,3 +107,4 @@
 | `TC_TEXTBOX_DRAG_PROBE=0` | 跳过拖动阶段（分离"拖动残留"与"关掉绘制"） |
 | `TC_TEXTBOX_FOUNDRY_BUTTON=1` | 保留游戏自己的"在元件工坊编辑"按钮（V4 的对照运行） |
 | `TC_FOUNDRY_TRACE=1` | 宿主把那个按钮的矩形与"是否被隐藏"每秒写进日志（门禁在弧线场景自动打开） |
+| `TC_FOUNDRY_SHOW_MOD_TYPES=1` | 让所有 Mod 类型的"在元件工坊编辑"按钮保持可用（`setFoundryButton(..., false)` 那批也不隐藏），用来查看它们被加载器代写进工坊的内壳接线 |

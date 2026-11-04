@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -56,10 +57,11 @@ std::map<uint64_t, InstanceBoxes> boxes;
 int frameCounter = 0;
 
 std::mutex valueMutex;
-std::map<uint64_t, uint32_t> values;
+/* The last input every Display saw, as the raw pattern of its own width: 16, 32
+   or 64 bits (the text is kept next to it so two Displays showing the same
+   pattern in different modes do not share a string). */
+std::map<uint64_t, uint64_t> values;
 std::map<uint64_t, std::string> texts;
-
-EditorState editor;
 
 void note(const std::string& text) {
     if (host && host->log) host->log(host->context, text.c_str());
@@ -247,16 +249,15 @@ void servicePendingCircuitSave() {
    really changes is the Board handle, so it is watched once per frame and
    everything that belonged to the old board is dropped with it.
 
-   Dropping the rows is what makes the next drawer pass re-read the instance's
-   configuration - the loader restores a saved record on the first frame that can
-   see it, which can be later than the frame that opened the drawer. */
+   The property rows belong to the loader now, so leaving a board only has to
+   drop what this Mod caches about it: the painted boxes, the Display's text
+   cache, and any save queued against the board that is gone. */
 bool sameBoardHandle(const TCGameHandle& left, const TCGameHandle& right) {
     return left.kind == right.kind && left.generation == right.generation &&
            left.token == right.token;
 }
 
 void forgetBoardState() {
-    editor = EditorState{};
     {
         std::lock_guard<std::mutex> lock(hitMutex);
         boxes.clear();
@@ -305,41 +306,82 @@ void serviceBoardChange() {
     note(detail);
 }
 
-ConstantConfig constantDefault() {
+/* One default configuration per registered type: the format byte is the width
+   that type works in, and the value is 1.0 *in that width*, so a freshly placed
+   Constant shows something readable in all three formats.  These are not
+   parameterless any more: FP16 Constant and FP64 Constant are different types
+   with different defaults, and the loader copies the registered default into
+   every new instance (plan 6.4.1). */
+ConstantConfig constantDefault(uint32_t format) {
     ConstantConfig config{};
-    config.format = kFormatBinary32;
+    config.format = static_cast<uint8_t>(format);
     config.display = 0;
-    config.bits = 0x3F800000u; /* 1.0: something readable on a fresh board */
+    /* 1.0: binary16 is 0x3C00, binary32 0x3F800000. */
+    config.bits = format == tcfp::kFormatBinary16 ? 0x3C00u : 0x3F800000u;
     return config;
 }
 
-AddConfig addDefault() {
+ConstantConfigWide constantWideDefault(uint32_t format) {
+    ConstantConfigWide config{};
+    config.format = static_cast<uint8_t>(format);
+    config.display = 0;
+    config.bits = format == tcfp::kFormatBinary16 ? UINT64_C(0x3C00)
+                                                  : UINT64_C(0x3FF0000000000000);
+    return config;
+}
+
+AddConfig addDefault(uint32_t format) {
     AddConfig config{};
-    config.format = kFormatBinary32;
+    config.format = static_cast<uint8_t>(format);
     config.rounding = static_cast<uint8_t>(tcfp::FPRounding::nearest_even);
     return config;
 }
 
-DisplayConfig displayDefault() {
+DisplayConfig displayDefault(uint32_t format) {
     DisplayConfig config{};
-    config.format = kFormatBinary32;
+    config.format = static_cast<uint8_t>(format);
     config.mode = static_cast<uint8_t>(tcfp::DisplayMode::decimal_and_hex);
     return config;
 }
 
-OpsConfig opsDefault() {
+OpsConfig opsDefault(uint32_t format) {
     OpsConfig config{};
-    config.format = kFormatBinary32;
+    config.format = static_cast<uint8_t>(format);
     config.rounding = static_cast<uint8_t>(tcfp::FPRounding::nearest_even);
     return config;
 }
 
+/* The width a callback was registered for.
+
+   The loader hands a definition's own `user` pointer back as `io->user` on every
+   phase (tc_component_types.h), and this Mod puts the format byte there.  That
+   is what lets one callback body serve FP16 Add, FP32 Add and FP64 Add: the
+   three are different types with different pins, but the code behind them is the
+   same table row, and the only thing it cannot read off the instance is which of
+   the three called it. */
+void* formatUser(uint32_t format) {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(format));
+}
+
+uint32_t ioFormat(const TCLogicIOV2* io) {
+    if (!io) return tcfp::kFormatBinary32;
+    const uintptr_t value = reinterpret_cast<uintptr_t>(io->user);
+    return (value == tcfp::kFormatBinary16 || value == tcfp::kFormatBinary64)
+               ? static_cast<uint32_t>(value)
+               : tcfp::kFormatBinary32;
+}
+
+/* The configuration the host owns for one instance.  It has this type's own
+   size, this type's own schema and this type's own format byte; anything else -
+   a short record, a blob written for another width, an older schema - runs on
+   the registered default instead of being read as something it is not. */
 template <typename T>
-T decodeOr(const uint8_t* data, uint32_t size, uint32_t schema, const T& fallback) {
+T decodeOr(const uint8_t* data, uint32_t size, uint32_t schema, const T& fallback,
+           uint32_t format) {
     if (!data || size < sizeof(T) || schema != kConfigSchema) return fallback;
     T config{};
     std::memcpy(&config, data, sizeof(T));
-    if (config.format != kFormatBinary32) return fallback;
+    if (config.format != static_cast<uint8_t>(format)) return fallback;
     return config;
 }
 
@@ -385,91 +427,6 @@ const char* displayModeName(tcfp::DisplayMode mode) {
         case tcfp::DisplayMode::hex_only: return "hex only";
     }
     return "decimal + hex";
-}
-
-/* A configuration an earlier release wrote: the same payload without the format
-   byte.  The migration inserts the format this build implements and refuses a
-   payload that is not a legal value, in which case the host keeps the record and
-   the instance runs on the registered default. */
-int migrateLegacyConfig(void* user, uint32_t from_schema, const void* from_data,
-                        uint32_t from_bytes, uint32_t to_schema, void* out,
-                        uint32_t capacity) {
-    const uint64_t type = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(user));
-    if (to_schema != kConfigSchema) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
-    if (from_schema == kConfigSchema && from_bytes == capacity) {
-        std::memcpy(out, from_data, capacity);
-        return TC_COMPONENT_CONFIG_MIGRATE_OK;
-    }
-    /* Schema 2 is this release minus the label: the same fields, then an empty
-       label where "CONST"/"ADD"/"DISP" is shown - which is exactly what the
-       board showed before the label existed. */
-    if (from_schema == kLabelSchema) {
-        if (type == kConstantId && from_bytes == sizeof(ConstantConfig) - kLabelBytes) {
-            ConstantConfig config = constantDefault();
-            std::memcpy(&config, from_data, from_bytes);
-            config.format = kFormatBinary32;
-            std::memcpy(out, &config, sizeof(config));
-            return TC_COMPONENT_CONFIG_MIGRATE_OK;
-        }
-        if (type == kAddId && from_bytes == sizeof(AddConfig) - kLabelBytes) {
-            AddConfig config = addDefault();
-            std::memcpy(&config, from_data, from_bytes);
-            config.format = kFormatBinary32;
-            std::memcpy(out, &config, sizeof(config));
-            return TC_COMPONENT_CONFIG_MIGRATE_OK;
-        }
-        if (type == kDisplayId && from_bytes == sizeof(DisplayConfig) - kLabelBytes) {
-            DisplayConfig config = displayDefault();
-            std::memcpy(&config, from_data, from_bytes);
-            config.format = kFormatBinary32;
-            std::memcpy(out, &config, sizeof(config));
-            return TC_COMPONENT_CONFIG_MIGRATE_OK;
-        }
-        /* The catalogue types are new in this release: the only payload an
-           older build could have written for one of them is schema 2, this
-           release's layout without the label. */
-        if (catalogueEntry(type)) {
-            if (from_bytes != sizeof(OpsConfig) - kLabelBytes ||
-                capacity != sizeof(OpsConfig))
-                return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
-            OpsConfig config = opsDefault();
-            std::memcpy(&config, from_data, from_bytes);
-            config.format = kFormatBinary32;
-            std::memcpy(out, &config, sizeof(config));
-            return TC_COMPONENT_CONFIG_MIGRATE_OK;
-        }
-        return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
-    }
-    if (from_schema != kLegacyConfigSchema) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
-    if (type == kConstantId && from_bytes == sizeof(uint32_t) &&
-        capacity == sizeof(ConstantConfig)) {
-        ConstantConfig config = constantDefault();
-        std::memcpy(&config.bits, from_data, sizeof(config.bits));
-        std::memcpy(out, &config, sizeof(config));
-        return TC_COMPONENT_CONFIG_MIGRATE_OK;
-    }
-    if (type == kAddId && from_bytes == sizeof(uint8_t) && capacity == sizeof(AddConfig)) {
-        uint8_t rounding = 0;
-        std::memcpy(&rounding, from_data, sizeof(rounding));
-        if (rounding > static_cast<uint8_t>(tcfp::FPRounding::toward_positive))
-            return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
-        AddConfig config = addDefault();
-        config.rounding = rounding;
-        std::memcpy(out, &config, sizeof(config));
-        return TC_COMPONENT_CONFIG_MIGRATE_OK;
-    }
-    if (type == kDisplayId && from_bytes == sizeof(uint8_t) &&
-        capacity == sizeof(DisplayConfig)) {
-        uint8_t mode = 0;
-        std::memcpy(&mode, from_data, sizeof(mode));
-        if (mode > static_cast<uint8_t>(tcfp::DisplayMode::hex_only))
-            return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
-        DisplayConfig config = displayDefault();
-        config.mode = mode;
-        std::memcpy(out, &config, sizeof(config));
-        return TC_COMPONENT_CONFIG_MIGRATE_OK;
-    }
-    return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
 }
 
 /* The host's enumerate answers OK only when every matching instance fitted in
@@ -873,15 +830,29 @@ int inputPinRow(uint32_t index, uint32_t count) {
 int outputPinRow(uint32_t index) { return static_cast<int>(index); }
 
 /* The width box in the top left corner, the same size and inset the stock
-   picture uses.  It is inert on purpose: FP16/FP64 do not exist yet, so it
-   shows what the instance is instead of offering a choice that cannot be
-   honoured (plan 7.2). */
+   picture uses.  It is inert on purpose, and it is not a choice at all: one
+   format is one component type (plan 6.4.1), so the box reports which type this
+   instance is - there is no other width it could be switched to. */
 float widthBoxX0(const BodyRect& body) { return body.x0 + kBoxInset; }
 float widthBoxY0(const BodyRect& body) { return body.y0 + kBoxInset; }
 
+/* What the width box prints: "16", "32" or "64". */
+const char* widthDigits(uint32_t format) {
+    return format == tcfp::kFormatBinary16 ? "16"
+                                           : (format == tcfp::kFormatBinary64 ? "64" : "32");
+}
+
+/* What the palette folder and the name say: "FP16", "FP32" or "FP64". */
+const char* formatLabel(uint32_t format) {
+    return format == tcfp::kFormatBinary16 ? "FP16"
+                                           : (format == tcfp::kFormatBinary64 ? "FP64"
+                                                                              : "FP32");
+}
+
 /* Body, width box and label, in the stock colours and the stock places. */
 void drawChrome(const TCComponentRenderFrameV1& frame, const BodyRect& body,
-                const char* typeName, const char* label, bool hovered) {
+                const char* typeName, const char* label, bool hovered,
+                const char* width) {
     drawBox(frame, body.x0, body.y0, body.x1, body.y1,
             hovered ? bodyFillHover() : bodyFill(),
             hovered ? bodyBorderHover() : bodyBorder(), 0.28f);
@@ -892,7 +863,7 @@ void drawChrome(const TCComponentRenderFrameV1& frame, const BodyRect& body,
     /* The width digits sit in the middle of their box, exactly like the stock
        part's "32"/"8" badge. */
     drawTextCells(frame, boxX0 + kBoxWidth * 0.5f, boxY0 + kBoxHeight * 0.5f,
-                  kWidthCapCells, TextAlign::centre, true, boxText(), "32");
+                  kWidthCapCells, TextAlign::centre, true, boxText(), width);
     /* The name slot shows the component's own label when it has one, and the
        type's name otherwise - the same rule the stock parts follow (an
        unlabelled Constant prints CONST, a labelled one prints its label). */
@@ -930,7 +901,10 @@ void drawRoundingBox(const TCComponentRenderFrameV1& frame, const BodyRect& body
    A source and an adder keep an output that the rest of the board reads; a pure
    sink has nothing, so the census below prints the first few calls of each
    instance by phase and makes that difference visible in the log. */
-void censusNote(uint64_t instance, uint32_t phase, const char* kind) {
+void censusNote(const TCLogicIOV2* io, const char* kind) {
+    const uint64_t instance = io->instance_id;
+    const uint32_t phase = io->phase;
+    const uint32_t format = ioFormat(io);
     struct Census {
         unsigned cycle = 0;
         unsigned refresh = 0;
@@ -946,20 +920,87 @@ void censusNote(uint64_t instance, uint32_t phase, const char* kind) {
     if (entry.logged >= 3 || entry.cycle + entry.refresh < entry.nextLog) return;
     ++entry.logged;
     entry.nextLog += 256;
-    char line[192] = {};
+    char line[208] = {};
     std::snprintf(line, sizeof(line),
-                  "float-ops M2: %s 0x%llx call census cycle=%u refresh=%u",
+                  "float-ops: FP%u %s 0x%llx call census cycle=%u refresh=%u", format,
                   kind, static_cast<unsigned long long>(instance), entry.cycle,
                   entry.refresh);
     note(line);
 }
 
+/* ---- which width an instance works in -----------------------------------
+
+   One format is one component type, so the `format` byte in an instance's
+   configuration is the type's own default, copied into the instance when it is
+   bound (components.hpp keeps the byte at +0 of every layout for exactly this).
+   A blob that says another width - an older release's record, a hand edit -
+   never reaches an operation: the callbacks decode through ioFormat(io) and fall
+   back to the registered default instead (decodeOr above). */
+const tcfp::FormatOps& opsFor(uint32_t format) {
+    const tcfp::FormatOps* ops = tcfp::formatOps(format);
+    return ops ? *ops : *tcfp::formatOps(tcfp::kFormatBinary32);
+}
+
+/* One input pin's value, masked to this instance's width: a 16-bit pattern
+   arrives on a 16-bit pin, but a configuration that was switched between
+   widths must not let the upper bits of a wider wire leak into the narrower
+   format. */
+uint64_t inputWord(const TCLogicIOV2* io, const tcfp::FormatOps& ops, uint32_t index) {
+    if (!io->inputs || io->input_count <= index) return 0;
+    return ops.mask(io->inputs[index]);
+}
+
+void publishBits(const TCLogicIOV2* io, const tcfp::FormatOps& ops, uint64_t bits,
+                 uint32_t index = 0) {
+    if (io->outputs && io->output_count > index) io->outputs[index] = ops.mask(bits);
+}
+
+void publishResult(const TCLogicIOV2* io, const tcfp::FormatOps& ops,
+                   const tcfp::FormatResult& result, bool with_flags = true) {
+    publishBits(io, ops, result.bits, 0);
+    if (with_flags) publishBits(io, ops, result.flags, 1);
+}
+
+void publishInt(const TCLogicIOV2* io, const tcfp::FormatOps& ops,
+                const tcfp::FormatIntResult& result) {
+    /* The integer side is a 32-bit pin whatever width the float side has, so it
+       is masked to 32 bits and not to the format's own width. */
+    if (io->outputs && io->output_count) io->outputs[0] = result.value & 0xFFFFFFFFu;
+    publishBits(io, ops, result.flags, 1);
+}
+
+OpsConfig opsConfigOf(const TCLogicIOV2* io) {
+    return decodeOr<OpsConfig>(io->config, io->config_size, io->config_schema,
+                               opsDefault(ioFormat(io)), ioFormat(io));
+}
+
+const tcfp::FormatOps& ioOps(const TCLogicIOV2* io) {
+    return opsFor(opsConfigOf(io).format);
+}
+
+/* The Constant publishes the pattern its own configuration holds; which layout
+   that is depends on the width, because binary32's four-byte blob is archived
+   and the two newer widths share the eight-byte one (components.hpp). */
+void publishConstant(TCLogicIOV2* io) {
+    const uint32_t format = ioFormat(io);
+    const tcfp::FormatOps& ops = opsFor(format);
+    if (format == tcfp::kFormatBinary32) {
+        const ConstantConfig config =
+            decodeOr<ConstantConfig>(io->config, io->config_size, io->config_schema,
+                                     constantDefault(format), format);
+        publishBits(io, ops, config.bits, 0);
+        return;
+    }
+    const ConstantConfigWide config =
+        decodeOr<ConstantConfigWide>(io->config, io->config_size, io->config_schema,
+                                     constantWideDefault(format), format);
+    publishBits(io, ops, config.bits, 0);
+}
+
 void constantLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "constant");
-    const ConstantConfig config = decodeOr<ConstantConfig>(
-        io->config, io->config_size, io->config_schema, constantDefault());
-    if (io->outputs && io->output_count) io->outputs[0] = config.bits;
+    censusNote(io, "constant");
+    publishConstant(io);
 }
 
 /* Prime the host-side output as soon as a Constant is rebound or changed, then
@@ -973,41 +1014,87 @@ void constantLifecycle(TCLogicIOV2* io) {
     requestBoardRefresh();
 }
 
-const TCComponentLifecycleV1 kConstantLifecycle = {
-    sizeof(TCComponentLifecycleV1), TC_COMPONENT_LIFECYCLE_VERSION_1,
-    &constantLifecycle, nullptr, &constantLifecycle, &constantLifecycle,
-    &constantLifecycle, nullptr};
+/* The property rows belong to the loader now (tc.component.editor), so an edit
+   reaches this Mod as the type's on_config_changed instead of as a call into
+   the Mod's own writeConfig.  What has to happen is the same as before: evaluate
+   the board again so the wires follow, and queue the circuit save so a
+   re-entered level comes back with the new value. */
+void editLifecycle(TCLogicIOV2* io) {
+    if (!io) return;
+    requestBoardRefresh();
+    requestCircuitSave();
+}
+
+/* The Constant additionally has to publish the new value right now: its output
+   is the configuration itself, and a paused board would otherwise show the old
+   number until something else forced an evaluation (tests/float-compat.cpp
+   pins exactly this). */
+void constantEditLifecycle(TCLogicIOV2* io) {
+    if (!io) return;
+    constantLogic(io);
+    requestBoardRefresh();
+    requestCircuitSave();
+}
+
+/* Filled field by field rather than positionally: the structure grows by
+   appending callbacks (on_move / on_rotate / on_resize / on_compile / on_unbind
+   arrived in 2026-09-28), and a positional list would have to be re-edited - and
+   would warn under -Werror=missing-field-initializers - every time. */
+const TCComponentLifecycleV1 kConstantLifecycle = [] {
+    TCComponentLifecycleV1 value{};
+    value.size = sizeof(value);
+    value.version = TC_COMPONENT_LIFECYCLE_VERSION_1;
+    value.on_create = &constantLifecycle;
+    value.on_config_changed = &constantEditLifecycle;
+    value.on_clone = &constantLifecycle;
+    value.on_load = &constantLifecycle;
+    return value;
+}();
+
+/* Every other type only needs the edit notification: it has no per-instance
+   state to prime, but its outputs depend on the configuration (the rounding
+   mode, the display mode) and the value has to be saved. */
+const TCComponentLifecycleV1 kEditLifecycle = [] {
+    TCComponentLifecycleV1 value{};
+    value.size = sizeof(value);
+    value.version = TC_COMPONENT_LIFECYCLE_VERSION_1;
+    value.on_config_changed = &editLifecycle;
+    return value;
+}();
 
 void addLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "add");
+    censusNote(io, "add");
+    const uint32_t format = ioFormat(io);
     const AddConfig config = decodeOr<AddConfig>(io->config, io->config_size,
-                                                io->config_schema, addDefault());
+                                                io->config_schema, addDefault(format),
+                                                format);
     if (io->phase == TC_LOGIC_RESET) return;
-    const uint32_t a =
-        io->inputs && io->input_count > 0 ? static_cast<uint32_t>(io->inputs[0]) : 0u;
-    const uint32_t b =
-        io->inputs && io->input_count > 1 ? static_cast<uint32_t>(io->inputs[1]) : 0u;
-    const tcfp::FP32Result result = tcfp::fp32_add(a, b, roundingOf(config.rounding));
-    if (io->outputs && io->output_count) io->outputs[0] = result.bits;
-    if (io->outputs && io->output_count > 1) io->outputs[1] = result.flags;
+    const tcfp::FormatOps& ops = opsFor(format);
+    const tcfp::FormatResult result =
+        ops.add(inputWord(io, ops, 0), inputWord(io, ops, 1), roundingOf(config.rounding));
+    publishResult(io, ops, result);
 }
 
 void displayLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "display");
+    censusNote(io, "display");
     if (io->phase == TC_LOGIC_DESTROY || io->phase == TC_LOGIC_RESET) {
         std::lock_guard<std::mutex> lock(valueMutex);
         values.erase(io->instance_id);
         texts.erase(io->instance_id);
         return;
     }
-    const uint32_t bits =
-        io->inputs && io->input_count ? static_cast<uint32_t>(io->inputs[0]) : 0u;
+    /* The Display shows the value its own width gives the wire: a 16-bit
+       pattern read out of a wider wire keeps only its own bits, and the text
+       layer formats in the same width (fp/decimal.hpp's format_value). */
+    const uint32_t format = ioFormat(io);
+    const uint64_t bits =
+        io->inputs && io->input_count ? tcfp::truncate(format, io->inputs[0]) : 0u;
     const DisplayConfig config = decodeOr<DisplayConfig>(
-        io->config, io->config_size, io->config_schema, displayDefault());
+        io->config, io->config_size, io->config_schema, displayDefault(format), format);
     char text[96] = {};
-    tcfp::format_value(bits, displayModeOf(config.mode), text, sizeof(text));
+    tcfp::format_value_for(format, bits, displayModeOf(config.mode), text, sizeof(text));
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(valueMutex);
@@ -1020,39 +1107,79 @@ void displayLogic(TCLogicIOV2* io) {
     if (changed) {
         char detail[192] = {};
         std::snprintf(detail, sizeof(detail),
-                      "float-ops M2: display 0x%llx shows %s (bits=0x%08X)",
-                      static_cast<unsigned long long>(io->instance_id), text, bits);
+                      "float-ops M2: display 0x%llx shows %s (bits=0x%0*llX)",
+                      static_cast<unsigned long long>(io->instance_id), text,
+                      static_cast<int>(format / 4), static_cast<unsigned long long>(bits));
         note(detail);
     }
 }
 
-/* ---- the M3/M4 catalogue ------------------------------------------------ */
+/* ---- the catalogue: one row per family, expanded over the three formats ----
 
-/* One table drives everything the catalogue types have in common: what the
-   loader registers (pins, description), what the board prints (board name,
-   symbol, whether a rounding badge belongs on the body) and what the drawer
-   shows (rounding choice or a one-line explanation).  Adding a type is a row
-   here plus its logic callback - the drawing, the panel rows and the
-   registration path do not have to be touched again (plan 6.2, 6.3). */
-struct CatalogueType {
-    CatalogueInfo info;
-    const TCComponentPinV2* inputs;
-    uint32_t input_count;
-    const TCComponentPinV2* outputs;
-    uint32_t output_count;
-    TCLogicCallbackV2 callback;
+   A family is written once - the five characters of its identity, its type id,
+   the folder it lives in, its name, its description, its pins, its callback -
+   and the concrete types are that row expanded over every width the family
+   exists in (plan 6.4.1).  Sixty-five hand-written rows would repeat all of it
+   three times; this way the FP64 family is visibly the FP16/FP32 one minus the
+   FMA, and a new width is one entry in the format list below.
+
+   What a family cannot share is the width of its pins: a Mod type's pins are
+   frozen when it registers, which is the whole reason one format is one type.
+   `PinShape` names the pin sets a family can ask for (A/B/C, R and Flags, the
+   relation, the classification bus, the bit fields) and `pinsFor` hands back the
+   set that belongs to the width. */
+
+enum PinShape : uint8_t {
+    pins_none,
+    pins_in_a,
+    pins_in_ab,
+    pins_in_abc,
+    pins_in_i32,
+    pins_in_u32,
+    pins_in_split,
+    pins_out_r,
+    pins_out_r_flags,
+    pins_out_i32_flags,
+    pins_out_u32_flags,
+    pins_out_relation,
+    pins_out_class,
+    pins_out_split,
 };
 
-/* The pin sets, as the game's own parts name them: A/B/C in, R and Flags out,
-   32-bit words, one-bit relations and the 10-bit classification bus. */
-const TCComponentPinV2 kInA[] = {{"a", "A", 32, 0}};
-const TCComponentPinV2 kInAB[] = {{"a", "A", 32, 0}, {"b", "B", 32, 0}};
-const TCComponentPinV2 kInABC[] = {{"a", "A", 32, 0}, {"b", "B", 32, 0},
-                                   {"c", "C", 32, 0}};
+/* The widths a family exists in.  FP64 Fused Multiply Add is the one gap: three
+   64-bit inputs are 192 bits against the loader's 128-bit input budget
+   (plan 1.2). */
+constexpr uint32_t kWidth16 = 1u << 0;
+constexpr uint32_t kWidth32 = 1u << 1;
+constexpr uint32_t kWidth64 = 1u << 2;
+constexpr uint32_t kAllWidths = kWidth16 | kWidth32 | kWidth64;
+
+/* The pin sets, as the game's own parts name them: A/B/C in, R and Flags out.
+   Every shape that carries a float value exists once per format, because the
+   word pins are the type's own width; the integer side of a conversion stays 32
+   bits in all three, and the bit fields follow the format (1/5/10, 1/8/23,
+   1/11/52).  The pin ids stay what they were for binary32, so a saved board of
+   FP32 parts keeps its compiled interface. */
+const TCComponentPinV2 kInA16[] = {{"a", "A", 16, 0}};
+const TCComponentPinV2 kInA32[] = {{"a", "A", 32, 0}};
+const TCComponentPinV2 kInA64[] = {{"a", "A", 64, 0}};
+const TCComponentPinV2 kInAB16[] = {{"a", "A", 16, 0}, {"b", "B", 16, 0}};
+const TCComponentPinV2 kInAB32[] = {{"a", "A", 32, 0}, {"b", "B", 32, 0}};
+const TCComponentPinV2 kInAB64[] = {{"a", "A", 64, 0}, {"b", "B", 64, 0}};
+const TCComponentPinV2 kInABC16[] = {{"a", "A", 16, 0}, {"b", "B", 16, 0},
+                                     {"c", "C", 16, 0}};
+const TCComponentPinV2 kInABC32[] = {{"a", "A", 32, 0}, {"b", "B", 32, 0},
+                                     {"c", "C", 32, 0}};
+const TCComponentPinV2 kInABC64[] = {{"a", "A", 64, 0}, {"b", "B", 64, 0},
+                                     {"c", "C", 64, 0}};
 const TCComponentPinV2 kInI32[] = {{"i", "I", 32, 0}};
 const TCComponentPinV2 kInU32[] = {{"i", "U", 32, 0}};
-const TCComponentPinV2 kOutR[] = {{"r", "R", 32, 0}};
-const TCComponentPinV2 kOutRFlags[] = {{"r", "R", 32, 0}, {"f", "Flags", 5, 0}};
+const TCComponentPinV2 kOutR16[] = {{"r", "R", 16, 0}};
+const TCComponentPinV2 kOutR32[] = {{"r", "R", 32, 0}};
+const TCComponentPinV2 kOutR64[] = {{"r", "R", 64, 0}};
+const TCComponentPinV2 kOutRFlags16[] = {{"r", "R", 16, 0}, {"f", "Flags", 5, 0}};
+const TCComponentPinV2 kOutRFlags32[] = {{"r", "R", 32, 0}, {"f", "Flags", 5, 0}};
+const TCComponentPinV2 kOutRFlags64[] = {{"r", "R", 64, 0}, {"f", "Flags", 5, 0}};
 const TCComponentPinV2 kOutI32Flags[] = {{"i", "I", 32, 0}, {"f", "Flags", 5, 0}};
 const TCComponentPinV2 kOutU32Flags[] = {{"u", "U", 32, 0}, {"f", "Flags", 5, 0}};
 const TCComponentPinV2 kOutRelation[] = {{"lt", "LT", 1, 0},
@@ -1060,303 +1187,644 @@ const TCComponentPinV2 kOutRelation[] = {{"lt", "LT", 1, 0},
                                          {"gt", "GT", 1, 0},
                                          {"f", "Flags", 5, 0}};
 const TCComponentPinV2 kOutClass[] = {{"c", "Class", 10, 0}};
-const TCComponentPinV2 kOutSplit[] = {{"s", "Sign", 1, 0},
-                                      {"e", "Exponent", 8, 0},
-                                      {"m", "Significand", 23, 0}};
-const TCComponentPinV2 kInSign[] = {{"s", "Sign", 1, 0},
-                                    {"e", "Exponent", 8, 0},
-                                    {"m", "Significand", 23, 0}};
+const TCComponentPinV2 kOutSplit16[] = {{"s", "Sign", 1, 0},
+                                        {"e", "Exponent", 5, 0},
+                                        {"m", "Significand", 10, 0}};
+const TCComponentPinV2 kOutSplit32[] = {{"s", "Sign", 1, 0},
+                                        {"e", "Exponent", 8, 0},
+                                        {"m", "Significand", 23, 0}};
+const TCComponentPinV2 kOutSplit64[] = {{"s", "Sign", 1, 0},
+                                        {"e", "Exponent", 11, 0},
+                                        {"m", "Significand", 52, 0}};
+const TCComponentPinV2 kInSplit16[] = {{"s", "Sign", 1, 0},
+                                       {"e", "Exponent", 5, 0},
+                                       {"m", "Significand", 10, 0}};
+const TCComponentPinV2 kInSplit32[] = {{"s", "Sign", 1, 0},
+                                       {"e", "Exponent", 8, 0},
+                                       {"m", "Significand", 23, 0}};
+const TCComponentPinV2 kInSplit64[] = {{"s", "Sign", 1, 0},
+                                       {"e", "Exponent", 11, 0},
+                                       {"m", "Significand", 52, 0}};
 
-uint32_t inputBits(const TCLogicIOV2* io, uint32_t index) {
-    return io->inputs && io->input_count > index ? static_cast<uint32_t>(io->inputs[index])
-                                                 : 0u;
+struct PinSet {
+    const TCComponentPinV2* pins;
+    uint32_t count;
+};
+
+PinSet pinsFor(PinShape shape, uint32_t format) {
+    const bool w16 = format == tcfp::kFormatBinary16;
+    const bool w64 = format == tcfp::kFormatBinary64;
+    switch (shape) {
+        case PinShape::pins_in_a:
+            return w16 ? PinSet{kInA16, 1} : (w64 ? PinSet{kInA64, 1} : PinSet{kInA32, 1});
+        case PinShape::pins_in_ab:
+            return w16 ? PinSet{kInAB16, 2} : (w64 ? PinSet{kInAB64, 2} : PinSet{kInAB32, 2});
+        case PinShape::pins_in_abc:
+            return w16 ? PinSet{kInABC16, 3}
+                       : (w64 ? PinSet{kInABC64, 3} : PinSet{kInABC32, 3});
+        case PinShape::pins_in_i32: return PinSet{kInI32, 1};
+        case PinShape::pins_in_u32: return PinSet{kInU32, 1};
+        case PinShape::pins_in_split:
+            return w16 ? PinSet{kInSplit16, 3}
+                       : (w64 ? PinSet{kInSplit64, 3} : PinSet{kInSplit32, 3});
+        case PinShape::pins_out_r:
+            return w16 ? PinSet{kOutR16, 1} : (w64 ? PinSet{kOutR64, 1} : PinSet{kOutR32, 1});
+        case PinShape::pins_out_r_flags:
+            return w16 ? PinSet{kOutRFlags16, 2}
+                       : (w64 ? PinSet{kOutRFlags64, 2} : PinSet{kOutRFlags32, 2});
+        case PinShape::pins_out_i32_flags: return PinSet{kOutI32Flags, 2};
+        case PinShape::pins_out_u32_flags: return PinSet{kOutU32Flags, 2};
+        case PinShape::pins_out_relation: return PinSet{kOutRelation, 4};
+        case PinShape::pins_out_class: return PinSet{kOutClass, 1};
+        case PinShape::pins_out_split:
+            return w16 ? PinSet{kOutSplit16, 3}
+                       : (w64 ? PinSet{kOutSplit64, 3} : PinSet{kOutSplit32, 3});
+        case PinShape::pins_none: default: break;
+    }
+    return PinSet{nullptr, 0};
 }
 
-void publishBits(const TCLogicIOV2* io, uint32_t bits, uint32_t index = 0) {
-    if (io->outputs && io->output_count > index) io->outputs[index] = bits;
-}
+/* The entry a callback wants is named by its place in the table rather than by
+   a width, so one callback body serves binary16, binary32 and binary64: the
+   instance's own format byte selects the row and the call follows. */
+using BinaryRoundingOp = tcfp::FormatResult (*)(uint64_t, uint64_t, tcfp::FPRounding);
+using UnaryRoundingOp = tcfp::FormatResult (*)(uint64_t, tcfp::FPRounding);
 
-void publishResult(const TCLogicIOV2* io, const tcfp::FP32Result& result,
-                   bool with_flags = true) {
-    publishBits(io, result.bits, 0);
-    if (with_flags) publishBits(io, result.flags, 1);
-}
-
-void publishInt(const TCLogicIOV2* io, const tcfp::FP32IntResult& result) {
-    publishBits(io, result.value, 0);
-    publishBits(io, result.flags, 1);
-}
-
-OpsConfig opsConfigOf(const TCLogicIOV2* io) {
-    return decodeOr<OpsConfig>(io->config, io->config_size, io->config_schema,
-                               opsDefault());
-}
-
-using BinaryRoundingOp = tcfp::FP32Result (*)(uint32_t, uint32_t, tcfp::FPRounding);
-using UnaryRoundingOp = tcfp::FP32Result (*)(uint32_t, tcfp::FPRounding);
-
-void binaryRoundingLogic(TCLogicIOV2* io, BinaryRoundingOp op, const char* kind) {
+void binaryRoundingLogic(TCLogicIOV2* io, BinaryRoundingOp tcfp::FormatOps::* which,
+                         const char* kind) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, kind);
+    censusNote(io, kind);
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishResult(io, op(inputBits(io, 0), inputBits(io, 1), roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishResult(io, ops, (ops.*which)(inputWord(io, ops, 0), inputWord(io, ops, 1),
+                                        roundingOf(config.rounding)));
 }
 
-void unaryRoundingLogic(TCLogicIOV2* io, UnaryRoundingOp op, const char* kind) {
+void unaryRoundingLogic(TCLogicIOV2* io, UnaryRoundingOp tcfp::FormatOps::* which,
+                        const char* kind) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, kind);
+    censusNote(io, kind);
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishResult(io, op(inputBits(io, 0), roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishResult(io, ops,
+                  (ops.*which)(inputWord(io, ops, 0), roundingOf(config.rounding)));
 }
 
 /* ---- M3: the operations that round ------------------------------------- */
 
 void subtractLogic(TCLogicIOV2* io) {
-    binaryRoundingLogic(io, tcfp::fp32_subtract, "subtract");
+    binaryRoundingLogic(io, &tcfp::FormatOps::subtract, "subtract");
 }
 void multiplyLogic(TCLogicIOV2* io) {
-    binaryRoundingLogic(io, tcfp::fp32_multiply, "multiply");
+    binaryRoundingLogic(io, &tcfp::FormatOps::multiply, "multiply");
 }
 void divideLogic(TCLogicIOV2* io) {
-    binaryRoundingLogic(io, tcfp::fp32_divide, "divide");
+    binaryRoundingLogic(io, &tcfp::FormatOps::divide, "divide");
 }
 void squareRootLogic(TCLogicIOV2* io) {
-    unaryRoundingLogic(io, tcfp::fp32_square_root, "square root");
+    unaryRoundingLogic(io, &tcfp::FormatOps::square_root, "square root");
 }
 void roundToIntegralLogic(TCLogicIOV2* io) {
-    unaryRoundingLogic(io, tcfp::fp32_round_to_integral_exact, "round to integral");
+    unaryRoundingLogic(io, &tcfp::FormatOps::round_to_integral_exact, "round to integral");
 }
 
 /* ---- M3: the bit operations (no flags: they cannot fail) ---------------- */
 
 void negateLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "negate");
+    censusNote(io, "negate");
     if (io->phase == TC_LOGIC_RESET) return;
-    publishBits(io, tcfp::fp32_negate(inputBits(io, 0)));
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishBits(io, ops, ops.negate(inputWord(io, ops, 0)));
 }
 
 void absoluteLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "absolute");
+    censusNote(io, "absolute");
     if (io->phase == TC_LOGIC_RESET) return;
-    publishBits(io, tcfp::fp32_absolute(inputBits(io, 0)));
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishBits(io, ops, ops.absolute(inputWord(io, ops, 0)));
 }
 
 /* ---- M3: relation and classification ----------------------------------- */
 
 void compareLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "compare");
+    censusNote(io, "compare");
     if (io->phase == TC_LOGIC_RESET) return;
     /* The relation is quiet (plan 2.5): exactly one of lt/eq/gt is set for
        numbers and none of them for a NaN input, which is how the player reads
        "unordered" off the three bits.  Only a signaling NaN raises NV, and that
        is what the Flags output carries. */
-    const tcfp::FP32Relation relation =
-        tcfp::fp32_compare(inputBits(io, 0), inputBits(io, 1));
-    publishBits(io, relation.lt ? 1u : 0u, 0);
-    publishBits(io, relation.eq ? 1u : 0u, 1);
-    publishBits(io, relation.gt ? 1u : 0u, 2);
-    publishBits(io, relation.flags, 3);
+    const tcfp::FormatOps& ops = ioOps(io);
+    const tcfp::FormatRelation relation =
+        ops.compare(inputWord(io, ops, 0), inputWord(io, ops, 1));
+    publishBits(io, ops, relation.lt ? 1u : 0u, 0);
+    publishBits(io, ops, relation.eq ? 1u : 0u, 1);
+    publishBits(io, ops, relation.gt ? 1u : 0u, 2);
+    publishBits(io, ops, relation.flags, 3);
 }
 
 void classifyLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "classify");
+    censusNote(io, "classify");
     if (io->phase == TC_LOGIC_RESET) return;
-    publishBits(io, tcfp::fp32_classify(inputBits(io, 0)));
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishBits(io, ops, ops.classify(inputWord(io, ops, 0)));
 }
 
 /* ---- M4: the extended operations --------------------------------------- */
 
 void fusedMultiplyAddLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "fused multiply add");
+    censusNote(io, "fused multiply add");
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishResult(io, tcfp::fp32_fused_multiply_add(inputBits(io, 0), inputBits(io, 1),
-                                                    inputBits(io, 2),
-                                                    roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishResult(io, ops,
+                  ops.fused_multiply_add(inputWord(io, ops, 0), inputWord(io, ops, 1),
+                                         inputWord(io, ops, 2),
+                                         roundingOf(config.rounding)));
 }
 
 void remainderLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "remainder");
+    censusNote(io, "remainder");
     if (io->phase == TC_LOGIC_RESET) return;
     /* IEEE remainder fixes the quotient to nearest-ties-to-even whatever the
        instance's stored mode is, so there is no rounding badge on this type
        (plan 6.3) - the configuration keeps the field only so every catalogue
        blob has the same shape. */
-    publishResult(io, tcfp::fp32_remainder(inputBits(io, 0), inputBits(io, 1)));
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishResult(io, ops, ops.remainder(inputWord(io, ops, 0), inputWord(io, ops, 1)));
 }
 
 void minimumLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "minimum number");
+    censusNote(io, "minimum number");
     if (io->phase == TC_LOGIC_RESET) return;
-    publishResult(io, tcfp::fp32_minimum_number(inputBits(io, 0), inputBits(io, 1)));
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishResult(io, ops,
+                  ops.minimum_number(inputWord(io, ops, 0), inputWord(io, ops, 1)));
 }
 
 void maximumLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "maximum number");
+    censusNote(io, "maximum number");
     if (io->phase == TC_LOGIC_RESET) return;
-    publishResult(io, tcfp::fp32_maximum_number(inputBits(io, 0), inputBits(io, 1)));
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishResult(io, ops,
+                  ops.maximum_number(inputWord(io, ops, 0), inputWord(io, ops, 1)));
 }
 
 void i32ToFp32Logic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "i32 to fp32");
+    censusNote(io, "i32 to fp32");
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishResult(io, tcfp::fp32_from_i32(static_cast<int32_t>(inputBits(io, 0)),
-                                          roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishResult(io, ops,
+                  ops.from_i32(static_cast<int32_t>(ops.mask(io->inputs[0] & 0xFFFFFFFFu)),
+                               roundingOf(config.rounding)));
 }
 
 void u32ToFp32Logic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "u32 to fp32");
+    censusNote(io, "u32 to fp32");
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishResult(io, tcfp::fp32_from_u32(inputBits(io, 0), roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishResult(io, ops,
+                  ops.from_u32(static_cast<uint32_t>(io->inputs[0] & 0xFFFFFFFFu),
+                               roundingOf(config.rounding)));
 }
 
 void fp32ToI32Logic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "fp32 to i32");
+    censusNote(io, "fp32 to i32");
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishInt(io, tcfp::fp32_to_i32(inputBits(io, 0), roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishInt(io, ops,
+               ops.to_i32(inputWord(io, ops, 0), roundingOf(config.rounding)));
 }
 
 void fp32ToU32Logic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "fp32 to u32");
+    censusNote(io, "fp32 to u32");
     if (io->phase == TC_LOGIC_RESET) return;
     const OpsConfig config = opsConfigOf(io);
-    publishInt(io, tcfp::fp32_to_u32(inputBits(io, 0), roundingOf(config.rounding)));
+    const tcfp::FormatOps& ops = opsFor(config.format);
+    publishInt(io, ops,
+               ops.to_u32(inputWord(io, ops, 0), roundingOf(config.rounding)));
 }
 
 void splitBitsLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "split bits");
+    censusNote(io, "split bits");
     if (io->phase == TC_LOGIC_RESET) return;
     /* Sign, exponent and significand are published as they are stored: the
-       exponent is the biased 8-bit field and the significand is the 23-bit
-       fraction, so Make Bits rebuilds the pattern bit for bit (plan 6.3). */
-    const uint32_t bits = inputBits(io, 0);
-    publishBits(io, (bits >> 31) & 1u, 0);
-    publishBits(io, (bits >> 23) & 0xFFu, 1);
-    publishBits(io, bits & 0x7FFFFFu, 2);
+       exponent is the biased field and the significand the fraction, so Make
+       Bits rebuilds the pattern bit for bit (plan 6.3).  Their widths come from
+       the format the instance works in - 1/5/10, 1/8/23 or 1/11/52. */
+    const tcfp::FormatOps& ops = ioOps(io);
+    const tcfp::FormatFields fields = ops.split(inputWord(io, ops, 0));
+    publishBits(io, ops, fields.sign, 0);
+    publishBits(io, ops, fields.exponent, 1);
+    publishBits(io, ops, fields.significand, 2);
 }
 
 void makeBitsLogic(TCLogicIOV2* io) {
     if (!io) return;
-    censusNote(io->instance_id, io->phase, "make bits");
+    censusNote(io, "make bits");
     if (io->phase == TC_LOGIC_RESET) return;
-    const uint32_t sign = inputBits(io, 0) & 1u;
-    const uint32_t exponent = inputBits(io, 1) & 0xFFu;
-    const uint32_t significand = inputBits(io, 2) & 0x7FFFFFu;
-    publishBits(io, (sign << 31) | (exponent << 23) | significand);
+    const tcfp::FormatOps& ops = ioOps(io);
+    publishBits(io, ops,
+                ops.make_bits(io->inputs[0] & 1u, io->inputs[1], io->inputs[2]));
 }
 
-const CatalogueType kCatalogue[] = {
-    {{kSubtractId, "local.float-ops/fp32-subtract", "FP32 Subtract",
-      "A − B，按元件自己的舍入模式（默认 RNE），输出 R[32] 与本次运算的 Flags[5]。",
-      "SUB", "−", true, nullptr},
-     kInAB, 2, kOutRFlags, 2, &subtractLogic},
-    {{kMultiplyId, "local.float-ops/fp32-multiply", "FP32 Multiply",
-      "A × B，按元件自己的舍入模式（默认 RNE），输出 R[32] 与本次运算的 Flags[5]。",
-      "MUL", "×", true, nullptr},
-     kInAB, 2, kOutRFlags, 2, &multiplyLogic},
-    {{kDivideId, "local.float-ops/fp32-divide", "FP32 Divide",
-      "A ÷ B，按元件自己的舍入模式（默认 RNE）；除数为零置 DZ，输出 R[32] 与 Flags[5]。",
-      "DIV", "÷", true, nullptr},
-     kInAB, 2, kOutRFlags, 2, &divideLogic},
-    {{kSquareRootId, "local.float-ops/fp32-square-root", "FP32 Square Root",
-      "√A，按元件自己的舍入模式（默认 RNE）；负数置 NV 并返回 canonical NaN。",
-      "SQRT", "√", true, nullptr},
-     kInA, 1, kOutRFlags, 2, &squareRootLogic},
-    {{kNegateId, "local.float-ops/fp32-negate", "FP32 Negate",
-      "翻转符号位，其余位原样保留（payload 不丢，不置任何 flag）。",
-      "NEG", "−x", false, "位操作：只翻符号位，NaN 的 payload 原样保留，永远不会置 Flags。"},
-     kInA, 1, kOutR, 1, &negateLogic},
-    {{kAbsoluteId, "local.float-ops/fp32-absolute", "FP32 Absolute",
-      "清掉符号位，其余位原样保留（payload 不丢，不置任何 flag）。",
-      "ABS", "|x|", false, "位操作：只清符号位，NaN 的 payload 原样保留，永远不会置 Flags。"},
-     kInA, 1, kOutR, 1, &absoluteLogic},
-    {{kCompareId, "local.float-ops/fp32-compare", "FP32 Compare",
-      "安静比较：输出 LT/EQ/GT 与 Flags[5]；有 NaN 时三个关系位全 0（无序），只有 sNaN 置 NV。",
-      "CMP", "CMP", false,
-      "输出 LT/EQ/GT（各 1 位）与 Flags[5]；无序时三位全 0，只有 sNaN 置 NV。"},
-     kInAB, 2, kOutRelation, 4, &compareLogic},
-    {{kClassifyId, "local.float-ops/fp32-classify", "FP32 Classify",
-      "输出 Class[10]，位序 bit0…bit9 = -inf, -正规, -次正规, -0, +0, +次正规, +正规, +inf, sNaN, qNaN。",
-      "CLS", "CLS", false,
-      "Class[10] 位序 bit0…bit9 = -inf, -norm, -sub, -0, +0, +sub, +norm, +inf, sNaN, qNaN。"},
-     kInA, 1, kOutClass, 1, &classifyLogic},
-    {{kFusedMultiplyAddId, "local.float-ops/fp32-fma", "FP32 Fused Multiply Add",
-      "A × B + C，只舍入一次（默认 RNE），输出 R[32] 与 Flags[5]。",
-      "FMA", "a×b+c", true, nullptr},
-     kInABC, 3, kOutRFlags, 2, &fusedMultiplyAddLogic},
-    {{kRemainderId, "local.float-ops/fp32-remainder", "FP32 Remainder",
-      "IEEE remainder（不是 fmod）：商的整数部分固定按最近偶数取整，不受元件舍入模式影响。",
-      "REM", "REM", false,
-      "IEEE remainder：商的整数按最近偶数取整，和元件舍入模式无关，所以本体上不显示舍入框。"},
-     kInAB, 2, kOutRFlags, 2, &remainderLogic},
-    {{kRoundToIntegralId, "local.float-ops/fp32-round-to-integral", "FP32 Round To Integral",
-      "按元件自己的舍入模式取整到整数值；结果与原值不同就置 NX。",
-      "RND", "RND", true, nullptr},
-     kInA, 1, kOutRFlags, 2, &roundToIntegralLogic},
-    {{kMinimumId, "local.float-ops/fp32-minimum", "FP32 MinimumNumber",
-      "IEEE 754-2019 minimumNumber：只有一个 NaN 时取另一个；两个都是 NaN 得 canonical NaN，sNaN 置 NV。",
-      "MIN", "MIN", false,
-      "2019 minimumNumber：一个 NaN 时取另一个操作数，sNaN 置 NV，不做 minNum 的那种悄悄取数。"},
-     kInAB, 2, kOutRFlags, 2, &minimumLogic},
-    {{kMaximumId, "local.float-ops/fp32-maximum", "FP32 MaximumNumber",
-      "IEEE 754-2019 maximumNumber：只有一个 NaN 时取另一个；两个都是 NaN 得 canonical NaN，sNaN 置 NV。",
-      "MAX", "MAX", false,
-      "2019 maximumNumber：一个 NaN 时取另一个操作数，sNaN 置 NV，不做 maxNum 的那种悄悄取数。"},
-     kInAB, 2, kOutRFlags, 2, &maximumLogic},
-    {{kI32ToFp32Id, "local.float-ops/i32-to-fp32", "I32 To FP32",
-      "32 位有符号整数转 FP32，按元件自己的舍入模式；不能精确表示时置 NX。",
-      "I2F", "I→F", true,
-      "输入按二进制补码解释；不能精确表示时置 NX，永远不会置 NV。"},
-     kInI32, 1, kOutRFlags, 2, &i32ToFp32Logic},
-    {{kU32ToFp32Id, "local.float-ops/u32-to-fp32", "U32 To FP32",
-      "32 位无符号整数转 FP32，按元件自己的舍入模式；不能精确表示时置 NX。",
-      "U2F", "U→F", true,
-      "输入按无符号解释；不能精确表示时置 NX，永远不会置 NV。"},
-     kInU32, 1, kOutRFlags, 2, &u32ToFp32Logic},
-    {{kFp32ToI32Id, "local.float-ops/fp32-to-i32", "FP32 To I32",
-      "FP32 转 32 位有符号整数，按元件自己的舍入模式；NaN、无穷或越界置 NV 并饱和。",
-      "F2I", "F→I", true,
-      "越界/NaN/无穷置 NV 并饱和到 INT32_MAX / INT32_MIN；-0 转 0 不置 NV。"},
-     kInA, 1, kOutI32Flags, 2, &fp32ToI32Logic},
-    {{kFp32ToU32Id, "local.float-ops/fp32-to-u32", "FP32 To U32",
-      "FP32 转 32 位无符号整数，按元件自己的舍入模式；NaN、无穷或越界置 NV 并饱和。",
-      "F2U", "F→U", true,
-      "越界/NaN/无穷置 NV 并饱和到 UINT32_MAX / 0；负的非零值按越界处理，-0 转 0 不置 NV。"},
-     kInA, 1, kOutU32Flags, 2, &fp32ToU32Logic},
-    {{kSplitBitsId, "local.float-ops/fp32-split-bits", "FP32 Split Bits",
-      "把 32 位模式拆成 Sign[1]、Exponent[8]（带偏移的位段）与 Significand[23]。",
-      "SPLIT", "SPLIT", false,
-      "输出 Sign[1] / Exponent[8] / Significand[23]，都是原始位段，不做任何解释或规范化。"},
-     kInA, 1, kOutSplit, 3, &splitBitsLogic},
-    {{kMakeBitsId, "local.float-ops/fp32-make-bits", "FP32 Make Bits",
-      "把 Sign[1]、Exponent[8]、Significand[23] 拼回 32 位模式（Split Bits 的逆）。",
-      "MAKE", "MAKE", false,
-      "输入 Sign[1] / Exponent[8] / Significand[23]，直接拼成 32 位模式，不做数值检查。"},
-     kInSign, 3, kOutR, 1, &makeBitsLogic},
+/* What one family contributes to every width it is registered in.  The text
+   fields carry the four width placeholders `expand()` knows: `%F` is "FP16"/
+   "FP32"/"FP64", `%W` the width, `%E`/`%S` the exponent and significand field
+   widths of that format. */
+struct FamilySpec {
+    const char* tail;        /* "ADD_1": the five characters after the width digits */
+    const char* slug;        /* "fp%W-add": the tail of "local.float-ops/…" */
+    const char* group;       /* the folder under 浮点/FP32 … under 浮点/FP64 */
+    const char* name;        /* "%F Add" */
+    const char* description;
+    const char* board_name;  /* what an unlabelled instance prints (ADD) */
+    const char* symbol;      /* what the body prints in the middle (+) */
+    bool rounding;
+    uint32_t widths;
+    PinShape inputs;
+    PinShape outputs;
+    TCLogicCallbackV2 callback;
+    /* The layout this family registers in binary32.  The Constant is the one
+       exception - its FP32 blob is archived at 16 bytes, so the two newer widths
+       use the 28-byte one; `layoutOf` below is the whole rule. */
+    ConfigLayout layout;
+    BodyKind body;
 };
 
+/* Which configuration layout a (family, width) pair actually registers.  Only
+   the Constant differs: binary32 shipped with a four-byte pattern field and its
+   label at +8, and that blob is in players' saves, so binary16 and binary64
+   share the wider layout with the 64-bit pattern field instead (components.hpp).
+   Every other family's blob is the same shape in all three widths. */
+ConfigLayout layoutOf(const FamilySpec& family, uint32_t format) {
+    if (family.layout == ConfigLayout::constant_narrow &&
+        format != tcfp::kFormatBinary32)
+        return ConfigLayout::constant_wide;
+    return family.layout;
+}
+
+/* In registration order: the three the vertical slice shipped first, then the
+   catalogue of plan 6.2 and 6.3 in the order the drawer has always shown it.
+   The ids are built from `tail`, so an FP32 row here is the same eight ASCII
+   characters the earlier releases saved. */
+const FamilySpec kFamilies[] = {
+    {"CONS1", "fp%W-constant", "常量与显示", "%F Constant",
+     "输出一个 %F 位模式；选中后由加载器在底部抽屉里编辑（FP32 是十进制 + 原始位两行，"
+     "FP16/FP64 是原始位行）。",
+     "CONST", "", false, kAllWidths, pins_none, pins_out_r, &constantLogic,
+     ConfigLayout::constant_narrow, BodyKind::constant_value},
+    {"ADD_1", "fp%W-add", "计算", "%F Add",
+     "A + B，按元件自己的舍入模式（默认 RNE），输出 R[%W] 与本次运算的 Flags[5]。",
+     "ADD", "+", true, kAllWidths, pins_in_ab, pins_out_r_flags, &addLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"DISP1", "fp%W-display", "常量与显示", "%F Display",
+     "把 %W 位输入显示成人读文本；显示方式按元件保存，暂停时也刷新。",
+     "DISP", "", false, kAllWidths, pins_in_a, pins_none, &displayLogic,
+     ConfigLayout::display, BodyKind::display_text},
+    {"SUB_1", "fp%W-subtract", "计算", "%F Subtract",
+     "A − B，按元件自己的舍入模式（默认 RNE），输出 R[%W] 与本次运算的 Flags[5]。",
+     "SUB", "−", true, kAllWidths, pins_in_ab, pins_out_r_flags, &subtractLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"MUL_1", "fp%W-multiply", "计算", "%F Multiply",
+     "A × B，按元件自己的舍入模式（默认 RNE），输出 R[%W] 与本次运算的 Flags[5]。",
+     "MUL", "×", true, kAllWidths, pins_in_ab, pins_out_r_flags, &multiplyLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"DIV_1", "fp%W-divide", "计算", "%F Divide",
+     "A ÷ B，按元件自己的舍入模式（默认 RNE）；除数为零置 DZ，输出 R[%W] 与 Flags[5]。",
+     "DIV", "÷", true, kAllWidths, pins_in_ab, pins_out_r_flags, &divideLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"SQT_1", "fp%W-square-root", "计算", "%F Square Root",
+     "√A，按元件自己的舍入模式（默认 RNE）；负数置 NV 并返回 canonical NaN。",
+     "SQRT", "√", true, kAllWidths, pins_in_a, pins_out_r_flags, &squareRootLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"NEG_1", "fp%W-negate", "计算", "%F Negate",
+     "翻转符号位，其余位原样保留（payload 不丢，不置任何 flag）。",
+     "NEG", "−x", false, kAllWidths, pins_in_a, pins_out_r, &negateLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"ABS_1", "fp%W-absolute", "计算", "%F Absolute",
+     "清掉符号位，其余位原样保留（payload 不丢，不置任何 flag）。",
+     "ABS", "|x|", false, kAllWidths, pins_in_a, pins_out_r, &absoluteLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"CMP_1", "fp%W-compare", "比较", "%F Compare",
+     "安静比较：输出 LT/EQ/GT 与 Flags[5]；有 NaN 时三个关系位全 0（无序），只有 sNaN 置 NV。",
+     "CMP", "CMP", false, kAllWidths, pins_in_ab, pins_out_relation, &compareLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"CLS_1", "fp%W-classify", "比较", "%F Classify",
+     "输出 Class[10]，位序 bit0…bit9 = -inf, -正规, -次正规, -0, +0, +次正规, +正规, +inf, "
+     "sNaN, qNaN。",
+     "CLS", "CLS", false, kAllWidths, pins_in_a, pins_out_class, &classifyLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"FMA_1", "fp%W-fma", "计算", "%F Fused Multiply Add",
+     "A × B + C，只舍入一次（默认 RNE），输出 R[%W] 与 Flags[5]。",
+     "FMA", "a×b+c", true, kWidth16 | kWidth32, pins_in_abc, pins_out_r_flags,
+     &fusedMultiplyAddLogic, ConfigLayout::ops, BodyKind::operator_symbol},
+    {"REM_1", "fp%W-remainder", "计算", "%F Remainder",
+     "IEEE remainder（不是 fmod）：商的整数部分固定按最近偶数取整，不受元件舍入模式影响。",
+     "REM", "REM", false, kAllWidths, pins_in_ab, pins_out_r_flags, &remainderLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"RND_1", "fp%W-round-to-integral", "计算", "%F Round To Integral",
+     "按元件自己的舍入模式取整到整数值；结果与原值不同就置 NX。",
+     "RND", "RND", true, kAllWidths, pins_in_a, pins_out_r_flags, &roundToIntegralLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"MIN_1", "fp%W-minimum", "比较", "%F MinimumNumber",
+     "IEEE 754-2019 minimumNumber：只有一个 NaN 时取另一个；两个都是 NaN 得 canonical NaN，"
+     "sNaN 置 NV。",
+     "MIN", "MIN", false, kAllWidths, pins_in_ab, pins_out_r_flags, &minimumLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"MAX_1", "fp%W-maximum", "比较", "%F MaximumNumber",
+     "IEEE 754-2019 maximumNumber：只有一个 NaN 时取另一个；两个都是 NaN 得 canonical NaN，"
+     "sNaN 置 NV。",
+     "MAX", "MAX", false, kAllWidths, pins_in_ab, pins_out_r_flags, &maximumLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"I2F_1", "i32-to-fp%W", "转换", "I32 To %F",
+     "32 位有符号整数转 %F，按元件自己的舍入模式；不能精确表示时置 NX。",
+     "I2F", "I→F", true, kAllWidths, pins_in_i32, pins_out_r_flags, &i32ToFp32Logic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"U2F_1", "u32-to-fp%W", "转换", "U32 To %F",
+     "32 位无符号整数转 %F，按元件自己的舍入模式；不能精确表示时置 NX。",
+     "U2F", "U→F", true, kAllWidths, pins_in_u32, pins_out_r_flags, &u32ToFp32Logic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"F2I_1", "fp%W-to-i32", "转换", "%F To I32",
+     "%F 转 32 位有符号整数，按元件自己的舍入模式；NaN、无穷或越界置 NV 并饱和。",
+     "F2I", "F→I", true, kAllWidths, pins_in_a, pins_out_i32_flags, &fp32ToI32Logic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"F2U_1", "fp%W-to-u32", "转换", "%F To U32",
+     "%F 转 32 位无符号整数，按元件自己的舍入模式；NaN、无穷或越界置 NV 并饱和。",
+     "F2U", "F→U", true, kAllWidths, pins_in_a, pins_out_u32_flags, &fp32ToU32Logic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"SPL_1", "fp%W-split-bits", "位与拆分", "%F Split Bits",
+     "把 %W 位模式拆成 Sign[1]、Exponent[%E]（带偏移的位段）与 Significand[%S]。",
+     "SPLIT", "SPLIT", false, kAllWidths, pins_in_a, pins_out_split, &splitBitsLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+    {"MKB_1", "fp%W-make-bits", "位与拆分", "%F Make Bits",
+     "把 Sign[1]、Exponent[%E]、Significand[%S] 拼回 %W 位模式（Split Bits 的逆）。",
+     "MAKE", "MAKE", false, kAllWidths, pins_in_split, pins_out_r, &makeBitsLogic,
+     ConfigLayout::ops, BodyKind::operator_symbol},
+};
+
+/* One registered type: the family row, expanded for one width. */
+struct CatalogueType {
+    CatalogueInfo info;
+    const TCComponentPinV2* inputs;
+    uint32_t input_count;
+    const TCComponentPinV2* outputs;
+    uint32_t output_count;
+    TCLogicCallbackV2 callback;
+    ConfigLayout layout;
+    BodyKind body;
+    /* The configuration this type registers as its default, with its own format
+       byte.  All four layouts live in the entry so the host can be handed a
+       pointer into it; registration copies the bytes. */
+    ConstantConfig constant_narrow{};
+    ConstantConfigWide constant_wide{};
+    OpsConfig ops{};
+    DisplayConfig display{};
+};
+
+const void* defaultConfigOf(const CatalogueType& type, uint32_t* size) {
+    switch (type.layout) {
+        case ConfigLayout::constant_narrow:
+            *size = sizeof(ConstantConfig);
+            return &type.constant_narrow;
+        case ConfigLayout::constant_wide:
+            *size = sizeof(ConstantConfigWide);
+            return &type.constant_wide;
+        case ConfigLayout::display:
+            *size = sizeof(DisplayConfig);
+            return &type.display;
+        case ConfigLayout::ops: default: break;
+    }
+    *size = sizeof(OpsConfig);
+    return &type.ops;
+}
+
+/* %F, %W, %E and %S inside a family's text. */
+std::string expand(const char* text, uint32_t format) {
+    const tcfp::Layout& layout = tcfp::layoutFor(format);
+    std::string out;
+    for (const char* p = text; p && *p; ++p) {
+        if (*p != '%') {
+            out.push_back(*p);
+            continue;
+        }
+        ++p;
+        switch (*p) {
+            case 'F': out += "FP"; out += std::to_string(format); break;
+            case 'W': out += std::to_string(format); break;
+            case 'E': out += std::to_string(layout.exponent_bits); break;
+            case 'S': out += std::to_string(layout.significand_bits); break;
+            case '\0': out.push_back('%'); --p; break;
+            default: out.push_back('%'); out.push_back(*p); break;
+        }
+    }
+    return out;
+}
+
+/* The catalogue, built once.  Strings are kept in a deque: its elements never
+   move, so the `const char*` the entries hand out stay valid for the process. */
+struct CatalogueStore {
+    std::deque<std::string> strings;
+    std::vector<CatalogueType> types;
+    std::map<uint64_t, size_t> byId;
+    const char* keep(const std::string& text) {
+        strings.push_back(text);
+        return strings.back().c_str();
+    }
+};
+
+CatalogueStore buildCatalogue() {
+    CatalogueStore store;
+    /* binary16 first, then the archived binary32 block (its order is the
+       drawer's own order and has not changed), then binary64. */
+    const uint32_t formats[] = {tcfp::kFormatBinary16, tcfp::kFormatBinary32,
+                                tcfp::kFormatBinary64};
+    for (uint32_t format : formats) {
+        const uint32_t bit = format == tcfp::kFormatBinary16
+                                 ? kWidth16
+                                 : (format == tcfp::kFormatBinary64 ? kWidth64 : kWidth32);
+        for (const FamilySpec& family : kFamilies) {
+            if (!(family.widths & bit)) continue;
+            CatalogueType type{};
+            type.info.id = floatTypeId(format, family.tail);
+            type.info.format = format;
+            type.info.layout = layoutOf(family, format);
+            type.info.body = family.body;
+            type.info.type_id = store.keep("local.float-ops/" + expand(family.slug, format));
+            type.info.group = family.group;
+            type.info.name = store.keep(expand(family.name, format));
+            type.info.description = store.keep(expand(family.description, format));
+            type.info.board_name = family.board_name;
+            type.info.symbol = family.symbol;
+            type.info.rounding = family.rounding;
+            const PinSet inputs = pinsFor(family.inputs, format);
+            const PinSet outputs = pinsFor(family.outputs, format);
+            type.inputs = inputs.pins;
+            type.input_count = inputs.count;
+            type.outputs = outputs.pins;
+            type.output_count = outputs.count;
+            type.callback = family.callback;
+            type.layout = layoutOf(family, format);
+            type.body = family.body;
+            switch (type.layout) {
+                case ConfigLayout::constant_narrow:
+                    type.constant_narrow = constantDefault(format);
+                    break;
+                case ConfigLayout::constant_wide:
+                    type.constant_wide = constantWideDefault(format);
+                    break;
+                case ConfigLayout::display:
+                    type.display = displayDefault(format);
+                    break;
+                case ConfigLayout::ops: default:
+                    type.ops = opsDefault(format);
+                    break;
+            }
+            store.byId[type.info.id] = store.types.size();
+            store.types.push_back(type);
+        }
+    }
+    return store;
+}
+
+const CatalogueStore& catalogueStore() {
+    static const CatalogueStore store = buildCatalogue();
+    return store;
+}
 const CatalogueType* catalogueEntry(uint64_t id) {
-    for (const CatalogueType& entry : kCatalogue)
-        if (entry.info.id == id) return &entry;
-    return nullptr;
+    const CatalogueStore& store = catalogueStore();
+    const auto found = store.byId.find(id);
+    return found == store.byId.end() ? nullptr : &store.types[found->second];
+}
+
+/* The types one width registered, for the log line that says what a load
+   actually produced. */
+size_t catalogueCountOfWidth(uint32_t format) {
+    size_t count = 0;
+    for (const CatalogueType& type : catalogueStore().types)
+        if (type.info.format == format) ++count;
+    return count;
+}
+
+/* A configuration an earlier release wrote: the same payload without the format
+   byte, or without the label.  The migration inserts the width the type it
+   belongs to works in and refuses a payload that is not a legal value, in which
+   case the host keeps the record and the instance runs on the registered
+   default.
+
+   Only the three binary32 types have an older layout at all: FP16/FP64 shipped
+   with this schema, so a record of theirs is always schema 3 and the copy below
+   is their whole path.  The copy checks the width byte as well, so a record that
+   says 32 can never be adopted by an FP16 type and read at the wrong size
+   (plan 7.1). */
+int migrateLegacyConfig(void* user, uint32_t from_schema, const void* from_data,
+                        uint32_t from_bytes, uint32_t to_schema, void* out,
+                        uint32_t capacity) {
+    const uint64_t type = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(user));
+    if (to_schema != kConfigSchema) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+    if (!from_data || !out) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+    const CatalogueType* entry = catalogueEntry(type);
+    if (!entry) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+    const uint32_t format = entry->info.format;
+    if (from_schema == kConfigSchema && from_bytes == capacity) {
+        if (static_cast<const uint8_t*>(from_data)[0] != static_cast<uint8_t>(format))
+            return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+        std::memcpy(out, from_data, capacity);
+        return TC_COMPONENT_CONFIG_MIGRATE_OK;
+    }
+    /* Schema 2 is this release minus the label: the same fields, then an empty
+       label where "CONST"/"ADD"/"DISP" is shown - which is exactly what the
+       board showed before the label existed.  Only binary32 ever wrote it. */
+    if (from_schema == kLabelSchema) {
+        if (format != tcfp::kFormatBinary32) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+        if (type == kConstantId && from_bytes == sizeof(ConstantConfig) - kLabelBytes &&
+            capacity == sizeof(ConstantConfig)) {
+            ConstantConfig config = constantDefault(format);
+            std::memcpy(&config, from_data, from_bytes);
+            config.format = static_cast<uint8_t>(format);
+            std::memcpy(out, &config, sizeof(config));
+            return TC_COMPONENT_CONFIG_MIGRATE_OK;
+        }
+        if (type == kAddId && from_bytes == sizeof(AddConfig) - kLabelBytes &&
+            capacity == sizeof(AddConfig)) {
+            AddConfig config = addDefault(format);
+            std::memcpy(&config, from_data, from_bytes);
+            config.format = static_cast<uint8_t>(format);
+            std::memcpy(out, &config, sizeof(config));
+            return TC_COMPONENT_CONFIG_MIGRATE_OK;
+        }
+        if (type == kDisplayId && from_bytes == sizeof(DisplayConfig) - kLabelBytes &&
+            capacity == sizeof(DisplayConfig)) {
+            DisplayConfig config = displayDefault(format);
+            std::memcpy(&config, from_data, from_bytes);
+            config.format = static_cast<uint8_t>(format);
+            std::memcpy(out, &config, sizeof(config));
+            return TC_COMPONENT_CONFIG_MIGRATE_OK;
+        }
+        /* The catalogue types: the only payload an older build could have
+           written for one of them is schema 2, this release's ops layout
+           without the label. */
+        if (entry->layout == ConfigLayout::ops &&
+            from_bytes == sizeof(OpsConfig) - kLabelBytes &&
+            capacity == sizeof(OpsConfig)) {
+            OpsConfig config = opsDefault(format);
+            std::memcpy(&config, from_data, from_bytes);
+            config.format = static_cast<uint8_t>(format);
+            std::memcpy(out, &config, sizeof(config));
+            return TC_COMPONENT_CONFIG_MIGRATE_OK;
+        }
+        return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+    }
+    /* Schema 1 is the development build's layout: the value alone for a
+       Constant, the choice byte alone for an Add or a Display. */
+    if (from_schema != kLegacyConfigSchema) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+    if (format != tcfp::kFormatBinary32) return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+    if (type == kConstantId && from_bytes == sizeof(uint32_t) &&
+        capacity == sizeof(ConstantConfig)) {
+        ConstantConfig config = constantDefault(format);
+        std::memcpy(&config.bits, from_data, sizeof(config.bits));
+        std::memcpy(out, &config, sizeof(config));
+        return TC_COMPONENT_CONFIG_MIGRATE_OK;
+    }
+    if (type == kAddId && from_bytes == sizeof(uint8_t) && capacity == sizeof(AddConfig)) {
+        uint8_t rounding = 0;
+        std::memcpy(&rounding, from_data, sizeof(rounding));
+        if (rounding > static_cast<uint8_t>(tcfp::FPRounding::toward_positive))
+            return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+        AddConfig config = addDefault(format);
+        config.rounding = rounding;
+        std::memcpy(out, &config, sizeof(config));
+        return TC_COMPONENT_CONFIG_MIGRATE_OK;
+    }
+    if (type == kDisplayId && from_bytes == sizeof(uint8_t) &&
+        capacity == sizeof(DisplayConfig)) {
+        uint8_t mode = 0;
+        std::memcpy(&mode, from_data, sizeof(mode));
+        if (mode > static_cast<uint8_t>(tcfp::DisplayMode::hex_only))
+            return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
+        DisplayConfig config = displayDefault(format);
+        config.mode = mode;
+        std::memcpy(out, &config, sizeof(config));
+        return TC_COMPONENT_CONFIG_MIGRATE_OK;
+    }
+    return TC_COMPONENT_CONFIG_MIGRATE_REJECT;
 }
 
 /* ---- the component column's picture (tc.component.render V5) -------------
@@ -1416,10 +1884,7 @@ void registerPictures() {
         else
             ++missing;
     };
-    apply(kConstantId);
-    apply(kAddId);
-    apply(kDisplayId);
-    for (const CatalogueType& entry : kCatalogue) apply(entry.info.id);
+    for (const CatalogueType& entry : catalogueStore().types) apply(entry.info.id);
     char line[320] = {};
     std::snprintf(line, sizeof(line),
                   "float-ops V5: %d of %d component pictures registered from %s",
@@ -1450,40 +1915,120 @@ BodyRect catalogueBody(const CatalogueType& entry) {
     return bodyRectForPins(minRow, maxRow);
 }
 
-/* One catalogue type, drawn exactly like the three M2 components: the stock
-   face, the 32 badge, the name in the top right, the symbol in the middle, the
-   pins on the 3.0 lane, and - only for the types whose arithmetic rounds - the
+/* One type on the board, drawn exactly like the stock parts: the stock face, the
+   width badge of its own format, the name in the top right corner, the middle of
+   the body (the operator, the constant's value or the display's rows), the pins
+   on the 3.0 lane, and - only for the types whose arithmetic rounds - the
    rounding badge next to the width box.  The rounding *choice* is a row in the
-   game's own drawer (components_ui.cpp), never a popup on the board. */
-void drawCatalogueType(const TCComponentRenderFrameV1& frame, const CatalogueType& entry,
-                       const OpsConfig& config, InstanceBoxes* out, char* shownText,
-                       size_t textCapacity, char* shownName, size_t nameCapacity) {
-    int minRow = 0, maxRow = 0;
-    cataloguePinSpan(entry, &minRow, &maxRow);
-    const BodyRect body = bodyRectForPins(minRow, maxRow);
-    out->body = hitBox(frame, body.x0, body.y0, body.x1, body.y1);
-    out->width = hitBox(frame, widthBoxX0(body), widthBoxY0(body),
-                        widthBoxX0(body) + kBoxWidth, widthBoxY0(body) + kBoxHeight);
-    out->rounding = entry.info.rounding
-                        ? hitBox(frame, widthBoxX0(body) + kBoxWidth + 0.14f,
-                                 widthBoxY0(body),
-                                 widthBoxX0(body) + kBoxWidth + 0.14f + 1.24f,
-                                 widthBoxY0(body) + kBoxHeight)
-                        : out->width;
-    drawChrome(frame, body, entry.info.board_name, config.label, out->body.hovered);
-    if (entry.info.rounding)
-        drawRoundingBox(frame, body, roundingOf(config.rounding), out->rounding.hovered,
-                        false);
-    drawTextCells(frame, 0.f, body.centerY, kValueCapCells, TextAlign::centre, true,
-                  bodyText(), entry.info.symbol);
-    for (uint32_t index = 0; index < entry.input_count; ++index)
-        drawPin(frame, -kPinLaneX, static_cast<float>(inputPinRow(index, entry.input_count)),
-                body.x0);
-    for (uint32_t index = 0; index < entry.output_count; ++index)
-        drawPin(frame, kPinLaneX, static_cast<float>(outputPinRow(index)), body.x1);
-    std::snprintf(shownText, textCapacity, "%s", entry.info.symbol);
-    std::snprintf(shownName, nameCapacity, "%s",
-                  config.label[0] ? config.label : entry.info.board_name);
+   game's own drawer (editor.cpp), never a popup on the board. */
+void drawBody(const TCComponentRenderFrameV1& frame, const CatalogueType& type,
+              const BodyRect& body, InstanceBoxes* out, char* shownText,
+              size_t textCapacity, char* shownName, size_t nameCapacity) {
+    const uint32_t format = type.info.format;
+    auto drawPins = [&]() {
+        for (uint32_t index = 0; index < type.input_count; ++index)
+            drawPin(frame, -kPinLaneX,
+                    static_cast<float>(inputPinRow(index, type.input_count)), body.x0);
+        for (uint32_t index = 0; index < type.output_count; ++index)
+            drawPin(frame, kPinLaneX, static_cast<float>(outputPinRow(index)), body.x1);
+    };
+    switch (type.body) {
+        case BodyKind::constant_value: {
+            uint64_t bits = 0;
+            char label[kLabelBytes] = {};
+            if (type.layout == ConfigLayout::constant_narrow) {
+                const ConstantConfig config = decodeOr<ConstantConfig>(
+                    frame.config, frame.config_size, frame.config_schema,
+                    constantDefault(format), format);
+                bits = config.bits;
+                std::snprintf(label, sizeof(label), "%s", config.label);
+            } else {
+                const ConstantConfigWide config = decodeOr<ConstantConfigWide>(
+                    frame.config, frame.config_size, frame.config_schema,
+                    constantWideDefault(format), format);
+                bits = config.bits;
+                std::snprintf(label, sizeof(label), "%s", config.label);
+            }
+            drawChrome(frame, body, type.info.board_name, label, out->body.hovered,
+                       widthDigits(format));
+            drawPins();
+            /* The value is printed in the middle of the body, in the same place
+               and at the same size the stock Constant prints its own: the
+               decimal on its own, because a constant's value is the one thing
+               the player reads off the board.  A value that would not fit the
+               body is shrunk until it does. */
+            char shortest[48] = {};
+            tcfp::format_shortest_for(format, bits, shortest, sizeof(shortest));
+            std::snprintf(shownText, textCapacity, "%s", shortest);
+            std::snprintf(shownName, nameCapacity, "%s",
+                          label[0] ? label : type.info.board_name);
+            drawFittedValue(frame, 0.f, 0.f, kValueCapCells, kValueMaxCells, bodyText(),
+                            shortest);
+            break;
+        }
+        case BodyKind::display_text: {
+            const DisplayConfig config = decodeOr<DisplayConfig>(
+                frame.config, frame.config_size, frame.config_schema,
+                displayDefault(format), format);
+            drawChrome(frame, body, type.info.board_name, config.label, out->body.hovered,
+                       widthDigits(format));
+            drawPins();
+            /* The value is this component's whole point, so it is split over the
+               value rows: the decimal on the stock value row, the bit pattern on
+               a smaller row under it, never on top of the label.  A mode that
+               shows only one of them uses the value row alone. */
+            uint64_t shown = 0;
+            {
+                std::lock_guard<std::mutex> lock(valueMutex);
+                const auto found = values.find(frame.instance_id);
+                if (found != values.end()) shown = found->second;
+            }
+            char decimal[48] = {};
+            char hex[40] = {};
+            tcfp::format_shortest_for(format, shown, decimal, sizeof(decimal));
+            tcfp::format_hex_for(format, shown, hex, sizeof(hex));
+            std::snprintf(shownText, textCapacity, "%s", decimal);
+            std::snprintf(shownName, nameCapacity, "%s",
+                          config.label[0] ? config.label : type.info.board_name);
+            const tcfp::DisplayMode mode = displayModeOf(config.mode);
+            const bool showDecimal = mode == tcfp::DisplayMode::decimal_and_hex ||
+                                     mode == tcfp::DisplayMode::shortest ||
+                                     mode == tcfp::DisplayMode::scientific;
+            const bool showHex = mode == tcfp::DisplayMode::decimal_and_hex ||
+                                 mode == tcfp::DisplayMode::hex_only;
+            /* One row when the mode shows a single form, two when it shows
+               both; the row that is alone stays on the centre, which is where
+               the stock parts print their value. */
+            const bool both = showDecimal && showHex;
+            if (showDecimal)
+                drawFittedValue(frame, 0.f, both ? kDisplayValueRow : 0.f,
+                                kValueCapCells, kValueMaxCells, bodyText(), decimal);
+            if (showHex)
+                drawFittedValue(frame, 0.f, both ? kDisplayHexRow : 0.f,
+                                both ? kDisplayHexCapCells : kValueCapCells,
+                                kValueMaxCells, boxText(), hex);
+            break;
+        }
+        case BodyKind::operator_symbol: default: {
+            const OpsConfig config = decodeOr<OpsConfig>(
+                frame.config, frame.config_size, frame.config_schema,
+                opsDefault(format), format);
+            drawChrome(frame, body, type.info.board_name, config.label, out->body.hovered,
+                       widthDigits(format));
+            if (type.info.rounding)
+                drawRoundingBox(frame, body, roundingOf(config.rounding),
+                                out->rounding.hovered, false);
+            /* The operator sits in the middle of the body, where the stock parts
+               print their value (plan 7.2). */
+            drawTextCells(frame, 0.f, body.centerY, kValueCapCells, TextAlign::centre,
+                          true, bodyText(), type.info.symbol);
+            drawPins();
+            std::snprintf(shownText, textCapacity, "%s", type.info.symbol);
+            std::snprintf(shownName, nameCapacity, "%s",
+                          config.label[0] ? config.label : type.info.board_name);
+            break;
+        }
+    }
 }
 
 /* ---- render callback ---------------------------------------------------- */
@@ -1493,8 +2038,8 @@ void renderCallback(void*, const TCComponentRenderFrameV1* frame) {
     InstanceBoxes entry{};
     entry.custom_id = frame->custom_id;
     /* Nothing on the body opens anything: the editor is the game's own component
-       drawer (components_ui.cpp), so the boxes below exist for the hover
-       highlight and for the drawer to tell this Mod's types apart. */
+       drawer (editor.cpp), so the boxes below exist for the hover highlight and
+       for the drawer to tell this Mod's types apart. */
     /* What the body prints, for the layout line below: the render case reads it
        back to know whether the value it measures is the full-size one or a
        value that had to be shrunk to fit the body. */
@@ -1502,126 +2047,23 @@ void renderCallback(void*, const TCComponentRenderFrameV1* frame) {
     /* The name the body prints: the instance's own label, or the type's name
        when it has none (the stock rule). */
     char shownName[32] = {};
-    switch (frame->custom_id) {
-        case kConstantId: {
-            const ConstantConfig config = decodeOr<ConstantConfig>(
-                frame->config, frame->config_size, frame->config_schema,
-                constantDefault());
-            const BodyRect body = bodyRect(kBodyHalfHeight);
-            entry.body = hitBox(*frame, body.x0, body.y0, body.x1, body.y1);
-            entry.width = hitBox(*frame, widthBoxX0(body), widthBoxY0(body),
-                                 widthBoxX0(body) + kBoxWidth,
-                                 widthBoxY0(body) + kBoxHeight);
-            entry.rounding = entry.width;
-            drawChrome(*frame, body, "CONST", config.label, entry.body.hovered);
-            drawPin(*frame, kPinLaneX, kPinRowFirst, body.x1);
-            /* The value is printed in the middle of the body, in the same place
-               and at the same size the stock Constant prints its own: the
-               decimal on its own, because a constant's value is the one thing
-               the player reads off the board.  A value that would not fit the
-               body is shrunk until it does. */
-            char shortest[40] = {};
-            tcfp::format_shortest(config.bits, shortest, sizeof(shortest));
-            std::snprintf(shownText, sizeof(shownText), "%s", shortest);
-            std::snprintf(shownName, sizeof(shownName), "%s",
-                          config.label[0] ? config.label : "CONST");
-            drawFittedValue(*frame, 0.f, 0.f, kValueCapCells, kValueMaxCells,
-                            bodyText(), shortest);
-            break;
-        }
-        case kAddId: {
-            const AddConfig config = decodeOr<AddConfig>(
-                frame->config, frame->config_size, frame->config_schema, addDefault());
-            const BodyRect body = bodyRect(kBodyHalfHeight);
-            entry.body = hitBox(*frame, body.x0, body.y0, body.x1, body.y1);
-            const float roundingX0 = widthBoxX0(body) + kBoxWidth + 0.14f;
-            entry.width = hitBox(*frame, widthBoxX0(body), widthBoxY0(body),
-                                 widthBoxX0(body) + kBoxWidth,
-                                 widthBoxY0(body) + kBoxHeight);
-            entry.rounding = hitBox(*frame, roundingX0, widthBoxY0(body),
-                                    roundingX0 + 1.24f, widthBoxY0(body) + kBoxHeight);
-            drawChrome(*frame, body, "ADD", config.label, entry.body.hovered);
-            /* The rounding box shows what the instance is set to; the choice is
-               made in the drawer's own row (components_ui.cpp). */
-            drawRoundingBox(*frame, body, roundingOf(config.rounding),
-                            entry.rounding.hovered, false);
-            /* The operator sits in the middle of the body, where the stock parts
-               print their value (plan 7.2). */
-            drawTextCells(*frame, 0.f, 0.f, kValueCapCells, TextAlign::centre, true,
-                          bodyText(), "+");
-            std::snprintf(shownText, sizeof(shownText), "+");
-            std::snprintf(shownName, sizeof(shownName), "%s",
-                          config.label[0] ? config.label : "ADD");
-            /* Pin lanes as the loader reports them for a two-pin side:
-               in0=(-3,0) in1=(-3,1), out0=(3,0) out1=(3,1). */
-            drawPin(*frame, -kPinLaneX, kPinRowFirst, body.x0);
-            drawPin(*frame, -kPinLaneX, kPinRowSecond, body.x0);
-            drawPin(*frame, kPinLaneX, kPinRowFirst, body.x1);
-            drawPin(*frame, kPinLaneX, kPinRowSecond, body.x1);
-            break;
-        }
-        case kDisplayId: {
-            const DisplayConfig config = decodeOr<DisplayConfig>(
-                frame->config, frame->config_size, frame->config_schema,
-                displayDefault());
-            const BodyRect body = bodyRect(kBodyHalfHeight);
-            entry.body = hitBox(*frame, body.x0, body.y0, body.x1, body.y1);
-            entry.width = hitBox(*frame, widthBoxX0(body), widthBoxY0(body),
-                                 widthBoxX0(body) + kBoxWidth,
-                                 widthBoxY0(body) + kBoxHeight);
-            entry.rounding = entry.width;
-            drawChrome(*frame, body, "DISP", config.label, entry.body.hovered);
-            drawPin(*frame, -kPinLaneX, kPinRowFirst, body.x0);
-            /* The value is this component's whole point, so it is split over the
-               value rows: the decimal on the stock value row, the bit pattern on
-               a smaller row under it, never on top of the label.  A mode that
-               shows only one of them uses the value row alone. */
-            {
-                uint32_t shown = 0;
-                {
-                    std::lock_guard<std::mutex> lock(valueMutex);
-                    const auto found = values.find(frame->instance_id);
-                    if (found != values.end()) shown = found->second;
-                }
-                char decimal[40] = {};
-                char hex[32] = {};
-                tcfp::format_shortest(shown, decimal, sizeof(decimal));
-                tcfp::format_hex(shown, hex, sizeof(hex));
-                std::snprintf(shownText, sizeof(shownText), "%s", decimal);
-                std::snprintf(shownName, sizeof(shownName), "%s",
-                              config.label[0] ? config.label : "DISP");
-                const tcfp::DisplayMode mode = displayModeOf(config.mode);
-                const bool showDecimal = mode == tcfp::DisplayMode::decimal_and_hex ||
-                                         mode == tcfp::DisplayMode::shortest ||
-                                         mode == tcfp::DisplayMode::scientific;
-                const bool showHex = mode == tcfp::DisplayMode::decimal_and_hex ||
-                                     mode == tcfp::DisplayMode::hex_only;
-                /* One row when the mode shows a single form, two when it shows
-                   both; the row that is alone stays on the centre, which is
-                   where the stock parts print their value. */
-                const bool both = showDecimal && showHex;
-                if (showDecimal)
-                    drawFittedValue(*frame, 0.f, both ? kDisplayValueRow : 0.f,
-                                    kValueCapCells, kValueMaxCells, bodyText(), decimal);
-                if (showHex)
-                    drawFittedValue(*frame, 0.f, both ? kDisplayHexRow : 0.f,
-                                    both ? kDisplayHexCapCells : kValueCapCells,
-                                    kValueMaxCells, boxText(), hex);
-            }
-            break;
-        }
-        default: {
-            /* The M3/M4 catalogue: same face, same badge, same pin lane as the
-               three types above, drawn from the one table. */
-            const CatalogueType* catalogue = catalogueEntry(frame->custom_id);
-            if (!catalogue) return;
-            const OpsConfig config = decodeOr<OpsConfig>(
-                frame->config, frame->config_size, frame->config_schema, opsDefault());
-            drawCatalogueType(*frame, *catalogue, config, &entry, shownText,
-                              sizeof(shownText), shownName, sizeof(shownName));
-            break;
-        }
-    }
+    /* One path for every type: the table says which width this instance is, how
+       the body is laid out (the pins decide the face) and which of the three
+       middles it prints.  The three types that shipped first used to have their
+       own cases here; the table replaced them when the width cut tripled them. */
+    const CatalogueType* type = catalogueEntry(frame->custom_id);
+    if (!type) return;
+    const BodyRect body = catalogueBody(*type);
+    entry.body = hitBox(*frame, body.x0, body.y0, body.x1, body.y1);
+    const float roundingX0 = widthBoxX0(body) + kBoxWidth + 0.14f;
+    entry.width = hitBox(*frame, widthBoxX0(body), widthBoxY0(body),
+                         widthBoxX0(body) + kBoxWidth, widthBoxY0(body) + kBoxHeight);
+    entry.rounding = type->info.rounding
+                         ? hitBox(*frame, roundingX0, widthBoxY0(body),
+                                  roundingX0 + 1.24f, widthBoxY0(body) + kBoxHeight)
+                         : entry.width;
+    drawBody(*frame, *type, body, &entry, shownText, sizeof(shownText), shownName,
+             sizeof(shownName));
     /* One bounded line per type: the frame's scale, where the body landed on
        screen and where the pins are.  The true-game render case reads these
        numbers to measure the picture it captured instead of guessing which
@@ -1700,6 +2142,46 @@ void renderCallback(void*, const TCComponentRenderFrameV1* frame) {
     }
 }
 
+/* ---- board hover and the frame callback ---------------------------------- */
+/* Board state, not editor state: the drawer rows that used to live next to this
+   code are the loader's now (see editor.cpp), while the boxes under the pointer
+   are still what makes this Mod's parts highlight like the stock ones. */
+
+bool inside(const HitBox& box, const MousePoint& point) {
+    return box.valid && point.x >= box.min_x && point.x <= box.max_x &&
+           point.y >= box.min_y && point.y <= box.max_y;
+}
+
+/* The newest painted boxes under the pointer: the body highlights on hover, the
+   way the stock parts do. */
+void refreshHover(const MousePoint& point) {
+    std::lock_guard<std::mutex> lock(hitMutex);
+    ++frameCounter;
+    for (auto& entry : boxes) {
+        entry.second.body.hovered = inside(entry.second.body, point);
+        entry.second.width.hovered = inside(entry.second.width, point);
+        entry.second.rounding.hovered = inside(entry.second.rounding, point);
+    }
+}
+
+void frameCallback(void*, const TCFrame* frame) {
+    (void)frame;
+    /* The board first: a level that was left and entered again keeps its
+       component ids, so everything the old board left behind has to go before
+       the render boxes or a queued save can be mistaken for the new board's
+       state. */
+    serviceBoardChange();
+    /* Storage commits and Constant binds happen while the game is still
+       mutating/compiling the board.  Refresh on the following frame, when that
+       work is visible to the simulation. */
+    servicePendingBoardRefresh();
+    servicePendingCircuitSave();
+    if (!getMousePos) return;
+    MousePoint point{};
+    getMousePos(&point);
+    refreshHover(point);
+}
+
 }  // namespace internals
 
 /* ---- registration -------------------------------------------------------- */
@@ -1712,17 +2194,22 @@ bool initialize(const TCHost* host, TCPlugin* plugin) {
     /* The name every type registers under.  The prefix is what puts the float
        types into their own folder in the game's own component column: the
        palette code splits a custom prototype's name on "/" and walks the parts
-       as parent categories, so "浮点/FP32 Add" is a component called
-       "FP32 Add" inside a "浮点" folder, built by the game itself
-       (docs/research/palette-categories.md has the measurement).  The prefix is
-       in the name on purpose - it is the only channel the pinned build offers -
-       and TC_FLOATOPS_PALETTE overrides it so a test can compare the folded and
-       flat menus with one binary. */
+       as parent categories, so "浮点/FP32/计算/FP32 Add" is a component called
+       "FP32 Add" inside a 计算 folder inside an FP32 folder inside 浮点, all
+       built by the game itself (docs/research/palette-categories.md has the
+       measurement).  The prefix is in the name on purpose - it is the only
+       channel the pinned build offers - and TC_FLOATOPS_PALETTE overrides it so
+       a test can compare the folded and flat menus with one binary. */
     std::string namePrefix = "浮点/";
     if (const char* prefix = std::getenv("TC_FLOATOPS_PALETTE")) namePrefix = prefix;
-    auto registeredName = [&](const char* base) {
-        static std::vector<std::string> keep;
-        keep.push_back(namePrefix + base);
+    /* The folders the type lives in, under the Mod's own 浮点 folder.  The width
+       comes first and the operation's kind second: with three widths the flat
+       kind-first shape would put sixty-five rows in one node, while
+       "浮点 ▸ FP64 ▸ 比较" stays readable, and a player looking for a wider adder
+       finds all of them in one place (plan 6.4.1). */
+    auto registeredName = [&](uint32_t format, const char* group, const char* base) {
+        static std::deque<std::string> keep;
+        keep.push_back(namePrefix + formatLabel(format) + "/" + group + "/" + base);
         return keep.back().c_str();
     };
 
@@ -1752,126 +2239,34 @@ bool initialize(const TCHost* host, TCPlugin* plugin) {
         std::memcpy(&getMousePos, &mousePos, sizeof(getMousePos));
     }
 
-    static const TCComponentPinV2 kConstantOutputs[] = {{"r", "R", 32, 0}};
-    static const TCComponentPinV2 kAddInputs[] = {{"a", "A", 32, 0}, {"b", "B", 32, 0}};
-    static const TCComponentPinV2 kAddOutputs[] = {{"r", "R", 32, 0},
-                                                   {"f", "Flags", 5, 0}};
-    static const TCComponentPinV2 kDisplayInputs[] = {{"a", "A", 32, 0}};
+    /* Every type in the catalogue comes from that one table now: the pins (whose
+       widths are the format's own), the description, the configuration layout
+       and the callback the family supplies.  The definition's `user` pointer
+       carries the width, which is how one shared callback body knows which of
+       the three same-named types called it (formatUser above).
 
-    const ConstantConfig constant_config = constantDefault();
-    const AddConfig add_config = addDefault();
-    const DisplayConfig display_config = displayDefault();
-
-    struct Definition {
-        uint64_t id;
-        const char* type_id;
-        const char* name;
-        const char* description;
-        const TCComponentPinV2* inputs;
-        uint32_t input_count;
-        const TCComponentPinV2* outputs;
-        uint32_t output_count;
-        TCLogicCallbackV2 callback;
-        const void* config;
-        uint32_t config_size;
-        uint64_t gate_cost;
-        uint64_t delay;
-    };
-    /* The cost is the honest "unknown" for a sandbox package (plan 9): zero
-       declared gates and zero declared cycles, because the component is
+       The cost is the honest "unknown" for a sandbox package (plan 9): zero
+       declared gates and zero declared cycles, because the components are
        combinational and this release does not claim a scoring model. */
-    const Definition definitions[] = {
-        {kConstantId, "local.float-ops/fp32-constant", "FP32 Constant",
-         "输出一个 FP32 位模式；点本体可输入十进制、科学计数法或 bits:0xXXXXXXXX。",
-         nullptr, 0, kConstantOutputs, 1, &constantLogic, &constant_config,
-         sizeof(ConstantConfig), 0, 0},
-        {kAddId, "local.float-ops/fp32-add", "FP32 Add",
-         "A + B，按元件自己的舍入模式（默认 RNE），输出 R[32] 与本次运算的 Flags[5]。",
-         kAddInputs, 2, kAddOutputs, 2, &addLogic, &add_config, sizeof(AddConfig), 0, 0},
-        {kDisplayId, "local.float-ops/fp32-display", "FP32 Display",
-         "把 32 位输入显示成人读文本；显示方式按元件保存，暂停时也刷新。",
-         kDisplayInputs, 1, nullptr, 0, &displayLogic, &display_config,
-         sizeof(DisplayConfig), 0, 0},
-    };
-
-    for (const Definition& definition : definitions) {
-        TCComponentTypeDefinitionV2 registered{};
-        registered.size = sizeof(registered);
-        registered.version = TC_COMPONENT_TYPES_VERSION_2;
-        registered.custom_id = definition.id;
-        registered.type_id = definition.type_id;
-        registered.name = registeredName(definition.name);
-        registered.description = definition.description;
-        registered.inputs = definition.inputs;
-        registered.outputs = definition.outputs;
-        registered.input_count = definition.input_count;
-        registered.output_count = definition.output_count;
-        registered.state_words = 0;
-        registered.gate_cost = definition.gate_cost;
-        registered.delay = definition.delay;
-        registered.callback = definition.callback;
-        registered.lifecycle =
-            definition.id == kConstantId ? &kConstantLifecycle : nullptr;
-        registered.config_schema = kConfigSchema;
-        registered.config_size = definition.config_size;
-        registered.default_config = definition.config;
-        registered.config_migration_version = TC_COMPONENT_CONFIG_MIGRATION_VERSION_1;
-        registered.migrate_config = &migrateLegacyConfig;
-        registered.migration_user =
-            reinterpret_cast<void*>(static_cast<uintptr_t>(definition.id));
-        /* The pins go on the 3.0 lane, where the stock Constant and Static Value
-           put theirs, so the body can be the stock 4.92 x 2.93 cells with the
-           pins outside it instead of underneath it (see components_internal.hpp
-           and sdk/tc_service_api.h).  A loader older than the pin-lane cut
-           ignores the field and keeps the pins at 2.0, which would put them
-           back inside this body; the render callback notes that case below. */
-        registered.pin_lane = kPinLaneX;
-        const int status = tc::component_types::registerDefinition(types, &registered);
-        if (status != TC_COMPONENT_TYPES_OK) {
-            char detail[192] = {};
-            std::snprintf(detail, sizeof(detail),
-                          "float-ops M2: registering %s failed: %s (%d)",
-                          definition.type_id, tc::component_types::errorText(status),
-                          status);
-            note(detail);
-            return false;
-        }
-        if (renderReady)
-            (void)tc::component_render::setDrawCallback(render, definition.id,
-                                                       &renderCallback);
-        /* The M0 probes keep the game's default drawing; the M2 components draw
-           themselves, so the stock body would be a second silhouette behind
-           them. */
-        if (renderReady)
-            (void)tc::component_render::setDefaultDrawing(render, definition.id, false);
-        if (placementPreviewReady)
-            (void)tc::component_render::setPlacementPreview(renderV6, definition.id, true);
-        /* The three M2 types keep the stock face centred on their own cell, so
-           either form of the declaration gives the same five-by-three box. */
-        if (geometryCellsReady) {
-            (void)tc::component_geometry::setFootprintCells(geometryV3, definition.id, -2, -1,
-                                                            5, 3);
-        } else if (geometryReady) {
-            (void)tc::component_geometry::setFootprint(geometry, definition.id,
-                                                       kFootprintHalfWidth,
-                                                       kFootprintHalfHeight);
-        }
-    }
-
-    /* The M3/M4 catalogue (plan 6.2 and 6.3): the same registration, drawing and
-       configuration path as the three types above, one row of the table each.
-       The footprint follows the face, so a taller multi-pin type is draggable
-       over the whole body. */
-    const OpsConfig ops_config = opsDefault();
-    for (const CatalogueType& entry : kCatalogue) {
+    for (const CatalogueType& entry : catalogueStore().types) {
         const BodyRect body = catalogueBody(entry);
+        uint32_t configSize = 0;
+        const void* defaultConfig = defaultConfigOf(entry, &configSize);
         TCComponentTypeDefinitionV2 registered{};
         registered.size = sizeof(registered);
         registered.version = TC_COMPONENT_TYPES_VERSION_2;
         registered.custom_id = entry.info.id;
         registered.type_id = entry.info.type_id;
-        registered.name = registeredName(entry.info.name);
-        registered.description = entry.info.description;
+        registered.name =
+            registeredName(entry.info.format, entry.info.group, entry.info.name);
+        /* No description for the game to print.  The bottom drawer is where the
+           *property rows* live, and the game draws a type's description above
+           them - a paragraph of prose that pushed the rows down and crowded the
+           panel (player report 2026-09-28: "去除底部面板中的元件说明").  The text
+           is not lost: the family table above still carries it and the Mod's
+           README documents every type; it is simply not handed to
+           game.setPrototypeDescription. */
+        registered.description = nullptr;
         registered.inputs = entry.inputs;
         registered.outputs = entry.outputs;
         registered.input_count = entry.input_count;
@@ -1880,28 +2275,51 @@ bool initialize(const TCHost* host, TCPlugin* plugin) {
         registered.gate_cost = 0;
         registered.delay = 0;
         registered.callback = entry.callback;
+        registered.user = formatUser(entry.info.format);
+        /* A Constant publishes its value as soon as it is bound and whenever its
+           configuration moves; every other type only needs the edit
+           notification, because its outputs are already a function of the
+           configuration (addLogic reads the rounding mode out of the blob). */
+        registered.lifecycle = entry.body == BodyKind::constant_value
+                                   ? &kConstantLifecycle
+                                   : &kEditLifecycle;
         registered.config_schema = kConfigSchema;
-        registered.config_size = sizeof(OpsConfig);
-        registered.default_config = &ops_config;
+        registered.config_size = configSize;
+        registered.default_config = defaultConfig;
         registered.config_migration_version = TC_COMPONENT_CONFIG_MIGRATION_VERSION_1;
         registered.migrate_config = &migrateLegacyConfig;
         registered.migration_user =
             reinterpret_cast<void*>(static_cast<uintptr_t>(entry.info.id));
+        /* The pins go on the 3.0 lane, where the stock Constant and Static Value
+           put theirs, so the body can be the stock 4.92 x 2.93 cells with the
+           pins outside it instead of underneath it (see components_internal.hpp
+           and sdk/tc_service_api.h).  A loader older than the pin-lane cut
+           ignores the field and keeps the pins at 2.0. */
         registered.pin_lane = kPinLaneX;
         const int status = tc::component_types::registerDefinition(types, &registered);
         if (status != TC_COMPONENT_TYPES_OK) {
-            char line[208] = {};
-            std::snprintf(line, sizeof(line), "float-ops M3: registering %s failed: %s (%d)",
+            char line[224] = {};
+            std::snprintf(line, sizeof(line),
+                          "float-ops: registering %s failed: %s (%d)",
                           entry.info.type_id, tc::component_types::errorText(status), status);
             note(line);
             return false;
         }
         if (renderReady) {
+            /* The type draws itself: the stock body would otherwise be a second
+               silhouette behind the face (the M0 probes keep the game's own
+               drawing, and they live in plugin.cpp). */
             (void)tc::component_render::setDrawCallback(render, entry.info.id, &renderCallback);
             (void)tc::component_render::setDefaultDrawing(render, entry.info.id, false);
         }
-        if (placementPreviewReady)
+        if (placementPreviewReady) {
             (void)tc::component_render::setPlacementPreview(renderV6, entry.info.id, true);
+            /* A Mod-owned type has no player-editable schematic behind it, so the
+               bottom panel's "edit this component in the foundry" button would
+               only open an empty definition: V6 carries V4's call, and the host
+               draws it transparent and inert (the panel layout does not move). */
+            (void)tc::component_render::setFoundryButton(renderV6, entry.info.id, false);
+        }
         if (geometryReady) {
             /* The declared box is the union of the face's cells and the pins'
                cells, stated in whole cells so the host stores exactly what was
@@ -1932,10 +2350,11 @@ bool initialize(const TCHost* host, TCPlugin* plugin) {
     if (plugin->size >= offsetof(TCPlugin, on_frame) + sizeof(plugin->on_frame))
         plugin->on_frame = &frameCallback;
 
-    /* The editors are rows inside the game's own component drawer, not windows
-       of this Mod's own: selection is what opens them, exactly like the stock
-       parts' label and value fields. */
-    if (uiReady) registerEditors(host);
+    /* The property rows are the loader's own (tc.component.editor): this Mod
+       declares a field table per type and the host draws, validates and commits
+       it through the same configuration path the rest of this file uses.  The
+       Mod no longer owns a window over the drawer. */
+    registerEditorFields(host);
 
     char detail[400] = {};
     std::snprintf(detail, sizeof(detail),
@@ -1946,12 +2365,14 @@ bool initialize(const TCHost* host, TCPlugin* plugin) {
                   commandsReady ? "ok" : "missing", uiReady ? "ok" : "missing",
                   (mouseClicked && getMousePos) ? "ok" : "missing");
     note(detail);
-    char catalogueLine[192] = {};
+    char catalogueLine[256] = {};
     std::snprintf(catalogueLine, sizeof(catalogueLine),
-                  "float-ops M3/M4: %zu more types registered (subtract, multiply, divide, "
-                  "square root, negate, absolute, compare, classify, fma, remainder, round, "
-                  "min, max, i32/u32 both ways, split/make bits)",
-                  sizeof(kCatalogue) / sizeof(kCatalogue[0]));
+                  "float-ops catalogue: %zu types registered (FP16 %zu, FP32 %zu, FP64 %zu; "
+                  "one format is one type, and the FP64 FMA is absent because three 64-bit "
+                  "inputs exceed the 128-bit input budget)",
+                  catalogueCount(), catalogueCountOfWidth(tcfp::kFormatBinary16),
+                  catalogueCountOfWidth(tcfp::kFormatBinary32),
+                  catalogueCountOfWidth(tcfp::kFormatBinary64));
     note(catalogueLine);
     registerPictures();
     /* Only tc.component.types is required: without it there are no components
@@ -1981,12 +2402,12 @@ size_t displayText(uint64_t instance, char* out, size_t capacity) {
 /* The catalogue as the rest of the Mod sees it (the drawer rows ask by id, so
    the panel never repeats the list of types). */
 size_t catalogueCount() {
-    return sizeof(internals::kCatalogue) / sizeof(internals::kCatalogue[0]);
+    return internals::catalogueStore().types.size();
 }
 
 const CatalogueInfo* catalogueAt(size_t index) {
     if (index >= catalogueCount()) return nullptr;
-    return &internals::kCatalogue[index].info;
+    return &internals::catalogueStore().types[index].info;
 }
 
 const CatalogueInfo* catalogueInfo(uint64_t custom_id) {

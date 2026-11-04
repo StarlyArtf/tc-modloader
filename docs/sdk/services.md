@@ -473,7 +473,7 @@ for (uint32_t i = 0; i < tc::component_registry::count(registry); ++i) {
 - **名字与形状**：声明式注册登记的引脚名会被保留；桥接时从游戏原型读到的**位宽**会覆盖声明值，
   所以 `bits` 反映的是游戏真正编译出来的形状。
 - **被拒绝的类型**：`active=0` 且 `status` 写明原因；**第一个原因不会被后续更笼统的原因覆盖**
-  （桥接那句"最多每方向八脚、每脚 1–64 位、总输入 ≤128 位"才是有用的那句）。同一个 id 之后注册
+  （桥接给出的脚数、单脚宽度与总输入预算才是有用的那句）。同一个 id 之后注册
   成功会替换掉这条记录。
 - **拒绝的 Mod 不留痕**：插件被拒绝时它的类型从目录里删除，和它的 Hook、界面一致。
 - **能力位**：目前只报告加载器能自行判断的三项——`LOGIC`（回调已接入游戏）、`WIDE_PIN`（有引脚
@@ -485,6 +485,157 @@ for (uint32_t i = 0; i < tc::component_registry::count(registry); ++i) {
 `tests/component-registry-playtest.ps1`（game 层）：它让一个探针 Mod 注册一个必然被拒绝的定义，
 再打印整个目录，断言被拒绝项的 `status` 与 `example.byte-adder` 那个已桥接类型的引脚名/位宽/代价。
 用法示例见 `examples/mod-inspector` 的 "component types" 一节。
+
+## tc.component.compose：原版类型目录（M4 第一刀，2026-09-29）
+
+计划 §16 阶段 4（M4）要的是"让 Mod 用游戏自己的零件拼元件，而不是每件事都写回调"：稳定原版
+类型目录、内部网表 builder、嵌套依赖、原版完整别名。第一刀交付**目录**：游戏把每个内置零件按
+**kind 字节**寻址，而 kind 字节是构建数据——同一个含义不保证跨构建——所以服务给每个零件一个
+**稳定拼写**，连同它在这个构建里的 kind。
+
+```cpp
+#include "tc_component_compose.h"
+
+tc::component_compose::Api compose{};
+if (!tc::component_compose::table(host, &compose)) return 2;   // 老 Loader：跳过这一节
+
+TCBuiltinTypeInfoV1 and_gate{};
+and_gate.size = sizeof(and_gate);
+if (tc::component_compose::findByTypeId(compose, "builtin/AND", &and_gate) ==
+    TC_COMPONENT_COMPOSE_OK) {
+    TCBuiltinPinV1 pin{};
+    pin.size = sizeof(pin);
+    tc::component_compose::pin(compose, and_gate.kind, TC_COMPONENT_PIN_INPUT, 0, &pin);
+    // pin.x / pin.y = (-1, -1)：板面格偏移，可以直接拿去描述一条导线端点
+}
+```
+
+拼写规则（`src/builtin_catalogue.hpp`，离线用例 `tests/component-compose.cpp`）：
+
+| 情形 | 拼写 | 本构建的例子 |
+|---|---|---|
+| 名字唯一 | `builtin/<名字>` | `builtin/AND` |
+| 同一构建里重名 | `builtin/<名字>#2`、`#3`…（按 **kind 升序**编号，所以稳定） | `builtin/AND` = `0x04`、`builtin/AND#2` = `0x14`；`builtin/Delay Line` = `0x0d`、`#2` = `0x37`；`builtin/Splitter` = `0x11`，然后 `0x2f`、`0x63`、`0x64`、`0x6d`、`0x6e` |
+| 游戏没给名字的槽位 | `builtin/0x<kind>` | `builtin/0x7b` |
+
+`find_by_type_id` 先精确匹配，再对**没有编号**的拼写做 ASCII 大小写折叠（`builtin/and` 找得到
+`builtin/AND`）；带 `#2` 的拼写永远精确匹配，不会折到别的零件上。
+
+重名不是意外：本构建 125 个 kind 里有 **17 个名字被重复使用**（`Output` ×7、`Input` ×6、
+`Splitter` ×6、`Word Maker` ×3、`Concatenator` ×3、`Maker` ×3，其余是 ×2：`AND`、`NAND`、
+`NOR`、`NOT`、`OR`、`XNOR`、`XOR`、`Switch`、`Register`、`Counter`、`Delay Line`）。它们大多是同一
+零件的不同变体（类别/宽度/端口形状不同），所以"按名字找"必须靠编号区分——真机日志会为每个重复
+名字打一行 `compose duplicates …`。
+
+每一项报告的是**读到的**事实，不是推断的：`name`、`description`（注册目录同样的 192 字节截断）、
+每个方向的引脚（板面格偏移 `x`/`y`、`word_size_raw`、能当数字用时才填的 `bits`）、以及两个标志：
+
+- `TC_BUILTIN_FLAG_NO_DECLARED_INPUTS`：原型一个输入脚都没声明。**实测归类**：有状态族
+  （Delay Line `0x0d`/`0x37`、Register、Counter…）和纯源（Input、Push Button、Verilog Input）
+  都落在这里。它们的输入位置来自游戏自带解题电路的测量，写在
+  [research/component-pipeline.md](../research/component-pipeline.md) §11.2，等别名那条路把它变成
+  契约再进服务；在此之前目录只如实报告"没声明"。
+- `TC_BUILTIN_FLAG_HAS_SHAPE`：原型带 shape（内置零件那张 SVG）。将来"复制原版元数据"那条路
+  要读的就是它。
+
+**引脚宽度有三种情况，目录原样区分**：`word_size_raw` 永远原样报出。取值 1–64 时 `bits` 就是它；
+取值是自动宽度标记（`0x7fff…`）时 `bits=0` 且置 `TC_BUILTIN_PIN_AUTO_WIDTH`；这个构建里两个
+Splitter 的输入用的是**比自动标记小 1、小 2** 的值（`0x7fff…fe`／`…fd`，见 `build/kinds.txt`），
+语义未核实，于是 `bits=0` 且置 `TC_BUILTIN_PIN_RAW_WIDTH`——**不要按 `bits` 猜，要按 raw 处理**。
+
+**目录报告表里的每一个 kind，包括游戏没命名的槽位**（本构建 125 条里 21 条无名，其中 `0x7b` 是
+全零槽、`0x4e` 是自定义实例占的那个槽）。这不是噪音：这些正是 `get_prototype()` 会接受的集合，
+而一个未知 kind 会抛出插件无法恢复的 Nim 错误。
+
+**故意不在这里的两件事**：
+
+- **代价**。内置零件的门数/延迟是游戏自己的打分器从它的内部电路算出来的（实测 Delay Line
+  5 门 4 延迟，见 `tests/component-cost-playtest.ps1`），而原型里那两个字段在本构建**所有** kind
+  上都是 0。目录不重复声明一个会误导人的数字。
+- **能力位**（LOGIC/STATE/RENDER/ALIASABLE）。§8.3 要求它，但那是别名那条路要做的研究；现在给 0
+  比给一个猜的值强。
+
+真机证据：`tests/component-compose-playtest.ps1`（game 层，用例 `component-compose`）把本探针与
+既有的引脚表探针装进**同一个沙盒、同一次会话**跑一遍，再要求两个**互相独立**的读表者逐条一致
+——`tests/kind-list-probe.cpp` 走 SDK 的 `TCGameModel` 封装，本服务走加载器自己的 `prototypeGet`
+与引脚解码。任意一边悄悄漂移都会变成一条 mismatch，而不是悄悄通过。日志与 `build/kinds.txt`
+逐条对照的证据见 [verification.md](../verification.md) 的 `tc.component.compose` 一节。
+
+### V2：内部网表 builder（同一次会话的第二刀）
+
+V1 只是目录；V2 让 Mod 真的**用原版零件拼元件**。一个组合元件没有回调：定义本身就是内部电路，
+游戏像编译手画电路一样编译它。
+
+```cpp
+#include "tc_component_compose.h"
+
+tc::component_compose::ApiV2 compose{};
+if (!tc::component_compose::tableV2(host, &compose)) return 2;   // 老 Loader：跳过
+
+TCComposeTypeV1 type{};
+type.size = sizeof(type);
+type.version = 1;
+type.custom_id = kMyAnd3;              // 自己的类型 id
+type.name = "Composite AND3";
+type.gate_cost = 1;                    // **故意写错**：游戏会按内部电路重算（见下）
+type.delay = 2;                        // 这个字段游戏原样信任，要写真实关键路径
+const TCComponentPinV2 ins[3] = {{"A","A",1,0},{"B","B",1,0},{"C","C",1,0}};
+const TCComponentPinV2 out{"Out","Out",1,0};
+type.inputs = ins;  type.input_count = 3;
+type.outputs = &out; type.output_count = 1;
+
+uint64_t session = 0;
+if (tc::component_compose::begin(compose, type, &session) != TC_COMPONENT_COMPOSE_OK) return 3;
+uint32_t and1 = 0, and2 = 0;
+tc::component_compose::node(compose, session, "builtin/AND", 4, -1, 1, &and1);
+tc::component_compose::node(compose, session, "builtin/AND", 20, 1, 1, &and2);
+tc::component_compose::connect(compose, session, 0, 0, and1, 0);   /* A   -> AND1 in0 */
+tc::component_compose::connect(compose, session, 1, 0, and1, 1);   /* B   -> AND1 in1 */
+tc::component_compose::connect(compose, session, and1, 0, and2, 0);/* AND1 -> AND2 in0 */
+tc::component_compose::connect(compose, session, 2, 0, and2, 1);   /* C   -> AND2 in1 */
+tc::component_compose::connect(compose, session, and2, 0, 3 + 1, 0);/* AND2 -> Out（输出脚节点） */
+if (tc::component_compose::commit(compose, session) != TC_COMPONENT_COMPOSE_OK)
+    log(tc::component_compose::status(compose, session));   /* 拒绝原因，人话 */
+```
+
+要点：
+
+| 事 | 规则 |
+|---|---|
+| 节点寻址 | 脚节点就是节点列表里的项：输入脚 i = 节点 i，输出脚 j = `input_count + 内部节点数 + j`（V2 封装里的 `outputPinNode()`）；`node()` 返回内部节点下标 |
+| 零件来源 | `builtin/<拼写>`（V1 目录）**或**另一个已注册类型的 `type_id`（`<mod>/0x<id>`，也可以直接给 `0x<id>`）——后者就是**嵌套**，内层类型必须先注册成功 |
+| 坐标 | 内部节点用电路单位（1 单位 = 1 板面格）；零件引脚位置就是目录报的偏移（实测：`0x05` 三输入 AND 的 in `(-1,-1)/(-1,0)/(-1,1)`、out `(2,0)` 与游戏自带定义逐字一致）；外层脚仍在"脚单位"（-18/+13，连接点 ±3） |
+| 代价 | **门数由游戏自己按内部电路重算**（真机：两个 AND 节点 → `gates=2`，而声明写的是 1）；**延迟被原样信任**，所以必须声明真实值 |
+| 校验 | `commit` 前先校验：空网表、引脚越界、同一脚被两条线驱动、内部输入没被驱动（外层输出脚也算 sink）、**无状态的组合环**（经过"不声明输入脚"的零件——Delay Line/Register 这类——的环是合法的），以及布线清扫（见下） |
+| 布线 | builder 自己选路径（先直连，再试目标脚列两侧与源侧的若干"沟槽"）；**允许不同网络的线交叉**——游戏里一根导线只有两个端点，交叉处没有端点就是两个网络（`HANDOFF-component-m4.md` §5.1 的测量）；**拒绝**会穿过别的引脚、**穿过元件本体**（元件引脚包围盒再放一格净空，只有"接到自己那个引脚"的那一段允许进入这块区域）、**端点落在别的网络上**（等于放一个端点把两根线接成一个网络）、或两根线共线重叠的布局，`status()` 报出冲突点让作者挪节点。一个源脚扇出多条线是允许的 |
+| 提交后 | 这个类型在除了"需要回调"的一切地方都像普通 Mod 类型：元件栏、放置、命令总线（place/duplicate/delete）、geometry、图片（V5）、属性行、归属检查都能用；**没有** `tc.component.instances` 绑定、没有 `tc.component.storage` 配置 blob、没有生命周期回调——这些属于加载器驱动的类型 |
+
+### 三条原版复用路径（计划 §8.3）
+
+| 路径 | 状态 | 怎么用 |
+|---|---|---|
+| `create_builtin_node` | **已交付**（就是 V2 的 `node("builtin/…")`） | 组合电路里直接用原版零件，游戏正常编译、正常算代价 |
+| `clone_builtin_metadata` | **已交付**（V2 的 `clone_metadata`，flags `TC_COMPOSE_CLONE_NAME/DESCRIPTION/COST`） | 把原版零件的**名字、说明、声明代价**抄到自己的类型上，让它"读起来"像原版；真机证据：抄 `builtin/AND` 后游戏存的原型名字就是 `AND`、说明就是它自己的 `[T] when both inputs are [T]` |
+| `register_builtin_alias` | **明确不可用**（`alias()` 恒返回 `TC_COMPONENT_COMPOSE_ERR_UNSUPPORTED`，目录的 `TC_BUILTIN_FLAG_ALIASABLE` 也从不置位） | 本构建**没有**让新 id 走原版完整分发的入口：游戏按元件记录的 kind 字节分发，而 Mod 类型的实例恒为 `0x4e`；两条既有实测（`shape_svg` 对自定义原型无效、默认绘制只能按类型关掉）也指向同一结论。可行的替代是三件套：`clone_metadata`（名字/说明）+ 用同一个原版节点拼的组合（行为）+ V5 `set_picture`（图标） |
+
+**图标为什么不在可复制字段里**：内置零件的图标来自原型的 shape SVG，而游戏画自定义原型时走自己的通用路径、**忽略** shape（[research/component-icons.md](../research/component-icons.md) §3 实测）。把 shape 抄过去只会让人以为它生效，所以契约只承诺名字/说明/代价，图标由 V5 的 PNG 负责。**引脚也不在里面**：类型的引脚是已经导入的定义的一部分，事后改会让所有实例失效——要别的形状就在注册时声明，或者用组合节点。
+
+真机证据：`tests/component-composite-playtest.ps1`（game 层，用例 `component-composite`）用 `tests/composite-probe.cpp` 注册上面这个 AND3、把 `build/nl_and3board.data` 放进 `and_gate_3` 关卡、让游戏自己的关卡测试判分：
+
+```text
+Component compose: composite 0x414e44335f303031 imported from 2 node(s), 3 in/1 out, declared delay=2
+composite: and3 custom=0x414e44335f303031 in=3 out=1 gates=2 delay=2
+composite: catalogue custom=0x414e44335f303031 implementation=1 capabilities=13 active=1 in=3 out=1
+composite: nested custom=0x4e455354335f3031 in=3 out=1 gates=2 delay=2
+composite: refusals broken=1 status=an inner input pin is not driven: node builtin/AND pin 1 has no wire driving it
+composite: clone prototype name="AND" description="[T] when both inputs are [T]"
+composite: alias status=-9
+byte-adder: autotest finished cycle=7 verdict=1
+```
+
+离线半边是 `tests/component-netlist.cpp`（`build.ps1` 内执行）：同一个 AND3 网表编码出来的字节，按字段与**游戏已经接受过的夹具定义** `build/nl_def_and3.data` 逐项一致（节点、引脚、导线端点、头部），并且逐条验证上面那张校验表。
+
+**仍未做**：把有状态零件的**实测输入位置**（Delay Line `(-3,0)`→`(3,0)`，research §11.2）也交给 builder——现在这类零件只能作为*源*使用（目录报告 `NO_DECLARED_INPUTS`，builder 因此不知道它的 sink 在哪，要么由调用者自己提供坐标，要么这一版就不连线进去）；字宽内部节点的宽度声明；以及"声明代价能不能覆盖游戏重算的门数"这个决策（目前刻意不覆盖，因为重算值正是"游戏真的走了网表"的证据）。
 
 ## tc.component.types：注册一个 V2 元件定义
 
@@ -529,6 +680,113 @@ if (tc::component_types::table(host, &types)) {
 `OK` / `ERR_ARGUMENT`（定义不合法）/ `ERR_DUPLICATE`（id 已占用）/
 `ERR_UNSUPPORTED`（形状桥接不了）/ `ERR_GAME`（游戏拒绝导入）/ `ERR_BUDGET`（输入位宽超预算）。
 被拒绝的定义同样进 `tc.component.registry` 目录，带自己的原因，和 V1 一致。
+
+### V3 三态注册
+
+查询 `TC_COMPONENT_TYPES_API_VERSION_2` 会得到 `TCComponentTypesApiV2`；它保留 V1 表前缀，
+并追加 `register_definition_v3`。C++ 包装对应 `tableV2` 与 `registerDefinitionV3`：
+
+```cpp
+static void tri(TCLogicIOV3* io) {
+    if (io->phase == TC_LOGIC_RESET) return;
+    io->outputs[0].value = io->inputs[0].value;
+    io->outputs[0].drive_mask = enabled ? 1u : 0u; // 1 位脚：驱动或 Z
+}
+
+tc::component_types::ApiV2 types{};
+if (tc::component_types::tableV2(host, &types)) {
+    TCComponentTypeDefinitionV3 definition{};
+    definition.size = sizeof(definition);
+    definition.version = TC_COMPONENT_TYPES_VERSION_3;
+    definition.custom_id = 0x545249535f303031ULL;
+    definition.name = "Tri-state buffer";
+    definition.inputs = ins; definition.input_count = 1;
+    definition.outputs = outs; definition.output_count = 1;
+    definition.callback = &tri;
+    tc::component_types::registerDefinitionV3(types, &definition);
+}
+```
+
+宿主把 V3 输出接到游戏自己的 Switch 生成代码，因此 Z 会实际断开驱动，并保留原版多驱动
+冲突判定。当前字宽 Switch 的使能是整字一位，故宽脚的 `drive_mask` 只支持 0 或全宽掩码；
+部分掩码按整脚 Z 处理。生命周期指针本版仍是 `TCComponentLifecycleV1`（V2 IO）：这些通知
+管理配置、状态和几何，不采样或驱动引脚。
+
+### 说明文字默认不进游戏面板（`TC_COMPONENT_TYPE_SHOW_DESCRIPTION`，2026-09-28）
+
+游戏会把原型的 `description` 印在**底部元件抽屉的标题下面**——那正是属性行所在的窗口——所以 V2
+定义里的 `description` 默认**不再写进原型**：文字仍然记在加载器自己的类型目录里（Mods 页用它），
+但游戏面板里不会出现。定义表尾部新增 `flags`（`size` 没覆盖到它的旧调用方 = 默认隐藏），想要
+面板里显示的类型设置 `TC_COMPONENT_TYPE_SHOW_DESCRIPTION`。
+
+两种结果都有日志行，可直接断言：
+
+```text
+Component V2: type 0x… keeps its description out of the game's panel (set TC_COMPONENT_TYPE_SHOW_DESCRIPTION to show it)
+Component V2: type 0x… shows its description in the game's panel (TC_COMPONENT_TYPE_SHOW_DESCRIPTION)
+```
+
+`examples/editor-demo` 的两个类型正好各占一种：设置类型不设标志（默认隐藏），长表类型设了标志
+（面板里显示）。旧的 V1 表（`register_component`）没有 flags 字段、布局也不能长大（`size` 不匹配
+即拒绝），因此保持原行为，并在日志里写明。
+
+### 逐输出依赖：让游戏按真实依赖画内壳（`TC_COMPONENT_TYPE_OUTPUT_DEPENDENCIES`，2026-10-05）
+
+默认情况下加载器生成的元件内壳把**每个输出**都接到**全部输入**的依赖链上。对一个"输出只由指令
+字段决定"的组合模块（单周期 CPU 的读地址就是 `instr[19:15]`），这会让游戏看到一个不存在的环：
+`寄存器堆读数据 → 内核 → 读地址 → 寄存器堆 → 读数据`，于是外部接游戏内置寄存器堆就被判成
+循环依赖。
+
+想要精确依赖的调用方在 V2/V3 定义尾部再给一张表，并设标志：
+
+```c
+static const uint32_t kOutputDependencies[3] = { 0x1u, 0x2u, 0x1fu };
+definition.flags |= TC_COMPONENT_TYPE_OUTPUT_DEPENDENCIES;
+definition.output_dependencies = kOutputDependencies;
+definition.output_dependency_count = 3;   /* 必须等于 output_count */
+```
+
+第 i 个 mask 的第 N 位表示"第 i 个输出组合地读取第 N 个输入引脚"。加载器为每个输出生成
+**自己的**依赖锥（输入收集器 + 该输出的依赖门 + 驱动），REFRESH 时对每个输出单独调用一次回调，
+只打包这个输出声明过的输入。约束与代价：
+
+* 掩码不能引用不存在的输入（`input_count` 之外的位置位会被拒绝）；`output_dependency_count`
+  必须等于 `output_count`，否则报 `TC_COMPONENT_TYPES_ERR_ARGUMENT`。
+* 回调必须**可以按输出独立、在 REFRESH 里重复求值**：REFRESH 可能在一个宿主周期里被调用多次，
+  且每次只为少数输出传入数据；REFRESH 不能提交时序状态。老定义不写这段就保持原行为，ABI 兼容。
+* 一个宿主周期里每个输出各触发一次回调，因此宽元件（如 17 个输出）的调用次数从 2 次/周期变成
+  2×输出数；换来的是依赖图正确，单周期语义不变。
+
+时序回调可在精确表之外再设置 `TC_COMPONENT_TYPE_CLOCKED_TICK`。加载器会增加一个没有外部输出的
+隐藏全输入汇点：公开输出仍只做 REFRESH，隐藏汇点每周期做一次 CYCLE，因此 `q <= q + 1` 只推进
+一步，而且 tick 的全输入依赖不会成为任何公开输出的组合边。TC-Verilog 对含边沿块的模块自动设置
+这两个标志。
+
+无状态、全驱动的二态组合类型还可在定义尾部提供游戏 JIT 程序，完全绕开回调热路径：
+
+```c
+static const char* const prefixes[1] = {
+    "var tc_j@T@_sum = U64 ((U64 (@0@) + U64 (@1@)) & U64 255)\n"
+};
+static const char* const expressions[1] = { "tc_j@T@_sum" };
+
+definition.flags |= TC_COMPONENT_TYPE_INLINE_EXPRESSIONS;
+definition.inline_expression_version = TC_COMPONENT_INLINE_EXPRESSIONS_VERSION_1;
+definition.inline_expression_count = 1;       /* 必须等于 output_count */
+definition.inline_prefixes = prefixes;        /* 可为 null；单项也可为 null */
+definition.inline_expressions = expressions;  /* 每一项都必须非 null */
+```
+
+`@T@` 是实例 token，`@0@..@31@` 是输入表达式。宿主注册时复制字符串；版本 1 要求
+`state_words == 0`、不能设置 `CLOCKED_TICK`、每个输出都有表达式，总文本不超过 8 MiB。
+它始终驱动整个输出脚，不能表达 X/Z。通常不应手写这张表：TC-Verilog 会做 SSA、逐输出死代码裁剪
+和依赖掩码校验；无法证明安全时自动保留 V3 回调。
+
+注册日志会打印这张表，真机上可直接对照游戏看到的依赖图：
+
+```text
+Native logic: registered custom 0x… inputs=5 outputs=17 … shape=5in/17out v3 state=18 deps=0x1,0x2,0x2,0x2,0xf,…
+```
 
 ## tc.component.geometry：声明类型 footprint 与逐实例交互范围
 
@@ -753,6 +1011,26 @@ if (tc::component_render::tableV4(host, &render)) {
 - 只影响这个按钮。选择、命中、拖动、删除、默认绘制、选中提示、footprint，以及工坊本身（含工具栏里
   打开工坊的按钮）都不变。
 
+**2026-09-29 追加：组合元件在工坊里能打开了。** 这条按钮之所以只对回调型 Mod 元件"开一个空定义"，
+是因为工坊取电路的方式：它拿元件的**名字**去玩家那份电路管理器里找
+`<存档>/schematics/foundry/<名字>/circuit.data`，而 Mod 类型在玩家这边没有这个文件（玩家第一次点
+这条按钮时游戏才建一个空占位）。真机测量（2026-09-29）确认那个文件就是**元件定义**格式——同一套
+头部与引脚记录，把 `tc.component.compose` V2 编出来的字节写进去，工坊立刻画出 65 个零件、157 根线
+的完整内部电路。因此加载器在**组合元件注册成功时补上这个条目**：不存在、或只是游戏建的空占位
+（≤64 字节）才写，玩家在工坊里改过的一律不动，写成功会记一行
+`foundry view: filled <路径> so the component can be opened in the foundry`。回调型元件没有电路，
+这一条不适用，`setFoundryButton(id, false)` 仍然是它们该有的选择。
+
+**2026-09-28 追加：同一决定现在也藏掉底部面板里的元件预览图。** 玩家反馈"底部属性栏里可以去掉
+元件预览图"——面板占的那块图正好是属性行要用的地方。一个 Mod 元件没有可编辑原理图，这一点同时
+决定了按钮和预览图，所以两者共用一个开关：`setFoundryButton(id, false)` 之后，被选中元件全是
+该 Mod 的这个类型时，游戏在底部面板画的两处图（`build_custom_component_preview`
+@0x14038ed85 与 `build_component_description_panel` @0x14039c916/@0x14039d336 的 `igImage`
+调用）改为**全透明 tint 提交**——图仍然提交，所以面板布局与其它控件位置一个字都不动，只是看不见。
+元件栏卡片（V5 像素）与放置幽灵（V6 回调）是另外两个面，不受影响。真机门禁：
+`tests/float-panel-playtest.ps1` 断言日志里的
+`Component render: the panel preview picture is hidden for the selected Mod component`。
+
 ### V5：元件栏卡片与抽屉预览画 Mod 自己的图
 
 游戏给一个自定义元件画的那张小图（元件栏里的一项、底部抽屉里的预览）来自**一张它自己每帧请求的
@@ -812,9 +1090,9 @@ V5 的品红标记图在幽灵区域为 0（两个接管面彼此独立），并
 
 | 项 | 值 |
 |---|---|
-| 每方向脚数 | 0–16（加载器数组上限；游戏导入器到 32 脚都收） |
+| 每方向脚数 | 0–32（与游戏导入器的实测上限一致） |
 | 每脚位宽 | 1–64 位（与游戏原版一致） |
-| 总输入位宽 | ≤128 位（生成的调用只有两个 64 位 payload 字；六个参数的外调会把第 5、6 个参数丢成垃圾，实测） |
+| 总输入位宽 | ≤2048 位；≤128 位直接传两个 payload 字，更宽时以四参数调用逐块暂存，避免六参数外调的实测损坏 |
 | 空方向 | 一个方向为 0（纯源/纯汇）可以；**两个都空也可以**，用于装饰元件（文本框）：加载器为它补一个不接线的驱动节点，元件因此仍进平坦序列、仍有实例句柄，但既不读也不写任何信号 |
 | 状态 | `state_words` 每实例持久字，0 表示无状态；只有 CYCLE 提交 |
 | 配置 | `config_size` 0–65536 字节；每实例复制默认值，schema 由定义声明；RESET 不清配置 |
@@ -875,9 +1153,58 @@ commandApi.submit(commandApi.context, &duplicate, &request);
   与 `on_save` 在锁外运行（可以调服务）。
 - 两者都在"变化发生的地方"同步调用（编译线程或场景切换），因此**必须便宜、不得触碰 UI**；
   写入的 `state`/`outputs` 会立即提交（它们不跟随某个周期）；
+- `on_compile`（2026-09-28 追加在结构末尾）：棋盘**编译通过**且这个实例在编译结果里，相位
+  `TC_LOGIC_COMPILE`。触发点在生成器产出这次编译的代码之后、`on_create`/`on_clone`/`on_load`
+  之后，所以回调里实例已经完全绑定；一次编译每个在场实例各收一次。
+- `on_unbind`（2026-09-28 追加）：宿主**丢掉了绑定**但实例本身没有被删——离开关卡/切场景，或
+  加载器正在退出，相位 `TC_LOGIC_UNBIND`。玩家**删除**元件走的是 `TC_LOGIC_DESTROY`。
+  两条路径的区别就是"元件还在原理图里吗"。
+- `on_move` / `on_rotate` / `on_resize`（2026-09-28 追加）：实例的位置、朝向或占位被改，相位分别是
+  `TC_LOGIC_MOVE` / `TC_LOGIC_ROTATE` / `TC_LOGIC_RESIZE`。宿主每帧读一次棋盘记录里的格点与方向
+  字节（第一次读数只是给绑定做基线，编译不会触发"移动"），占位则由 `tc.component.geometry` 的
+  逐实例矩形写入处派发。新值从 `TCLogicIOV2` 的**放置尾巴**读取：
+
+```c
+if (io->size >= offsetof(TCLogicIOV2, half_height) + sizeof(io->half_height)) {
+    int32_t x = io->cell_x, y = io->cell_y;   /* 板面格 */
+    uint32_t rotation = io->rotation;         /* 顺时针 1/4 圈，0..3，就是记录里那个方向字节 */
+    float halfW = io->half_width, halfH = io->half_height;   /* 占位半宽/半高 */
+}
+```
+
+  这三个回调与 `on_create`/`on_destroy` 一样在实例锁内运行（别在里面调服务）。真机门禁当前只覆盖
+  `on_resize`（由 `tc.component.geometry` V2 的逐实例矩形驱动，`pin-shape-wide9` 断言里能看到新的
+  `half=`）；`on_move`/`on_rotate` 的派发在离线用例里验证，但**本构建对合成输入驱动的棋盘拖动
+  没有反应**（与 [research/component-hitbox-path.md](../research/component-hitbox-path.md) 的结论
+  一致），所以这两条的自动真机门禁仍是待办——探针会把尝试与结果都写进日志，但不会替它们断言。
 - 老的调用方（`size` 停在 `lifecycle` 之前）不会收到任何通知，行为与之前完全一致。
 - `TCLogicIOV2` 尾部的 `config/config_size/config_schema` 是宿主借用的只读视图；新回调先用
   `io->size` 判断尾字段是否存在，老回调不受影响。
+
+### V8：字体资源、逐实例图片与设备世代（2026-09-28）
+
+V7 把**图片**收进宿主（`load_image` + 绘制表 V3 的 `image`），V8 把同一套"资源由宿主持有、插件只拿句柄"
+做成三件事：
+
+| 能力 | 接口 | 规则 |
+|---|---|---|
+| 字体资源 | `load_font(key, ttf_path, native_size, ranges, range_count, out)` / `release_font(key)` | 绝对路径、单个 TTF、≤16 MiB；每 Mod 8 个面；`native_size` 4–512；`ranges` ≤16 段、BMP 内闭区间。宿主建 atlas、上传纹理、保留解码像素、按 Mod 回收；`out->font` 是句柄、`revision` 从 1 起 |
+| 字体绘制 | 绘制表 V4：`text_font(font, x, y, size, color, style, utf8)`、`measure_font(font, size, style, utf8, &w, &h)` | 只在元件 render 回调里有效；`font=0` = 宿主默认面；`BOLD`/`ITALIC` 由宿主合成（斜体是逐带偏移 + 自裁剪）；越界/未知句柄返回 `ERR_FONT` |
+| 逐实例图片 | `load_instance_image(instance, key, png_path, out)` / `release_instance_image(...)` | 图片绑定到某个实例的世代；实例释放或换板后自动回收（`images.prune` 按实例句柄校验），另一个实例的同名 key 互不影响 |
+| 设备世代 | `set_device_callback` / `device_generation` | 纹理管理器保留解码像素；GL 上下文变化时重传并 +1 世代，宿主逐个 Mod 回调（句柄不变）。**本构建的上下文只随窗口创建一次，没有重建路径**，所以这条当前不会被触发，文档不把它当承诺 |
+
+**这个构建的一个坑（已修，2026-09-28）**：它的 ImGui 用 **32 位 `ImWchar`**——`ImFontAtlas_GetGlyphRangesDefault`
+返回的默认区间表是 `20 00 00 00 / ff 00 00 00 / 00 00 00 00`。宿主原来按 16 位对编码 SDK 传来的
+`TCComponentRenderFontRangeV1`，atlas 于是按另一组（错的）区间建字形：`measure_font` 还能给出度量
+（走回退字形），但真正绘制时 `AddText` 一个顶点都不产生。现在按 32 位对编码（`TCComponentRenderFontRangeV1`
+本来就是 `uint32_t`），并把这条写进 [reference/limits.md](../reference/limits.md)。
+
+**真机证据**（隔离沙箱，`tests/text-box-playtest.ps1 -Font`，示例 Mod 用 `data_directory_utf8/../../../asset/font/`
+取游戏自带字体）：两个面加载成功（句柄/native/revision 全部报出）、相对路径与超长区间被 `ERR_ARGUMENT`
+拒绝、同一 key 再加载不变句柄且 `revision=2`、释放后重载是全新句柄且 `revision=1`、`measure_font` 对同一段文本
+给出面相关的度量（CJK 面 42.6 px vs UI 面 62.4 px），绘制路径本身用宿主默认面验证（同一位置 102 个像素）。
+**仍未关闭**：由宿主加载的自定义面画出来仍是 0 像素（atlas 纹理作为图片四边形能画、度量也对），
+说明该构建里字体 atlas 的纹理绑定还有一层没找对；见 [verification.md](../verification.md)。
 
 ## tc.component.instances：跨帧稳定的实例句柄
 
@@ -920,6 +1247,143 @@ if (tc::component_instances::table(host, &instances)) {
    复用时发放新的 generation——这正是旧句柄失效的机制；
 4. 关卡自己的测试台程序也会编译，但它不含我们的实例：第 1 条只在这种"确实是棋盘"的编译上生效，
    否则每加载一关都会把活实例拆掉。
+
+### V2：这个元件在游戏眼里是哪一个（2026-09-27）
+
+自定义元件里可以再放一个自定义元件。回调是按**内层实例自己的 64 位 id** 调用的，而玩家点到的、
+游戏选中集与撤销记账认的是**外层元件**——所以在自己元件上做交互的 Mod 必须把两者对上。
+这一对是加载器编译遍历时本来就知道的数据，以前只以 `interactive-map.txt` 这个**诊断文件**的
+形式落在游戏目录里（`examples/clock` 就是往自己数据目录上跳三级去读它的）。V2 把它变成正式调用：
+
+```cpp
+tc::component_instances::ApiV2 instances{};
+if (tc::component_instances::tableV2(host, &instances)) {          // V1 loader 会返回 false
+    uint64_t top = 0;
+    if (tc::component_instances::topLevelId(instances, handle, &top) ==
+        TC_COMPONENT_INSTANCES_OK) {
+        // 直接放在棋盘上的元件：top == handle.instance_id
+        // 装在别的自定义元件内部：top == 那个外层元件的 id
+    }
+}
+```
+
+| 入口 | 语义 |
+|---|---|
+| `tableV2(host, &api)` | 拿到 V2 表（含 V1 的五个入口）；只认 V1 的加载器返回 false，Mod 保留降级路径 |
+| `topLevelId(api, handle, &top)` | 游戏选中/顶层遍历用的 id；**失败时 `top` 一定是 0**，不会留下半写答案；句柄过期 `ERR_STALE`，没有这个调用则 `ERR_UNAVAILABLE` |
+| `v1(apiV2)` | 同一个表的 V1 半视图（字段逐个复制，不是类型转换），可直接喂给 `enumerate/validate/info/state/reset` |
+
+* 值在编译遍历时记在绑定上，调用本身不读棋盘、不阻塞（`src/component_container.hpp` 是那条规则，
+  `tests/component-instances.cpp` 离线钉住它）。
+* 它**不**替代 `interactive-map.txt` 的另一个用途：选中集本身是用**元件序列下标**做 key 的，
+  那仍然从 `tc.board` 的快照里读（`examples/clock` 的 `refreshSelectionKeys`）。
+* `interactive-map.txt` 现在只是诊断文件；`examples/clock` 只在加载器没有 V2 时才读它。
+
+## tc.component.render V7：画自己的图（`load_image` + 绘制表 V3 `image`）
+
+元件要贴一张图，此前只有一条路：插件自己解 PNG（WIC + COM）、自己 `create_ui_texture`、
+再用 `engine_proc` 拿 `ImDrawList_AddImageQuad` 和背景 draw list 自己画——`examples/clock`
+的取值标记就是这么写的（自己的解码器 + 自己的 COM 单元 + 宿主纹理句柄 + 三个引擎入口）。
+V7 把这条链收进加载器：**图由加载器加载、持有、释放；插件只拿一个 handle**。
+
+```cpp
+#include "tc_component_render.h"
+
+static uint64_t gSprite = 0;                     // 跨帧稳定，插件只存这个
+
+// 注册时（tc_mod_load）或运行中：
+tc::component_render::ApiV7 render{};
+if (tc::component_render::tableV7(host, &render)) {       // 老加载器返回 false
+    TCComponentRenderImageV1 image{};
+    if (tc::component_render::loadImage(render, "bit-sprite", pngPath, &image) ==
+        TC_COMPONENT_RENDER_OK)
+        gSprite = image.image;
+}
+
+// 绘制回调里（frame 是宿主给的帧）：
+TCComponentRenderQuadV1 quad{};
+tc::component_render::localToScreen(frame, x0, y0, &quad.x0, &quad.y0);
+tc::component_render::localToScreen(frame, x1, y0, &quad.x1, &quad.y1);
+tc::component_render::localToScreen(frame, x1, y1, &quad.x2, &quad.y2);
+tc::component_render::localToScreen(frame, x0, y1, &quad.x3, &quad.y3);
+quad.u1 = 1.f; quad.v2 = 1.f; quad.v3 = 1.f;      // 或雪碧图某一格的 uv
+tc::component_render::image(frame, gSprite, quad, 0xffffffffu);
+```
+
+| 入口 | 语义 |
+|---|---|
+| `load_image(key, png_path, out)` | key 是 Mod 自己的名字（`a-z 0-9 . _ -`，≤64 字节），`png_path` 是绝对路径，**只读一次**；返回 `image`（绘制用 handle）、尺寸与 `revision`。同一 key 再加载 = 换像素：**handle 不变、revision +1**，旧 GL 对象延后一帧释放 |
+| `release_image(key)` | 释放一张；`key == NULL` 释放该 Mod 的全部 |
+| `image(frame, handle, quad, tint)` | 绘制表 V3 的图元：四角为屏幕像素（ImDrawList 顺序），四组 uv，`tint` 为 0xAABBGGRR；计入每实例每帧配额并受 frame 裁剪框约束 |
+| `tableV7(host, &api)` / `errorText(status)` | 版本探测与错误文案；`ERR_IMAGE(-7)` 覆盖键/路径/解码/尺寸/配额 |
+
+几件写进契约的事：
+
+1. **生命周期全在加载器**：GL 对象属于 `ui_texture::Manager`（owner = 该 Mod），插件卸载/停用时
+   随该 Mod 的其它纹理一起回收；插件从不接触 renderer id，所以不存在"跨帧持有过期 id"。
+2. **配额**：每 Mod 最多 16 张、解码后合计 ≤16 MiB、单文件 ≤64 MiB；越界返回 `ERR_IMAGE`
+   且**什么都不改**。纹理管理器自身每 Mod 64 张 / 128 MiB 的上限仍然生效。
+3. **降级**：老加载器没有 V7（`tableV7` 返回 false）；`AddImageQuad` 解析不到时，加载器给回调的
+   绘制表退回 V2——所以"看到 `draw->version >= 3` 才有 `image`"这句话永远成立。
+4. **键/路径校验**：相对路径、目录、重解析点、读不出的文件都拒绝；文件读完即与磁盘脱钩
+   （之后游戏或玩家改那个文件不影响已画的图）。
+5. **设备重建**：本构建的 GL 上下文只随窗口创建一次，没有重建路径；加载器保留解码像素以备将来，
+   但当前构建里那条路不会触发，因此不作为承诺。
+
+## tc.component.input：元件输入路由
+
+`tc.component.input` V1 让自定义元件声明一个与 `TCComponentRenderFrameV1` 同坐标系的局部矩形，
+由宿主完成棋盘缩放/旋转后的命中与逐实例路由。回调会收到 screen、board、local 三套坐标，以及
+enter/leave/move/down/up/click/double-click/wheel/drag、物理键和 UTF-8 文本提交事件。
+
+```cpp
+#include "tc_component_input.h"
+
+static uint32_t input(void*, const TCComponentInputEventV1* event) {
+    if (event->kind == TC_COMPONENT_INPUT_POINTER_DOWN)
+        return TC_COMPONENT_INPUT_RESULT_CONSUMED |
+               TC_COMPONENT_INPUT_RESULT_CAPTURE_POINTER |
+               TC_COMPONENT_INPUT_RESULT_FOCUS_KEYBOARD;
+    if (event->kind == TC_COMPONENT_INPUT_TEXT_COMMIT)
+        return TC_COMPONENT_INPUT_RESULT_CONSUMED;
+    return 0;
+}
+
+TCComponentInputApiV1 api{};
+tc::component_input::load(host, &api);
+tc::component_input::setHandler(api, customId, -2.f, -1.f, 2.f, 1.f, input);
+```
+
+焦点、hover 与捕获属于完整实例句柄，不只属于 `instance_id`；删除实例、换板、换场景或卸载 Mod
+都会清理。回调返回 `CONSUMED` 后，棋盘本帧不再处理该输入；文本提交还会在进入游戏 ImGui 输入队列
+前被截住。`route()` 可在回调外显式请求/释放焦点与捕获。
+
+当前 Windows 路径会交付 `WM_CHAR` / `WM_IME_CHAR` 最终提交形成的 Unicode 文本，并从游戏窗口的
+`WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION / WM_IME_ENDCOMPOSITION` 读取 preedit，映射为
+`IME_BEGIN/UPDATE/END`。候选串读取与路由已有离线覆盖，但真实输入法下的候选窗位置和取消组合仍需
+真机门禁确认；不要把 preedit 持久化为元件配置。
+
+## tc.component.channel：渲染／仿真通道
+
+`tc.component.channel` V1 为一个 generation-checked 实例开两条有界消息队列和一个双缓冲快照。
+方向常量描述消息的生产者与消费者；快照固定为仿真发布、渲染读取。调用使用 `try_lock`，不会等待：
+争用返回 `ERR_BUSY`，队列满时按 `DROP_NEWEST` 或 `DROP_OLDEST` 处理并累计统计。
+
+```cpp
+#include "tc_component_channel.h"
+
+TCComponentChannelApiV1 api{};
+tc::component_channel::load(host, &api);
+TCComponentChannelConfigV1 cfg{sizeof(cfg), 1, 32, 256, 4096,
+                               TC_COMPONENT_CHANNEL_DROP_OLDEST};
+tc::component_channel::open(api, instance, cfg);
+tc::component_channel::send(api, instance, TC_COMPONENT_CHANNEL_RENDER_TO_SIM,
+                            &command, sizeof(command));
+```
+
+限制为每方向 1–256 条、每条至多 64 KiB、快照至多 1 MiB。`receive()` 的 count-only 查询和
+`ERR_SIZE` 都不弹出队首；`read_snapshot()` 传入已知 revision 可跳过未变化拷贝。实例销毁、换板或
+Mod 卸载都会回收通道，旧 generation 只会得到 `ERR_STALE`。
 
 ## tc.component.storage：配置与仿真状态快照
 
@@ -969,8 +1433,12 @@ if (tc::component_storage::table(host, &storage)) {
 （第一种判断错，后两种会打断 `text-box` 的相机平移，见 [../verification.md](../verification.md)）。
 正确的做法是写完配置后由 Mod 发出玩家自己那个请求：`tc::simulation::pause(sim)`（= `sim.do`
 command 1，走同一条钩子链），`local.float-ops` 就是这么做的
-（`examples/float-ops/components.cpp` 的 `refreshBoardAfterEdit`，日志
-`float-ops: the board was refreshed after a configuration edit (status 0)`）。
+（`examples/float-ops/components.cpp` 的 `requestBoardRefresh`，日志
+`float-ops: the board was refreshed after a Constant bind/configuration edit`）。
+
+走 `tc.component.editor` 的宿主行也一样：宿主只负责**改配置**，改完调这个类型的
+`on_config_changed`，所以字段表的消费者要在那里自己发刷新（`local.float-ops` 的
+`constantEditLifecycle`/`kEditLifecycle` 顺手再 `requestCircuitSave()` 把新配置落盘）。
 
 ### 配置随元件存档（2026-09-22 第二刀）
 
@@ -1085,6 +1553,179 @@ if (tc::component_storage::tableV2(host, &storage2)) {
 | `abort_edit` | 把配置还原成 begin 时的字节（记录与宿主内存都改），撤销栈不动；没有事务时返回 `ERR_STATE` |
 | 生命周期 | 实例被释放或换板时丢弃未提交的事务 |
 | 上限 | 与单次写入共用同一个栈：每块板最多 64 步 |
+
+## tc.component.editor：声明式属性行
+
+`tc.component.editor` 把"元件属性编辑器"拆成数据：一个类型在 `tc_mod_load` 里声明自己的配置
+字段，宿主负责把行画出来、收鼠标键盘、提交。SDK 封装在 `sdk/tc_component_editor.h`；V1 是
+基础字段与自动排版，**V2** 加布局标志、枚举单选、可编辑十六进制和滚动窗口，**V3** 加枚举下拉、
+RGBA 颜色、自定义行（绘制 + 右键菜单 + 双击 + 右下角缩放抓手）、行内校验提示与显式的多字段
+编辑事务，**V4** 加调色板 / 混合取色行、一行式校验标记与"确认 / 取消"式的暂存表。
+
+```cpp
+#include "tc_component_editor.h"
+
+static const char* const kModes[] = {"RNE", "RTZ", "RDN", "RUP", "RNA"};
+static const TCComponentFieldV1 kFields[] = {
+    // id         label               tooltip  kind                     flags offset bytes bits choices labels  min max   minf maxf
+    {"enabled", "Enabled",           nullptr, TC_COMPONENT_FIELD_BOOL, 0, 0, 1, 0, 0, nullptr, 0, 0, 0.0, 0.0},
+    {"period",  "Period (1..100)",   nullptr, TC_COMPONENT_FIELD_UINT, 0, 1, 2, 0, 0, nullptr, 1, 100, 0.0, 0.0},
+    {"mode",    "Rounding",          nullptr, TC_COMPONENT_FIELD_ENUM, 0, 3, 1, 0, 5, kModes, 0, 0, 0.0, 0.0},
+    {"label",   "Label",             nullptr, TC_COMPONENT_FIELD_TEXT, 0, 4, 24, 0, 0, nullptr, 0, 0, 0.0, 0.0},
+    {"scale",   "Scale (0.25..8)",   nullptr, TC_COMPONENT_FIELD_FLOAT, 0, 28, 4, 0, 0, nullptr, 0, 0, 0.25, 8.0},
+};
+
+tc::component_editor::Api editor{};
+if (tc::component_editor::table(host, &editor))
+    tc::component_editor::setFields(editor, kMyTypeId, kFields,
+                                    sizeof(kFields) / sizeof(kFields[0]));
+```
+
+| 项目 | 规则 |
+|---|---|
+| 声明时机 | 游戏线程的 `tc_mod_load`；必须先注册该类型，且只能声明调用方自己的 `custom_id` |
+| 字段落点 | `offset`/`bytes` 是**该实例配置 blob 的字节偏移**：越界即整表拒绝（`ERR_FIELD`），日志写明是哪一条 |
+| 端点字节序 | 配置是字节布局不是 C 结构；加载器按小端读写，因此字段不必匹配编译器的 padding |
+| 提交 | 走 `tc.component.storage` 的同一条路：**一次提交 = 一步撤销**，并触发该类型的 `on_config_changed` |
+| 提交时机 | 文本/整数/浮点：离开字段（Enter 或点别处）；勾选框与枚举：一改就提交 |
+| 行窗口 | 宿主自己的窗口盖在游戏元件抽屉上（无标题栏/无背景/不抢焦点），位置取抽屉内容原点，和 `examples/float-ops` 的可用配方一致 |
+| 与面板插槽共存 | 宿主行画在 `TC_UI_SLOT_BOARD_COMPONENT_PANEL` 回调之后；自定义编辑器仍然可用 |
+| 没声明的类型 | 行为完全不变；没有 `tc.component.editor` 的旧 Loader 返回 `UNAVAILABLE`，`table()` 返回 false |
+| 上限 | 每类型 32 行；UINT 最多 31 位（十六进制 64 位）；文本 2–64 字节；整数 1/2/4 字节；浮点 4 字节，宽度感知的十进制浮点 2/4/8 字节；调色板每行最多 16 个色块 |
+| 诊断 | `TC_EDITOR_TRACE=1` 时宿主每秒打印每行的矩形（`Component editor: row instance=… field="…" rect=… active=… focused=…`，文本行还带上缓冲内容），真机用例据此点击 |
+| 行窗口位置 | 抽屉内容原点 + 宽 8%/高 52%，再用上一帧窗口自己的高度夹进屏幕；字段多的类型不会把行画到屏幕外 |
+| 示例 | `examples/editor-demo`（0 引脚、54 字节配置：bool/整数/下拉/浮点/十六进制/文本/单选/颜色/调色板+十六进制混合行/自定义行，最小样例 + 32 行长表 + 暂存表）、`examples/float-ops`（65 个元件类型改用字段表，见下） |
+
+### V2：布局标志、单选、十六进制与滚动
+
+同一张字段表的 `flags` 多了一组位；`tableV2()` 能拿到 V2 表就说明这个加载器认这些位。
+
+| 标志 | 作用 |
+|---|---|
+| `TC_COMPONENT_FIELD_FULL_ROW` | 控件占满整行，画在标签的下一行（文本、宽值用它） |
+| `TC_COMPONENT_FIELD_INLINE` | 与**上一个**字段共用一行，两个短字段读起来像一对 |
+| `TC_COMPONENT_FIELD_SEPARATOR` | 本行之前画一条分隔线——长表格分组最省事的办法 |
+| `TC_COMPONENT_FIELD_RADIO` | 仅 ENUM：把一个选项一个单选按钮铺满一行，而不是点一下轮换（`examples/float-ops` 的"舍入模式"就是这一形状） |
+| `TC_COMPONENT_FIELD_HEX` | 仅 UINT：值以十六进制文本编辑（`0x1f40`），宽度上限从 31 位提到 **64**；解析不了的输入被拒绝、配置保持旧字节，并写一行日志 |
+
+### V2 的宽度感知十进制浮点行（`TC_COMPONENT_FIELD_FLOAT_WIDTH`，2026-09-27）
+
+`TC_COMPONENT_FIELD_FLOAT` 是 ImGui 的 32 位浮点框，宽度写死四字节。需要 16 位或 64 位浮点值的
+Mod（`local.float-ops` 的 FP16/FP64 常量）此前只能用十六进制行让玩家手敲 `0x2E66`，所以 V2 的
+字段种类加了这一种：
+
+| 项目 | 规则 |
+|---|---|
+| 宽度 | `bytes` = **2 / 4 / 8** 字节，分别按 IEEE-754 binary16 / binary32 / binary64 解释；其它宽度整表拒绝 |
+| 行内容 | 文本行，显示**能原样解析回该位模式的最短十进制**（binary16 的 0.1 显示 `0.1`，不是 `0.099975586`；binary64 用同样的"逐位加长直到能往返"办法，最多 17 位） |
+| 输入 | 普通十进制、科学计数法、`inf`/`-inf`/`nan`（任意大小写，可带符号）、`-0`；**按本宽度正确舍入**（binary16 经 double 中转仍精确：double 的 53 位远超 2p+2 = 24 的要求） |
+| 拒绝 | 解析器没有整段吃掉的文本（空、`abc`、`1.2.3`、`3.5x`）一律拒绝：配置保持旧字节，输入框恢复成实例真正持有的值，并写一行日志 |
+| 越界 | `min_float`/`max_float` 声明了范围时按双精度比较后钳位（与 FLOAT 同规则），钳位写一行日志 |
+| 存的是什么 | 位模式。文本只在读取时生成、在提交时解析一次，仿真里永远只有位模式 |
+| 与十六进制行的关系 | 两者互补：十进制行是给人输入的，`TC_COMPONENT_FIELD_HEX` 的 UINT 行是 NaN payload / 次正规 / 精确向量的逃生口。`local.float-ops` 的 FP16/FP64 常量两张都声明 |
+| 日志 | 声明行按宽度写 `value(float16)` / `value(float64)`；`TC_EDITOR_TRACE=1` 的每行矩形日志也带上输入框缓冲 |
+
+纯函数（`component_editor::formatFloatText` / `parseFloatText` / 两个转换）在
+`tests/component-editor.cpp` 里离线钉住：22 条具名拼写、**全部 65536 个 binary16 模式**的
+文本↔位模式往返、拒绝与钳位；真机上由 `tests/float-width-playtest.ps1` 用真实鼠标键盘把 `3.5`
+打进 FP16 常量、把 `2.5` 打进 FP64 常量并回读棋盘。
+
+布局规则（表级校验，违反整表拒绝）：
+
+- 第一行不能 `INLINE`；上一行如果是 `FULL_ROW` 或 `RADIO`（它们都独占整行），下一行也不能
+  `INLINE`；
+- 最多两个字段共用一行（三列会越过窗口宽度）；
+- 未知 flag 位**拒绝**而不是忽略——否则一个笔误只会悄悄改变排版。
+
+窗口行为：行窗口按**内容**高度（上一帧窗口高度 + 滚动范围）夹进屏幕，再用
+`igSetNextWindowSizeConstraints` 把它封顶在屏幕内；装不下的部分由 ImGui 滚动。
+`TC_EDITOR_TRACE=1` 时宿主还会打印一行 `Component editor: window instance=… pos=… size=…
+rows=… scrollmax=…`，滚动是否真的可用由它断言。
+
+**真机证据**：行绘制、真实鼠标点击、真实键盘输入与提交都已在 pinned build 上验过——复选框点一下
+提交（`enabled=1` → `0`）、文本行点开打字后回车提交（`label` 从 `"hello"` 变成 `"xy"`）、单选行
+点最后一个选项提交（`format=Float`）、十六进制框打字后回车提交（`mask=0x…beef`）、以及 32 行长表
+（`rows=32 scrollmax=458`，第一行照样点得动）。每条都由元件自己的 `on_config_changed` 报出。
+用例：`tests/component-editor-playtest.ps1`（注册）与 `-Stage rows`（四个控件形状 + `-Type long`
+滚动），见 [verification.md](../verification.md)；踩过的坑与驱动做法见
+[HANDOFF-component-editor.md](../HANDOFF-component-editor.md) §5。
+
+### V3：下拉、颜色、自定义行、校验与编辑事务
+
+V3 的字段描述符是**另一个结构**（`TCComponentFieldV2` 里嵌一份完整的 V1/V2 字段），所以 V1/V2 的
+表布局一个字节都没动：只有显式查询 V3 并调用 `set_fields_v2()` 的 Mod 才会碰到下面这些能力。
+
+| 新增 | 说明 |
+|---|---|
+| `TC_COMPONENT_FIELD_DROPDOWN` | 仅 ENUM：行画成真正的下拉框（默认仍是 V1 的点一下轮换）。与 `RADIO` 互斥 |
+| `TC_COMPONENT_FIELD_COLOR_RGBA8`（种类 8） | 4 字节小端 `0xAABBGGRR` 的颜色行，用 ImGui 自己的颜色控件；一次拖动 = 一步撤销 |
+| `TC_COMPONENT_FIELD_CUSTOM`（种类 9） | 自定义行：`offset`/`bytes` 可以为 0，宿主给一块裁剪过的画布和 `TCComponentRenderDrawV1` 绘制表，Mod 自己画；`custom_height` 给行高上限 4096 px |
+| `TC_COMPONENT_FIELD_RESIZE_HANDLE` | 仅 CUSTOM：行右下角一个缩放抓手。按下时宿主开一个 `storage` 编辑事务，拖动期间把累计位移交给 Mod，松手提交——**整段拖动 = 一步撤销** |
+| `TCComponentEditorValidateV1` | 提交前校验：宿主把**拟提交的完整配置**交给 Mod，返回 `OK` 提交、`WARNING` 提交并记一行警告、`ERROR` 拒绝并保留旧字节（配置不变） |
+| `TCComponentEditorActionCallbackV1` | 自定义行的交互：`MENU`（带 Mod 自己声明的 action id）、`DOUBLE_CLICK`、`RESIZE_BEGIN`/`RESIZE`/`RESIZE_END`/`RESIZE_CANCEL`，事件里带屏幕坐标、累计位移与配置快照 |
+| `begin_edit` / `commit_edit` / `abort_edit`（编辑器侧） | 把 `tc.component.storage` V2 的事务从编辑器服务转发出来，供菜单/双击回调使用（缩放抓手已经自动这么做） |
+
+校验提示画在该行下面（`Error:` / `Warning:` 前缀），拒绝时同时写一行 `validator refused field …`。
+自定义行的上下文菜单由 `context_action_ids`/`context_action_labels` 声明（每行最多 8 条，id 非零
+且不重复）；回调在宿主线程调用、异常被捕获并禁用该行，不会越过 C ABI。
+
+### V4：调色板、混合取色、校验标记与确认对话框（2026-09-29）
+
+V4 不再动字段描述符：它的表还是 `TCComponentFieldV2`，所以 V3 的表一字未改。V4 加的是三件东西
+——**取色的另外两种形状**、**一行式校验标记**，以及**表级的暂存开关**。查询 V4（或调用
+`set_fields_v3()`）才表示"这个加载器认得下面这些位"；只查 V3 的加载器会用 `ERR_FIELD` 拒绝，
+而不是换一种画法，所以用 V4 形状的 Mod 必须保留一份 V3 的降级表。
+
+| 新增 | 说明 |
+|---|---|
+| `TC_COMPONENT_FIELD_COLOR_PALETTE`（位 8） | 仅 `COLOR_RGBA8`：行里的取色控件是 Mod 自己声明的**色块条**。色块复用 `choices`/`choice_labels` 这两个成员，每个标签是一条颜色字面量 `"#RRGGBB"`/`"#RRGGBBAA"`（`#`/`0x` 前缀可省，`#RGB` 按 CSS 规则展开）；点一个色块 = 提交那个颜色。最多 16 个色块 |
+| `TC_COMPONENT_FIELD_COLOR_HEX`（位 9） | 仅 `COLOR_RGBA8`：这一行**再多一个文本框**，内容是打包值 `0xAABBGGRR`——颜色字段原本没有的"精确位型"出口，地位和 UINT 的 `HEX` 一样。文本框也接受 `#RRGGBB[AA]`；读不懂的输入被拒绝、配置保持旧字节，输入框退回实例真正持有的值。与 PALETTE 同时声明就是"色块条 + 十六进制框"的混合行 |
+| `TC_COMPONENT_FIELD_VALIDATION_ICON`（位 10） | 任意种类：校验消息不再占一行文字，而是画在控件末尾的一个小方块（错误红 / 警告琥珀），鼠标停在上面时以 tooltip 显示同一条消息。消息本身照旧写进日志；**用宿主窗口自己的绘制表画、不占 ImGui 的项**，否则下一个行会被挤到标记旁边而不是掉到下一行 |
+| `TC_COMPONENT_EDITOR_TABLE_CONFIRM`（表级位 0） | 表级开关，经 `set_fields_v3()` 传入：整张表的编辑都落在宿主的**工作副本**里，行的底下多出 `Apply` / `Cancel`。Apply 才写配置，而且**一次写完**——不管改了几个字段，都是一步撤销、一次 `on_config_changed`；Cancel 重新读实例、把暂存值丢掉。声明了 CUSTOM 行的表不能开这个开关（那种行的回调自己经 `tc.component.storage` 写配置，会和宿主的副本抢同一个 blob），整表拒绝 |
+| `TC_COMPONENT_FIELD_V3_KNOWN_FLAGS` | V3 那一版的位集，单独留名。`TC_COMPONENT_FIELD_KNOWN_FLAGS` 是"当前这一版"的别名，所以 V3 入口按前者校验：新加载器不会因为自己长大就悄悄接受一个 V3 调用方不可能知道的位 |
+
+暂存表的编辑语义与 V3 逐字一致，只差"写到哪"：值先落在工作副本里，行上显示的就是暂存值，
+校验器照常跑（`ERROR` 的那一笔回滚并把消息留在标记上），Apply 再对着整份暂存字节把所有改过的
+字段各校验一遍——任何一条 `ERROR` 都让整批不写。
+
+诊断：色块发布 `Component editor: swatch instance=… field="…" index=N rect=…`，校验标记发布
+`Component editor: validation icon instance=… field="…" status=… rect=…`，hover 时另有
+`Component editor: validation tip … message="…"`，暂存表发布
+`Component editor: dialog instance=… apply=… cancel=… pending=N`；暂存与落盘分别写
+`staged field "…"` 与 `applied N staged field(s) … in one step`、取消写 `cancelled N staged field(s)`。
+真机用例 `component-editor-swatch`、`component-editor-color-hex`、`component-editor-validation-icon`、
+`component-editor-confirm`、`component-editor-confirm-cancel` 就是照这些行断言的，见
+[verification.md](../verification.md)。
+
+### 面板约束、折叠与窗口自适应（2026-09-28）
+
+行窗口画在游戏自己的底部面板里，因此几何规则是**面板优先**的：
+
+| 情况 | 行为 |
+|---|---|
+| 面板矩形 | 每帧从游戏窗口读（`igGetWindowPos/Size`），行窗口的左右与上下都夹在面板边框内，留 6 px 边距 |
+| 装不下 | 表格比面板高时行窗口封顶在面板底边并交给 ImGui 滚动；**先尽量用满标题行以下的整块面板**，只有放得下时才把上半留给游戏自己的内容 |
+| 面板收起 | 钩子（抽屉标题行）在收起状态照常运行，所以宿主按"标题行以下还剩多少"判折叠：低于 34 px 就**完全不画、也不动任何编辑状态**（正在输入的文本、滚动位置、窗口矩形都保留） |
+| 面板再次拉起 | 恢复绘制，行回到原来的位置，先前填入的内容与预览不变 |
+| 窗口尺寸变化 | 面板矩形、行宽、控件位置每帧重算：窄窗口收缩字段宽度而不是把控件推出面板，高窗口按内容自适应 |
+| 诊断 | `TC_EDITOR_TRACE=1` 的 `window` 行带 `panel=` 与 `toggle=`（游戏自己的折叠钮矩形），行行带 `value=`/`buffer=` |
+| 真机验收 | 每个 rows 用例都断言行窗口与被点击的行落在 `panel=` 矩形内；`-Fold` 用例点游戏自己的折叠钮，断言折叠期间**零**行 trace、展开后同一矩形与同一 `buffer` 回来 |
+
+## `tc.mod.storage`：Mod 全局设置与随存档数据
+
+这张表不是游戏对象服务，而是同一套 `query_service` 发现机制下的宿主服务。它把调用插件身份绑定在
+服务 context 上，为每个 Mod 提供 GLOBAL 与 PROFILE 两个隔离命名空间；插件只读写 key/blob，不能
+指定 id 或路径。完整示例、磁盘归属、错误码和配额见 [mod-storage.md](mod-storage.md)。
+
+V1 的写入是原子整值替换，支持先问长度再读；PROFILE 数据住在当前独立 profile 内，因此存档管理页
+的复制/重命名/删除天然会把它一起处理。V2 把 schema 版本与 payload 放进同一原子 envelope，提供
+`get_version` / `migrate`；回调失败、输出越界或并发改写都不动旧值。V1 读取仍只看到 payload。
+
+## `tc.mod.settings`：统一声明式设置页
+
+Mod 在 `tc_mod_load` 交一张 bool/int/float/enum/text 字段表，宿主复制后从 `tc.mod.storage` 读取并校验，
+在主菜单的统一 **Mod settings** 页按 Global / Current save 分组绘制。改动自动原子保存；每行有 Reset；
+可选 changed 回调能在写入前拒绝值。完整字段约束和示例见 [mod-settings.md](mod-settings.md)。
 
 ## 演进规则
 

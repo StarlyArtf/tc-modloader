@@ -1,0 +1,18 @@
+# The game's word Mux (kind 0x2a) as a live session recorded it: the component
+# the dump labels `index=22` in
+# tc-modloader-data/plugin-data/dev.sandbox-sim/sandbox-sim-board.txt
+# (2026-09-29), plus the four wires that land on its pins.  It is the only
+# component here, so it takes position 0 and its device is `u0_mux32`.
+#
+# The pins are the catalogue's own (build/kinds.txt: in0=(-1,-1,w1),
+# in1=(-1,0,wauto), in2=(-1,1,wauto), out0=(2,0,wauto)), so at (84,-14) the
+# pins are (83,-15) select, (83,-14) A, (83,-13) B and (86,-14) the output.
+# The one-bit wire really does arrive on in0 - which is why the select is the
+# pin that must never be widened - while A and the output are 32 bits and B is
+# a 16-bit wire reaching a 32-bit pin.  memory_bits is the width the game
+# resolved for the auto-width data pins, the same field a Word Switch uses.
+component index=0 kind=0x2a x=84 y=-14 rotation=0 word30=3 word40=1 custom=0 memory_bits=32 memory_extra=0 little_endian=0
+wire index=0 from=83,-29 to=83,-15 width=1 slot=4194390
+wire index=1 from=83,-14 to=78,-14 width=32 slot=4194382
+wire index=2 from=81,-13 to=83,-13 width=16 slot=4194384
+wire index=3 from=87,-14 to=86,-14 width=32 slot=4194308

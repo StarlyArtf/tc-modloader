@@ -1,8 +1,10 @@
 # IEEE 754 浮点元件族实施方案
 
-更新时间：2026-09-25  
-状态：**方案已定，M0 兼容性、M1 数值内核与 M2 垂直切片均已完成（2026-09-25），M3 基础包可以
-开始**；§12 只保留真正需要产品选择的事项。
+更新时间：2026-09-27
+状态：**M0–M4 与 M6 的位宽部分均已交付**——M0 兼容性、M1 数值内核、M2 垂直切片、M3 基础包、
+M4 扩展运算（2026-09-25/26），以及 **binary16/binary64 元件族**（2026-09-27，§6.4.1 定稿的
+"一个格式一个元件"）：65 个元件、元件栏按格式分层、文本层按宽度、离线与真机用例都已跑绿。
+剩下的只有 M5 产品化里的可选项（本地化、导线标签、成本政策）与 §12.3 里按需再定的决策。
 
 M2 交付（`tests/float-ops-playtest.ps1`，真机闭环）：`FP32 Constant`（0 入 1 出，
 配置 8 字节 schema 2 = format + display + bits）、`FP32 Add`（A/B 两输入 → R[32]+Flags[5]，
@@ -415,6 +417,67 @@ binary32 稳定后，再按需求增加：
 - binary64 的 Constant、Display、二元运算、比较、分类和转换；
 - 不提供普通形态的 FP64 FMA，除非以后增加多周期装载协议。
 
+#### 6.4.1 定稿（2026-09-27）：一个格式一个元件，不做实例级切换
+
+原本设想的"同一个 Add，用左上角位宽框在 16/32/64 之间切换"**不成立**：棋盘上"位宽"就是引脚
+宽度，而 Mod 元件的引脚宽度是**注册期按类型冻结**的（`TCComponentPinV2.bits`，1–64，
+`tc.component.types` 没有"引脚宽度跟随实例配置"这一项）。把可切换类型的引脚统一加宽到 64 位
+也只能绕开问题的一半，而且二元运算会正好压满 128 位输入预算、FMA 三个输入直接超预算。
+
+所以改成**一种格式一个元件**：`FP16 Add`、`FP32 Add`、`FP64 Add` 各是一个类型，各自声明自己
+宽度的引脚。位宽框因此仍按类型显示 `16`/`32`/`64`，**不做成按钮**（没有可切换的状态），
+左上角那两个方框保持"显示当前配置"的职责。
+
+身份与命名规则（沿用已有的 `F32…` ASCII 惯例，旧存档里的 id 一个都不动）：
+
+| 格式 | custom_id 形态 | 显示名 | 引脚宽度 |
+|---|---|---|---|
+| binary16 | `F16ADD_1`（8 个 ASCII 字符，u64） | `FP16 Add` | 输入/输出 16 位 |
+| binary32 | `F32ADD_1`（**已有，不改**） | `FP32 Add` | 32 位 |
+| binary64 | `F64ADD_1` | `FP64 Add` | 64 位 |
+
+目录结构按**格式在前、分类在后**，避免 60+ 个元件全挤在 `浮点/计算` 一个节点下：
+`浮点/FP16/计算/FP16 Add`、`浮点/FP64/比较/FP64 Compare`（游戏按名字里的 `/` 拆树，
+见 [research/palette-categories.md](research/palette-categories.md)）。
+
+覆盖范围：
+
+| 类型族 | FP16 | FP32 | FP64 |
+|---|---|---|---|
+| Constant、Display | 有 | 有 | 有 |
+| Add/Subtract/Multiply/Divide/Square Root/Remainder/Round To Integral | 有 | 有 | 有 |
+| Negate/Absolute/Compare/Classify/Minimum/Maximum | 有 | 有 | 有 |
+| I32→FP、U32→FP、FP→I32、FP→U32（整数侧仍是 32 位） | 有 | 有 | 有 |
+| Split Bits / Make Bits（位段宽度随格式） | 有 | 有 | 有 |
+| Fused Multiply Add | 有 | 有 | **无**（3×64 = 192 > 128 位输入预算） |
+
+每种格式的运算都走 `fp/format.hpp` 的 `FormatOps` 表（binary32 转调 `fp32.cpp`，16/64 是
+SoftFloat 的 f16/f64 入口），所以"一种格式一个元件"只是**注册层的复制**，数值语义仍只有一份。
+
+**实施状态（2026-09-27）：已交付。**
+
+| 交付面 | 落地位置 | 证据 |
+|---|---|---|
+| 65 个类型（22/22/21） | `components.cpp` 的 `kFamilies` 一族一行，`catalogueStore()` 按格式展开；`floatTypeId()` 造 `F16…`/`F64…`，22 个既有 `F32…` id 由 `static_assert` 钉住不变 | `tests/float-compat.cpp` 走完整表：形状、引脚宽度、配置布局与默认 blob 的宽度字节 |
+| 引脚宽度按格式 | 字 16/32/64；位段 `Split/Make` 用 1/5/10、1/8/23、1/11/52；整数侧仍 32 位；`Flags[5]`、`Class[10]` 不变 | 同上；`2+3=5` 在三种格式各跑一遍 |
+| 宽度写进回调身份 | `TCComponentTypeDefinitionV2::user` = 格式字节，回调由 `ioFormat(io)` 读回（`TCLogicIOV2::user`） | `tests/float-compat.cpp`：FP16 的 1.0+2^-11 半 ULP 用例在 RNE/RUP 下不同，且外来宽度配置被拒 |
+| 元件栏分层 | 注册名 `浮点/<格式>/<分类>/<名字>`，游戏自己建目录（`浮点 ▸ FP16 ▸ 计算 ▸ FP16 Add`） | `tests/float-palette-playtest.ps1`：70 个 id 一一核对 + 三层目录存在 |
+| FP16/FP64 常量配置 | binary32 保留原 16 字节 `ConstantConfig`；两个新宽度共用 28 字节 `ConstantConfigWide`（`+4` 起 8 字节位模式）；抽屉里只有 `原始位`（hex，16/64 位）+ `标签` | `editor.cpp`、`tests/float-compat.cpp` 的布局检查 |
+| 按宽度的文本 | `format_shortest_for` / `format_scientific_for` / `format_hex_for` / `format_value_for`：32 走 Ryu `f2s`，64 走 Ryu `d2s`，16 把精确 binary32 像的位数截短到仍能往返 | `tests/float-text.cpp`：22 条具名拼写 + 全部 65536 个 binary16 模式 + 20000 个 binary64 抽样往返 |
+| 元件图 | `icons.cpp` 从同一张表生成 65 张 PNG | `tests/float-icons.ps1`（65 张，逐张量本体/引脚/文字） |
+
+已知取舍（都写进了实现注释）：
+
+- FP64 FMA 不注册：三个 64 位输入 = 192 位 > 加载器 128 位输入预算，加载器会直接拒绝注册。
+- FP64 二元运算正好 128 位（`kMaxInputBits`，`src/native_logic.hpp`），是预算的上界本身。
+- binary16 的最短十进制取"能往返的最短位数"，因此最大有限值 65504 显示 `65500`——与 Ryu 对
+  最大 binary32 打 `3.4028235E38` 同一条规则，不是精度丢失。
+- ~~FP16/FP64 常量只能写十六进制位模式~~ **已解决（2026-09-27）**：加载器新增
+  `TC_COMPONENT_FIELD_FLOAT_WIDTH`（2/4/8 字节的十进制浮点行，见
+  [sdk/services.md](sdk/services.md) 的同名小节），FP16/FP64 常量现在与 FP32 一样有 `值` 行，
+  `原始位` 行保留给 NaN payload 与精确向量。真机证据：`tests/float-width-playtest.ps1` 的
+  第 2、3 阶段。
+
 ## 7. 配置与交互
 
 ### 7.1 原则
@@ -665,8 +728,8 @@ ABI。
 | M2 垂直切片 | Constant + Add + Display，原版风格本体、固定 `32` 位宽框、五模式舍入框、配置和真机闭环 | M3 |
 | M3 基础包 ✅ | Sub/Mul/Div/Sqrt/Neg/Abs/Compare/Classify（已交付，见 §10.4 与 changelog） | M4 / 首次公开测试 |
 | M4 FP32 扩展运算 ✅ | FMA、remainder、roundToIntegralExact、min/max Number、I32/U32 双向转换、Split/Make Bits（已交付，见 §10.4） | M5 |
-| M5 产品化 | 全元件外观收口、本地化、菜单探针、成本政策 | 稳定发布 |
-| M6 扩展 | binary16/binary64、可选导线标签、按新版 Loader 能力扩大兼容范围 | 独立决策 |
+| M5 产品化 | 全元件外观收口、本地化、菜单探针、成本政策（外观与菜单探针已随 M3/M4 落地，剩余为可选项） | 稳定发布 |
+| M6 扩展 ✅ | binary16/binary64 元件族已交付（2026-09-27，§6.4.1：22/22/21 个类型、元件栏按格式分层、文本层按宽度）；可选导线标签与按新版 Loader 扩大兼容范围仍是独立决策 | 独立决策 |
 
 按阶段留下适用证据并写入该 Mod 的验证记录：M1 是纯离线数值验证；M0、M2 及以后同时保留
 离线测试和真机证据。

@@ -8,7 +8,7 @@
 | 上一份日志 | `<游戏目录>/tc-modloader-data/loader.log.1` | 超过 8 MiB 时轮转一次（只保留上一份） |
 | 崩溃归属 | `<游戏目录>/tc-modloader-data/fault.log` | 插件回调里的硬件异常：哪条链节/监听器、什么原因（见下） |
 | 插件数据 | `<游戏目录>/tc-modloader-data/plugin-data/<mod id>/` | 插件自己写的数据（例如自动验证开关） |
-| 生成源码转储 | 游戏工作目录 | `native-logic-source-<n>.txt`（每次编译一份）、`native-logic-source.txt`（含桥接调用的那份） |
+| 生成源码转储 | 游戏工作目录 | `native-logic-source-<n>.txt`（每次编译一份，**游戏自己发出的原文**）、`native-logic-source.txt`（含桥接调用的那份）、`native-logic-source-keyboard-<n>.txt`（同一份被 Keyboard 修正改写后、真正交给 JIT 的那份；只在改写命中时写） |
 | 隔离沙箱日志 | `build/<playtest>-<guid>/game/tc-modloader-data/loader.log` | 自动验证每次运行的副本 |
 | 版本不匹配标记 | `<游戏目录>/tc-modloader-data/unsupported-build.txt` | 加载器版本 + 游戏 EXE/引擎哈希；出现它就说明这次运行没有真正接管（见下方"与游戏不匹配时"） |
 
@@ -128,6 +128,10 @@ ImGui 的文字要有字形才会画顶点：字体不对时**矩形照画、文
 
 - `native-logic-source-<n>.txt`：按编译顺序编号（一个关卡会分别编译关卡 IO 程序与原理图程序）。
 - `native-logic-source.txt`：含桥接调用的那一份，便于直接看替换结果。
+- `native-logic-source-keyboard-<n>.txt`：加载器改写掉原版 Keyboard（kind `0x5d`）两处缺陷后、
+  真正交给游戏 JIT 的那一份，只在改写命中时写；编号与同一轮编译的 `native-logic-source-<n>.txt`
+  对应，两份并排 diff 就是这次改写动的全部行。`TC_MODLOADER_KEYBOARD_FIX=0` 可以关掉改写，
+  用来抓对照（见 [键盘修正的由来](../changelog.md)）。
 
 典型排查路径：在转储里搜 `tc_logic` 看替换后的行，再搜 `com_` 找到对应元件节点与
 `level_output.` 赋值行，对比游戏自己的发射形式。示例：

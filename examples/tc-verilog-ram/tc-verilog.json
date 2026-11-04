@@ -1,0 +1,33 @@
+{
+  "format": 2,
+  "project": {
+    "id": "example.tc-verilog-ram",
+    "name": "TC-Verilog Components",
+    "description": "Editable Verilog components for the TC-Verilog example mod.",
+    "source_roots": [
+      "."
+    ],
+    "default_component": "ram16x8"
+  },
+  "build": {
+    "max_source_bytes": 262144,
+    "max_tokens": 65536,
+    "max_state_words": 65536,
+    "max_expression_depth": 128
+  },
+  "components": [
+    {
+      "key": "ram16x8",
+      "source": "ram16x8.v",
+      "top_module": "ram16x8",
+      "group": "Memory",
+      "custom_id": "0x54435652414d3031",
+      "type_id": "example.tc-verilog-ram/ram16x8",
+      "name": "Verilog RAM 16x8",
+      "description": "Synchronous-write 16 x 8 RAM loaded from a .v file.",
+      "gate_cost": 16,
+      "delay": 1,
+      "pin_lane": 3.0
+    }
+  ]
+}

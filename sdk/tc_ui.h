@@ -127,9 +127,11 @@ struct Table {
     double (*getTime)();
     void (*setCursorPos)(Vec2);
     void (*setNextItemWidth)(float);
+    void (*getContentRegionAvail)(Vec2*);
     void (*textUnformatted)(const char*, const char*);
     void (*textDisabled)(const char*, ...);
     void (*separator)();
+    void (*separatorText)(const char*);
     void (*sameLine)(float, float);
     void (*newLine)();
     void (*spacing)();
@@ -140,12 +142,14 @@ struct Table {
     bool (*invisibleButton)(const char*, Vec2, int);
     bool (*checkbox)(const char*, bool*);
     bool (*radioButton)(const char*, bool);
+    bool (*selectable)(const char*, bool, int, Vec2);
     void (*beginDisabled)(bool);
     void (*endDisabled)();
     bool (*colorPicker3)(const char*, float*, int);
     bool (*colorButton)(const char*, Vec4, int, Vec2);
     bool (*sliderFloat)(const char*, float*, float, float, const char*, int);
     bool (*inputText)(const char*, char*, unsigned long long, int, void*, void*);
+    bool (*inputTextMultiline)(const char*, char*, unsigned long long, Vec2, int, void*, void*);
     bool (*beginChild)(const char*, Vec2, int, int);
     void (*endChild)();
     void (*pushId)(const char*);
@@ -236,9 +240,11 @@ inline bool load(const TCHost* host) {
     TC_UI_BIND(getTime, "igGetTime");
     TC_UI_BIND(setCursorPos, "igSetCursorPos");
     TC_UI_BIND(setNextItemWidth, "igSetNextItemWidth");
+    TC_UI_BIND(getContentRegionAvail, "igGetContentRegionAvail");
     TC_UI_BIND(textUnformatted, "igTextUnformatted");
     TC_UI_BIND(textDisabled, "igTextDisabled");
     TC_UI_BIND(separator, "igSeparator");
+    TC_UI_BIND(separatorText, "igSeparatorText");
     TC_UI_BIND(sameLine, "igSameLine");
     TC_UI_BIND(newLine, "igNewLine");
     TC_UI_BIND(spacing, "igSpacing");
@@ -249,12 +255,14 @@ inline bool load(const TCHost* host) {
     TC_UI_BIND(invisibleButton, "igInvisibleButton");
     TC_UI_BIND(checkbox, "igCheckbox");
     TC_UI_BIND(radioButton, "igRadioButton_Bool");
+    TC_UI_BIND(selectable, "igSelectable_Bool");
     TC_UI_BIND(beginDisabled, "igBeginDisabled");
     TC_UI_BIND(endDisabled, "igEndDisabled");
     TC_UI_BIND(colorPicker3, "igColorPicker3");
     TC_UI_BIND(colorButton, "igColorButton");
     TC_UI_BIND(sliderFloat, "igSliderFloat");
     TC_UI_BIND(inputText, "igInputText");
+    TC_UI_BIND(inputTextMultiline, "igInputTextMultiline");
     TC_UI_BIND(beginChild, "igBeginChild_Str");
     TC_UI_BIND(endChild, "igEndChild");
     TC_UI_BIND(pushId, "igPushID_Str");
@@ -635,6 +643,9 @@ private:
 };
 
 inline void separator() { if (table().separator) table().separator(); }
+inline void separatorText(const char* label) {
+    if (table().separatorText) table().separatorText(label ? label : "");
+}
 inline void newLine() { if (table().newLine) table().newLine(); }
 inline void spacing() { if (table().spacing) table().spacing(); }
 inline void sameLine(float offsetFromStartX = 0.f, float spacing = -1.f) {
@@ -645,6 +656,11 @@ inline void setCursorPos(Vec2 localPos) {
 }
 inline void setNextItemWidth(float width) {
     if (table().setNextItemWidth) table().setNextItemWidth(width);
+}
+inline Vec2 contentRegionAvailable() {
+    Vec2 value{0, 0};
+    if (table().getContentRegionAvail) table().getContentRegionAvail(&value);
+    return value;
 }
 inline void setNextWindowBgAlpha(float alpha) {
     if (table().setNextWindowBgAlpha) table().setNextWindowBgAlpha(alpha);
@@ -662,6 +678,9 @@ inline void setNextWindowFocus() {
     if (table().setNextWindowFocus) table().setNextWindowFocus();
 }
 inline float windowWidth() { return table().getWindowWidth ? table().getWindowWidth() : 0.f; }
+inline void setWindowFontScale(float scale) {
+    if (table().setWindowFontScale && scale > 0.f) table().setWindowFontScale(scale);
+}
 
 /* Popups: the game's own tools expand this way (a small window next to the
    control, closed by clicking away or pressing Escape).  Open one on hover and
@@ -700,6 +719,10 @@ inline bool checkbox(const char* label, bool* value) {
 inline bool radioButton(const char* label, bool active) {
     return table().radioButton && table().radioButton(label, active);
 }
+inline bool selectable(const char* label, bool selected = false, int flags = 0,
+                       Vec2 size = {0, 0}) {
+    return table().selectable && table().selectable(label, selected, flags, size);
+}
 inline bool sliderFloat(const char* label, float* value, float min, float max,
                         const char* format = "%.3f", int flags = 0) {
     return table().sliderFloat && table().sliderFloat(label, value, min, max, format, flags);
@@ -715,6 +738,13 @@ inline bool inputText(const char* label, char* buffer, unsigned long long capaci
                       int flags = 0) {
     return table().inputText &&
            table().inputText(label, buffer, capacity, flags, nullptr, nullptr);
+}
+/* Multi-line counterpart used by source/code editors.  The buffer must remain
+   writable and stable for the duration of the call, exactly like inputText(). */
+inline bool inputTextMultiline(const char* label, char* buffer, unsigned long long capacity,
+                               Vec2 size = {0, 0}, int flags = 0) {
+    return table().inputTextMultiline &&
+           table().inputTextMultiline(label, buffer, capacity, size, flags, nullptr, nullptr);
 }
 inline bool colorPicker3(const char* label, float* rgb, int flags = 0) {
     return table().colorPicker3 && table().colorPicker3(label, rgb, flags);

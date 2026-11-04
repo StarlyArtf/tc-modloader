@@ -128,7 +128,7 @@ EXE RVA 0x38f0ea，所以被调函数看到的返回地址是 **0x38f0ef**。同
 ```powershell
 $env:TC_CURSOR_CLICK='1'
 .\tests\pin-label-playtest.ps1 -Name theirs17 -Seconds 140 -ShotDelay 56000 -CursorDelay 40000 `
-  -Profile 'C:\Users\Administrator\AppData\Roaming\Turing Complete Mods\profiles\import-e93e633f1ae7701b50bc8576' `
+  -Profile '<profile-directory>' `
   -ExtraMods 'dev.enter-board','dev.cursor-pin' -CursorPoint '345 37'
 ```
 

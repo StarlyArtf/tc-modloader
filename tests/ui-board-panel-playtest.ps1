@@ -18,7 +18,7 @@
 # then the driver run uses that point.  The driver never guesses a position.
 param(
   [string]$Sandbox = (Join-Path (Split-Path $PSScriptRoot) 'build\board-panel-sandbox'),
-  [int]$Seconds = 45,
+  [int]$Seconds = 120,
   [switch]$Probe,
   # Load the *shipped* example instead of the driver build: it only proves that
   # the example package registers and runs without errors (reaching a board
@@ -80,7 +80,10 @@ try {
   $env:TC_BOARD_CLICK = $taskPreviousClick
   if ($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning) {
     [void]$taskProcess.CloseMainWindow()
-    if (!$taskProcess.WaitForExit(4000)) { Stop-Process -Id $taskProcess.Id }
+    if (!$taskProcess.WaitForExit(4000)) {
+      Stop-Process -Id $taskProcess.Id
+      if (!$taskProcess.WaitForExit(5000)) { throw 'Isolated board-panel game did not exit' }
+    }
   }
 }
 

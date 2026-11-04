@@ -1,4 +1,5 @@
 # Runs the simulation-state mapping probe in an isolated sandbox.
+param([string]$Loader = '')
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path $PSScriptRoot
 $taskGame = Split-Path $taskRepo
@@ -29,7 +30,8 @@ foreach($taskDir in @('asset','campaign','translations')) {
 foreach($taskFile in @('Turing Complete.exe','compile.dll','tc_game_engine.dll','soft_oal.dll','steam_api64.dll','libgcc_s_seh-1.dll','libwinpthread-1.dll')) {
   Copy-Item -LiteralPath (Join-Path $taskGame $taskFile) -Destination $taskRoot
 }
-Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\tc-loader.dll') -Destination (Join-Path $taskRoot 'game_engine.dll')
+$taskLoader = if ($Loader) { (Resolve-Path -LiteralPath $Loader).Path } else { Join-Path $taskRepo 'dist\tc-loader.dll' }
+Copy-Item -LiteralPath $taskLoader -Destination (Join-Path $taskRoot 'game_engine.dll')
 Copy-Item -LiteralPath $taskMod -Destination (Join-Path $taskRoot 'mods\dev.sim-state.mod')
 if($taskLogic) {
   Set-Content -LiteralPath (Join-Path $taskData 'logic.txt') -Value $taskLogic -Encoding ascii

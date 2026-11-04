@@ -19,7 +19,7 @@ New-Item -ItemType Directory -Force $taskWork | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'probes') -Destination $taskWork -Recurse -Force
 Push-Location $taskWork
 try {
-    foreach ($taskName in @('probe1-initial-delay', 'probe2-edge-delays', 'probe3-resolution')) {
+    foreach ($taskName in @('probe1-initial-delay', 'probe2-edge-delays', 'probe3-resolution', 'probe4-vector-delays')) {
         "=== $taskName ==="
         & $taskIverilog -g2005 -o "$taskName.vvp" "probes\$taskName.v"
         if ($LASTEXITCODE) { throw "iverilog refused $taskName" }

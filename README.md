@@ -8,20 +8,26 @@
 | 资源 Mod | 替换/新增游戏资源文件、精确文本补丁、停用恢复 | [docs/mod-format.md](docs/mod-format.md) |
 | 原生插件 | 解析游戏符号、Hook 函数、每帧回调、用游戏自身 ImGui 画面板 | [docs/sdk/host-api.md](docs/sdk/host-api.md) |
 | 插件界面 | `sdk/tc_ui.h`：面板/窗口作用域、类型化控件、视口尺寸、热键；导出在加载期统一校验 | [docs/sdk/ui.md](docs/sdk/ui.md) |
+| 元件属性编辑器 | `sdk/tc_component_editor.h`：类型声明一张字段表，宿主在游戏自己的元件抽屉里画行、收输入、提交；V4 加色块条/混合取色、一行式校验标记与"确认/取消"式暂存表 | [docs/sdk/services.md](docs/sdk/services.md#tccomponenteditor声明式属性行) |
 | 自定义绘图 | `sdk/tc_ui_draw.h`：交互画布、线／圆／多边形／曲线／文本、局部坐标与嵌套裁剪 | [docs/sdk/ui.md](docs/sdk/ui.md) |
 | 图片纹理 | `sdk/tc_ui_texture.h`：图片／RGBA 上传、UV 裁切与翻转、图片按钮、按 Mod 管理与延迟释放 | [docs/sdk/ui.md](docs/sdk/ui.md) |
 | 电路封装元件 | 导入 `circuit.data` 生成自定义元件，菜单放置、保存重载 | [docs/sdk/game-model.md](docs/sdk/game-model.md) |
 | 声明式 C++ 元件 | 只声明引脚和回调，自动生成定义，无需手写电路文件 | [docs/sdk/native-components.md](docs/sdk/native-components.md) |
 | 声明延迟 | 元件声明的关键路径进入编译期时序统计 | [docs/sdk/game-model.md](docs/sdk/game-model.md#设计代价与声明延迟) |
 | 原生逻辑回调 | 元件每周期行为由插件 C++ 决定，关卡判定/暂停/重置仍由游戏执行 | [docs/sdk/custom-logic.md](docs/sdk/custom-logic.md) |
+| TC-Verilog 内核 | 可综合 Verilog 子集直接生成并执行 V3 元件，自动生成端口，含寄存器、RAM、NBA 与三态输出 | [docs/sdk/tc-verilog.md](docs/sdk/tc-verilog.md) |
 | 独立存档与存档管理 | 始终使用独立存档；主菜单「存档」页可新建/导入/复制/重命名/删除到回收站/切换副本，并列出每份存档**需要哪些 Mod、缺哪些** | [docs/install.md](docs/install.md) |
+| Mod 配置与设置页 | `tc.mod.storage` V2：隔离数据、schema 原子迁移与失败回滚；`tc.mod.settings`：统一声明式设置页、自动保存/重置 | [存储](docs/sdk/mod-storage.md) / [设置](docs/sdk/mod-settings.md) |
 | 能力协商 | 插件按 `TC_CAP_*` 位判断宿主支持什么；包在 `mod.json` 里声明所需能力与依赖版本 | [docs/reference/capabilities.md](docs/reference/capabilities.md) |
 | 符号别名与钩子链 | 插件用 `sim.do` 这类稳定别名取地址；多个 Mod 可以加入同一个游戏函数的钩子链 | [docs/reference/symbols.md](docs/reference/symbols.md) |
 | 事件总线 | 订阅关卡加载、场景切换、仿真命令、保存等事件，不必自己钩内部函数 | [docs/reference/capabilities.md](docs/reference/capabilities.md) |
 
 版本号只有一个来源：仓库根目录的 `VERSION`；`build.ps1` 由它生成 `src/version.hpp`，
 加载器横幅、安装器标题、`tcmod-cli --version` 与分发包文件名都读同一处，不再各写各的。
-当前版本 **0.8.0**：在 0.4.0 之后加入了元件图片 V5 与放置幽灵 V6、声明式元件、原生逻辑形状/位宽
+当前版本 **0.8.5**：内置原版仿真的 JIT 优化与宽常量、波形采集热路径优化，修复 Keyboard 输出，
+扩展 TC-Verilog 组合核、元件编辑与组合接口，更新单窗口安装器。仿真加速默认启用，实际 MHz 随
+电路和运行环境变化；详见 [版本说明](docs/changelog.md)。
+0.8.0 在 0.4.0 之后加入了元件图片 V5 与放置幽灵 V6、声明式元件、原生逻辑形状/位宽
 扩展、插件界面页面与插槽、纹理、波形导出、存档管理页与 Mod 依赖清单，以及能力协商与依赖版本约束
 （详见 [docs/changelog.md](docs/changelog.md)）。
 
@@ -53,10 +59,12 @@ SDK 定义在 `sdk/`：`tc_mod_api.h`（宿主入口）、`tc_service_api.h`（�
 `tc_lifecycle_api.h`（值类型生命周期/变化事件）、
 `tc_transaction_api.h`（事务预检、批处理与保存屏障）、
 `tc_handle_api.h`（对象句柄）、`tc_mod.h`（聚合模型）、
+`tc_mod_storage.h`（每 Mod 全局／存档数据）、
 `tc_game_model.h`、`tc_component_model.h`、`tc_board_model.h`、`tc_game_state.h`、
 `tc_simulation.h`、`tc_wire_model.h`、`tc_save_model.h`、`tc_logic_api.h`（原生逻辑回调）、
+`tc_verilog.hpp` / `tc_verilog.cpp`（可综合 Verilog 内核）、
 `tc_hook.h` / `tc_hook_api.h`（钩子链）、`tc_trace.h`（关卡波形与 VCD 导出）、
-`tc_ui.h`（插件界面）。
+`tc_ui.h`（插件界面）、`tc_component_editor.h`（声明式元件属性行）。
 
 ## 示例
 
@@ -66,6 +74,7 @@ SDK 定义在 `sdk/`：`tc_mod_api.h`（宿主入口）、`tc_service_api.h`（�
 | `example.circuit-and.mod` | 注册两输入一输出 AND 自定义元件，并声明设计统计 `(1 门, 1 延迟)` |
 | `example.custom-or.mod` | 元件行为由 C++ 回调决定；真机回归 11 个场景 |
 | `example.byte-adder.mod` | 单字节加法器（进位入/出），声明 **1 门 1 延迟**，行为由 C++ 决定 |
+| `example.tc-verilog-ram.mod` | 从 `.v` 加载并注册的 16×8 同步写 RAM；主菜单含编译校验、原子保存的多行源码编辑页 |
 | `dev.cost-watch.mod` | 只读诊断：把界面分数、各 kind 代价与原型字段写进日志 |
 | `dev.kind-list.mod` | 只读探测：枚举 125 个内置元件的 kind／名称／引脚 |
 | `dev.menu-demo.mod` | 主菜单页面注册与控件 ID 隔离示例 |

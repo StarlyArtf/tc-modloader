@@ -202,12 +202,15 @@ if (!$taskText.Contains('name="left"')) {
   throw "The component label did not reach the board; inspect $taskLog"
 }
 
-# The editor lives in the game's own component drawer: selecting one of the
-# Mod's components is what opens it, and the Mod says so when the drawer shows
-# one of its instances.  A floating window of the Mod's own is gone (the panel
-# screenshot below is the game's panel, with the Mod's rows in it).
-if (!$taskText.Contains('float-ops: the editor lives in the game''s component drawer')) {
-  throw "The Mod did not register its rows in the component drawer; inspect $taskLog"
+# The editor rows are the loader's own (tc.component.editor): the Mod declares a
+# field table per type during tc_mod_load, and the loader logs the table it
+# accepted.  Selecting one of the Mod's components is what opens the rows; a
+# floating window of the Mod's own no longer exists.
+if (!$taskText.Contains('float-ops: 65 type(s) declared their property rows to the loader (tc.component.editor V2)')) {
+  throw "The Mod did not hand its property rows to the loader; inspect $taskLog"
+}
+if (!$taskText.Contains('Component editor: type 0x463332434f4e5331 edits value(float), bits(uint), label(text)')) {
+  throw "The loader did not accept the Constant's field table; inspect $taskLog"
 }
 # The drawer's own rows are exercised by selecting a component, which needs a
 # real click at a real moment: the sandbox window is started hidden, so a

@@ -20,6 +20,12 @@ struct V2 {
 };
 
 constexpr uint64_t kAndComponentId = 0x414E44325F303031ULL;
+/* A type another Mod owns: local.editor-demo's decorative EDIT_001 (examples/
+   editor-demo, a documented example with a published custom id and no hooks). */
+constexpr uint64_t kPeerTypeId = 0x454449545f303031ULL;
+/* A type no Mod registered: naming it has to reach the command's own
+   NOT_FOUND, not the ownership refusal. */
+constexpr uint64_t kUnknownTypeId = 0x464F524549474E31ULL;
 constexpr uint8_t kCustomKind = 0x4E;
 const TCHost* host;
 tc::TCMod mod;
@@ -42,6 +48,20 @@ size_t commandBefore = 0;
 size_t commandLiveBefore = 0;
 size_t transactionBefore = 0;
 bool phase1 = false, commandPending = false, transactionPending = false;
+/* The delete command's own state machine: submit, read back, undo, read back,
+   redo, read back. */
+bool deletePending = false, deleteUndoPending = false, deleteRedoPending = false;
+uint64_t deleteRequest = 0, deleteUndoRequest = 0, deleteRedoRequest = 0;
+uint64_t deleteInstance = 0;
+size_t deleteLiveBefore = 0;
+/* The ownership half of the delete command: the probe places a component of the
+   peer Mod's type and names it in a delete (must be refused before queueing),
+   then names the same instance under a type nobody registered (must queue and
+   fail with NOT_FOUND). */
+bool peerPlacePending = false, foreignPending = false;
+uint64_t peerPlaceRequest = 0, foreignRequest = 0;
+uint64_t peerInstance = 0;
+size_t peerLiveBefore = 0;
 /* TC_UNDO_TRACE=1 dumps every undo entry the game registers while this probe
    drives its edits.  The entry is one seq of 0x490-byte variant elements whose
    tag sits at +8, so the dump is what tells the layout apart from the
@@ -233,7 +253,7 @@ static bool boardCounts(size_t& components, size_t& wires) {
     wires = static_cast<size_t>(counts.wire_count);
     return true;
 }
-static size_t countCustomAt(int32_t x, int32_t y) {
+static size_t countTypeAt(uint64_t typeId, int32_t x, int32_t y) {
     if (boardApi.get_current(boardApi.context, &boardHandle) != TC_HANDLE_OK) return 0;
     TCBoardObjectSnapshotV1 counts{};
     TCBoardObjectBuffersV1 countOnly{sizeof(countOnly), TC_BOARD_OBJECT_SNAPSHOT_VERSION_1, nullptr, 0, nullptr, 0};
@@ -247,9 +267,12 @@ static size_t countCustomAt(int32_t x, int32_t y) {
     for (const auto& child : handles) {
         TCComponentInfoV1 info{};
         if (tc::readComponent(&boardApi4, &child, &info) != TC_SNAPSHOT_OK) continue;
-        if (info.kind == 0x4e && info.custom_prototype_id == kAndComponentId && info.x == x && info.y == y) ++found;
+        if (info.kind == 0x4e && info.custom_prototype_id == typeId && info.x == x && info.y == y) ++found;
     }
     return found;
+}
+static size_t countCustomAt(int32_t x, int32_t y) {
+    return countTypeAt(kAndComponentId, x, y);
 }
 /* The sequence length is not the live component count: the game's undo leaves a
    zero-filled record behind instead of shrinking the sequence, so anything
@@ -271,6 +294,30 @@ static size_t liveComponents() {
         if (info.kind) ++live;
     }
     return live;
+}
+/* The instance id of the type's component at one cell: the delete command names
+   its target by (instance id, type), the same pair the duplicate command uses. */
+static uint64_t instanceOfTypeAt(uint64_t typeId, int32_t x, int32_t y) {
+    if (boardApi.get_current(boardApi.context, &boardHandle) != TC_HANDLE_OK) return 0;
+    TCBoardObjectSnapshotV1 counts{};
+    TCBoardObjectBuffersV1 countOnly{sizeof(countOnly), TC_BOARD_OBJECT_SNAPSHOT_VERSION_1, nullptr, 0, nullptr, 0};
+    if (tc::captureBoardObjects(&boardApi, &boardHandle, &counts, &countOnly) != TC_SNAPSHOT_ERR_CAPACITY) return 0;
+    std::vector<TCGameHandle> handles(counts.component_count), wireHandles(counts.wire_count);
+    TCBoardObjectBuffersV1 storage{sizeof(storage), TC_BOARD_OBJECT_SNAPSHOT_VERSION_1,
+        handles.empty() ? nullptr : handles.data(), handles.size(),
+        wireHandles.empty() ? nullptr : wireHandles.data(), wireHandles.size()};
+    if (tc::captureBoardObjects(&boardApi, &boardHandle, &counts, &storage) != TC_SNAPSHOT_OK) return 0;
+    for (const auto& child : handles) {
+        TCComponentInfoV1 info{};
+        if (tc::readComponent(&boardApi4, &child, &info) != TC_SNAPSHOT_OK) continue;
+        if (info.kind == 0x4e && info.custom_prototype_id == typeId &&
+            info.x == x && info.y == y)
+            return info.id;
+    }
+    return 0;
+}
+static uint64_t instanceAt(int32_t x, int32_t y) {
+    return instanceOfTypeAt(kAndComponentId, x, y);
 }
 
 static void frame(void*, const TCFrame* value) {
@@ -307,8 +354,240 @@ static void frame(void*, const TCFrame* value) {
                 " restored=" + std::to_string(countCustomAt(28, 10)));
             const bool ok = status.state == TC_COMMAND_STATE_SUCCEEDED && status.result == TC_COMMAND_OK &&
                             components == transactionAfter && countCustomAt(28, 10) == 1;
-            finish(ok ? "PASS a component was deleted through the board entry; components were placed through the menu helper, the command bus and a two-step transaction; one undo reverted one step and redo restored it"
-                      : "FAIL redo did not restore the board");
+            if (!ok) {
+                finish("FAIL redo did not restore the board");
+                return;
+            }
+            /* Third edit: the delete command.  It goes through the game's
+               undo-aware wrapper, so the component comes back with one undo and
+               disappears again with redo - the thing the low-level tombstone
+               delete cannot do. */
+            deleteInstance = instanceAt(28, 10);
+            if (!deleteInstance) {
+                finish("FAIL the transaction's second component is not on the board to delete");
+                return;
+            }
+            deleteLiveBefore = liveComponents();
+            TCCommandV2 erase{};
+            erase.size = sizeof(erase);
+            erase.type = TC_COMMAND_BOARD_DELETE_COMPONENT;
+            erase.subject = boardHandle;
+            erase.custom_prototype_id = kAndComponentId;
+            erase.argument = static_cast<int64_t>(deleteInstance);
+            const int submitted = commandApi.submit(commandApi.context, &erase, &deleteRequest);
+            log("component delete command submit=" + std::to_string(submitted) +
+                " request=" + std::to_string(deleteRequest) +
+                " instance=" + std::to_string(deleteInstance));
+            if (submitted != TC_COMMAND_OK) {
+                finish("FAIL the delete command was refused: " + std::to_string(submitted));
+                return;
+            }
+            deletePending = true;
+            redoPending = false;
+            return;
+        }
+        if (deletePending) {
+            TCCommandStatusV1 status{};
+            if (commandApi.get_status(commandApi.context, deleteRequest, &status, sizeof(status)) != TC_COMMAND_OK) return;
+            if (status.state != TC_COMMAND_STATE_SUCCEEDED && status.state != TC_COMMAND_STATE_FAILED &&
+                status.state != TC_COMMAND_STATE_CANCELLED)
+                return;
+            deletePending = false;
+            const size_t live = liveComponents();
+            const size_t atCell = countCustomAt(28, 10);
+            log("component delete command state=" + std::to_string(status.state) +
+                " result=" + std::to_string(status.result) +
+                " live=" + std::to_string(deleteLiveBefore) + "->" + std::to_string(live) +
+                " at(28,10)=" + std::to_string(atCell));
+            if (!(status.state == TC_COMMAND_STATE_SUCCEEDED && status.result == TC_COMMAND_OK &&
+                  live + 1 == deleteLiveBefore && atCell == 0)) {
+                finish("FAIL the delete command did not remove the component");
+                return;
+            }
+            TCCommandV2 undo{};
+            undo.size = sizeof(undo);
+            undo.type = TC_COMMAND_BOARD_UNDO;
+            undo.subject = boardHandle;
+            deleteUndoPending = commandApi.submit(commandApi.context, &undo, &deleteUndoRequest) == TC_COMMAND_OK;
+            if (!deleteUndoPending) {
+                finish("FAIL the undo after the delete was refused");
+                return;
+            }
+            return;
+        }
+        if (deleteUndoPending) {
+            TCCommandStatusV1 status{};
+            if (commandApi.get_status(commandApi.context, deleteUndoRequest, &status, sizeof(status)) != TC_COMMAND_OK) return;
+            if (status.state != TC_COMMAND_STATE_SUCCEEDED && status.state != TC_COMMAND_STATE_FAILED &&
+                status.state != TC_COMMAND_STATE_CANCELLED)
+                return;
+            deleteUndoPending = false;
+            const size_t live = liveComponents();
+            const size_t atCell = countCustomAt(28, 10);
+            log("component delete undo state=" + std::to_string(status.state) +
+                " result=" + std::to_string(status.result) +
+                " live=" + std::to_string(live) + " at(28,10)=" + std::to_string(atCell));
+            if (!(status.state == TC_COMMAND_STATE_SUCCEEDED && status.result == TC_COMMAND_OK &&
+                  live == deleteLiveBefore && atCell == 1)) {
+                finish("FAIL the undo did not bring the deleted component back");
+                return;
+            }
+            TCCommandV2 redo{};
+            redo.size = sizeof(redo);
+            redo.type = TC_COMMAND_BOARD_REDO;
+            redo.subject = boardHandle;
+            deleteRedoPending = commandApi.submit(commandApi.context, &redo, &deleteRedoRequest) == TC_COMMAND_OK;
+            if (!deleteRedoPending) {
+                finish("FAIL the redo after the delete was refused");
+                return;
+            }
+            return;
+        }
+        if (deleteRedoPending) {
+            TCCommandStatusV1 status{};
+            if (commandApi.get_status(commandApi.context, deleteRedoRequest, &status, sizeof(status)) != TC_COMMAND_OK) return;
+            if (status.state != TC_COMMAND_STATE_SUCCEEDED && status.state != TC_COMMAND_STATE_FAILED &&
+                status.state != TC_COMMAND_STATE_CANCELLED)
+                return;
+            deleteRedoPending = false;
+            const size_t live = liveComponents();
+            const size_t atCell = countCustomAt(28, 10);
+            log("component delete redo state=" + std::to_string(status.state) +
+                " result=" + std::to_string(status.result) +
+                " live=" + std::to_string(live) + " at(28,10)=" + std::to_string(atCell));
+            if (!(status.state == TC_COMMAND_STATE_SUCCEEDED && status.result == TC_COMMAND_OK &&
+                  live + 1 == deleteLiveBefore && atCell == 0)) {
+                finish("FAIL the redo did not remove the component again");
+                return;
+            }
+            /* Ownership half: place an instance of the peer Mod's type and try
+               to delete it.  The command has to be refused at submit time (the
+               catalogue names local.editor-demo as the owner of that type), and
+               the board must be untouched. */
+            peerLiveBefore = liveComponents();
+            TCCommandV2 peer{};
+            peer.size = sizeof(peer);
+            peer.type = TC_COMMAND_BOARD_PLACE_COMPONENT;
+            peer.subject = boardHandle;
+            peer.custom_prototype_id = kPeerTypeId;
+            peer.kind = 0x4e;
+            peer.x = 12;
+            peer.y = 10;
+            const int peerSubmitted = commandApi.submit(commandApi.context, &peer, &peerPlaceRequest);
+            peerPlacePending = peerSubmitted == TC_COMMAND_OK;
+            log("component delete peer placement submit=" + std::to_string(peerSubmitted) +
+                " request=" + std::to_string(peerPlaceRequest));
+            if (!peerPlacePending) {
+                finish("FAIL the peer Mod's component could not be placed: " + std::to_string(peerSubmitted));
+                return;
+            }
+            deleteRedoPending = false;
+            return;
+        }
+        if (peerPlacePending) {
+            TCCommandStatusV1 status{};
+            if (commandApi.get_status(commandApi.context, peerPlaceRequest, &status, sizeof(status)) != TC_COMMAND_OK) return;
+            if (status.state != TC_COMMAND_STATE_SUCCEEDED && status.state != TC_COMMAND_STATE_FAILED &&
+                status.state != TC_COMMAND_STATE_CANCELLED)
+                return;
+            peerPlacePending = false;
+            const size_t placed = countTypeAt(kPeerTypeId, 12, 10);
+            peerInstance = instanceOfTypeAt(kPeerTypeId, 12, 10);
+            log("component delete peer placement state=" + std::to_string(status.state) +
+                " result=" + std::to_string(status.result) +
+                " instance=" + std::to_string(peerInstance) +
+                " at(12,10)=" + std::to_string(placed));
+            if (!(status.state == TC_COMMAND_STATE_SUCCEEDED && status.result == TC_COMMAND_OK &&
+                  placed == 1 && peerInstance)) {
+                finish("FAIL the peer Mod's component did not land on the board");
+                return;
+            }
+            /* Name the peer's instance under the peer's type: another Mod's type
+               is exactly what the ownership rule protects. */
+            TCCommandV2 foreign{};
+            foreign.size = sizeof(foreign);
+            foreign.type = TC_COMMAND_BOARD_DELETE_COMPONENT;
+            foreign.subject = boardHandle;
+            foreign.custom_prototype_id = kPeerTypeId;
+            foreign.argument = static_cast<int64_t>(peerInstance);
+            const int refused = commandApi.submit(commandApi.context, &foreign, &foreignRequest);
+            const size_t stillThere = countTypeAt(kPeerTypeId, 12, 10);
+            log("component delete foreign type submit=" + std::to_string(refused) +
+                " request=" + std::to_string(foreignRequest) +
+                " still=" + std::to_string(stillThere) +
+                " live=" + std::to_string(peerLiveBefore) + "->" + std::to_string(liveComponents()));
+            if (refused != TC_COMMAND_ERR_ARGUMENT || foreignRequest != 0 || stillThere != 1) {
+                finish("FAIL the delete of another Mod's type was not refused: " +
+                       std::to_string(refused));
+                return;
+            }
+            /* The same instance under a type nobody registered: the ownership
+               rule has nothing to say, so the command queues and the board read
+               is what refuses it (NOT_FOUND). */
+            TCCommandV2 unknown = foreign;
+            unknown.custom_prototype_id = kUnknownTypeId;
+            const int queued = commandApi.submit(commandApi.context, &unknown, &foreignRequest);
+            foreignPending = queued == TC_COMMAND_OK;
+            log("component delete unknown type submit=" + std::to_string(queued) +
+                " request=" + std::to_string(foreignRequest));
+            if (!foreignPending) {
+                finish("FAIL the delete naming an unregistered type was refused: " +
+                       std::to_string(queued));
+                return;
+            }
+            return;
+        }
+        if (foreignPending) {
+            TCCommandStatusV1 status{};
+            if (commandApi.get_status(commandApi.context, foreignRequest, &status, sizeof(status)) != TC_COMMAND_OK) return;
+            if (status.state != TC_COMMAND_STATE_SUCCEEDED && status.state != TC_COMMAND_STATE_FAILED &&
+                status.state != TC_COMMAND_STATE_CANCELLED)
+                return;
+            foreignPending = false;
+            const size_t stillThere = countTypeAt(kPeerTypeId, 12, 10);
+            log("component delete unknown type state=" + std::to_string(status.state) +
+                " result=" + std::to_string(status.result) +
+                " at(12,10)=" + std::to_string(stillThere) +
+                " live=" + std::to_string(liveComponents()));
+            const bool ok = status.state == TC_COMMAND_STATE_FAILED &&
+                            status.result == TC_COMMAND_ERR_NOT_FOUND && stillThere == 1;
+            if (!ok) {
+                finish("FAIL the delete naming an unregistered type did not fail with NOT_FOUND");
+                return;
+            }
+            /* Staging runs the same validation as submitting, so neither another
+               Mod's type nor a type number outside the command range can enter a
+               transaction and slip through at commit time. */
+            uint64_t validationTx = 0;
+            const int beginStatus =
+                transactionApi.begin(transactionApi.context, &boardHandle, 0, &validationTx);
+            TCCommandV2 foreignStage{};
+            foreignStage.size = sizeof(foreignStage);
+            foreignStage.type = TC_COMMAND_BOARD_DELETE_COMPONENT;
+            foreignStage.subject = boardHandle;
+            foreignStage.custom_prototype_id = kPeerTypeId;
+            foreignStage.argument = static_cast<int64_t>(peerInstance);
+            TCCommandV2 bogusStage = foreignStage;
+            bogusStage.custom_prototype_id = kAndComponentId;   /* the probe's own type */
+            bogusStage.type = 1000u;                            /* outside the range */
+            const int foreignStaged = beginStatus == TC_TRANSACTION_OK
+                                          ? transactionApi.stage(transactionApi.context, validationTx, &foreignStage)
+                                          : beginStatus;
+            const int bogusStaged = beginStatus == TC_TRANSACTION_OK
+                                        ? transactionApi.stage(transactionApi.context, validationTx, &bogusStage)
+                                        : beginStatus;
+            if (beginStatus == TC_TRANSACTION_OK)
+                transactionApi.abort(transactionApi.context, validationTx);
+            log("component delete transaction validation begin=" + std::to_string(beginStatus) +
+                " foreign=" + std::to_string(foreignStaged) +
+                " bogus=" + std::to_string(bogusStaged) +
+                " still=" + std::to_string(countTypeAt(kPeerTypeId, 12, 10)));
+            if (!(beginStatus == TC_TRANSACTION_OK && foreignStaged == TC_TRANSACTION_ERR_ARGUMENT &&
+                  bogusStaged == TC_TRANSACTION_ERR_ARGUMENT)) {
+                finish("FAIL the transaction staged a command the command bus refuses");
+                return;
+            }
+            finish("PASS components were placed through the menu helper, the command bus and a two-step transaction; one undo reverted one step and redo restored it; the delete command removed a component and its own undo/redo brought it back and removed it again; a delete naming another Mod's type was refused before queueing (also when staged in a transaction) and one naming an unregistered type failed with NOT_FOUND");
             return;
         }
         if (undoPending) {

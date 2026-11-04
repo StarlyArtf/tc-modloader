@@ -27,6 +27,7 @@ extern "C" __declspec(dllexport) void tc_pin_patch_marker(){}
    behaves exactly as before. */
 #include <memory>
 #include <shellapi.h>
+#include <imm.h>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -1382,6 +1383,65 @@ static HWND gameWindowHandle(){
  cached=finder.found;return cached;
 }
 
+/* ImGui receives committed characters, but Windows keeps an IME's preedit in
+   the window message stream.  Subclass the game window only when a component
+   input handler exists and mirror BEGIN/UPDATE/END into the component router.
+   The original procedure still receives every composition message so the OS
+   candidate UI and the engine backend retain their normal lifetime. */
+static WNDPROC componentImePrevious=nullptr;
+static HWND componentImeWindow=nullptr;
+static thread_local bool componentTextForwarding=false;
+static LRESULT CALLBACK componentImeWindowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam){
+ if(message==WM_UNICHAR&&wParam==UNICODE_NOCHAR)return TRUE;
+ if(compatible&&nativeRuntime){
+  if((message==WM_CHAR||message==WM_IME_CHAR||message==WM_UNICHAR)&&wParam&&wParam<=0x10ffff&&
+     nativeRuntime->componentTextCodepoint(static_cast<uint32_t>(wParam)))return 0;
+  if(message==WM_IME_STARTCOMPOSITION)nativeRuntime->componentIme(TC_COMPONENT_INPUT_IME_BEGIN,"");
+  else if(message==WM_IME_ENDCOMPOSITION)nativeRuntime->componentIme(TC_COMPONENT_INPUT_IME_END,"");
+  else if(message==WM_IME_COMPOSITION&&(lParam&GCS_COMPSTR)){
+   using GetContext=HIMC(WINAPI*)(HWND);using ReleaseContext=BOOL(WINAPI*)(HWND,HIMC);
+   using GetComposition=LONG(WINAPI*)(HIMC,DWORD,LPVOID,DWORD);
+   static HMODULE imm=LoadLibraryW(L"imm32.dll");
+   static auto getContext=imm?reinterpret_cast<GetContext>(GetProcAddress(imm,"ImmGetContext")):nullptr;
+   static auto releaseContext=imm?reinterpret_cast<ReleaseContext>(GetProcAddress(imm,"ImmReleaseContext")):nullptr;
+   static auto getComposition=imm?reinterpret_cast<GetComposition>(GetProcAddress(imm,"ImmGetCompositionStringW")):nullptr;
+   if(getContext&&releaseContext&&getComposition){
+    HIMC context=getContext(window);
+    if(context){
+     const LONG bytes=getComposition(context,GCS_COMPSTR,nullptr,0);
+     if(bytes>=0&&bytes<=8192){
+      std::vector<wchar_t> wide(static_cast<size_t>(bytes)/sizeof(wchar_t)+1);
+      if(bytes)getComposition(context,GCS_COMPSTR,wide.data(),static_cast<DWORD>(bytes));
+      const int needed=WideCharToMultiByte(CP_UTF8,0,wide.data(),static_cast<int>(bytes/sizeof(wchar_t)),
+                                           nullptr,0,nullptr,nullptr);
+      std::string utf8(static_cast<size_t>(std::max(needed,0)),0);
+      if(needed)WideCharToMultiByte(CP_UTF8,0,wide.data(),static_cast<int>(bytes/sizeof(wchar_t)),
+                                    utf8.data(),needed,nullptr,nullptr);
+      nativeRuntime->componentIme(TC_COMPONENT_INPUT_IME_UPDATE,utf8.c_str());
+     }
+     releaseContext(window,context);
+    }
+   }
+  }
+ }
+ const bool previousForwarding=componentTextForwarding;
+ componentTextForwarding=message==WM_CHAR||message==WM_IME_CHAR||message==WM_UNICHAR;
+ const LRESULT result=componentImePrevious?CallWindowProcW(componentImePrevious,window,message,wParam,lParam):
+                                            DefWindowProcW(window,message,wParam,lParam);
+ componentTextForwarding=previousForwarding;return result;
+}
+static void ensureComponentImeWindow(){
+ if(componentImeWindow&&IsWindow(componentImeWindow))return;
+ if(componentImeWindow){componentImeWindow=nullptr;componentImePrevious=nullptr;}
+ if(!nativeRuntime||!nativeRuntime->hasComponentInputs())return;
+ HWND window=gameWindowHandle();if(!window)return;
+ SetLastError(0);const LONG_PTR previous=SetWindowLongPtrW(window,GWLP_WNDPROC,
+     reinterpret_cast<LONG_PTR>(&componentImeWindowProc));
+ if(!previous&&GetLastError()!=0){log("Component input: could not observe IME composition messages");return;}
+ componentImePrevious=reinterpret_cast<WNDPROC>(previous);componentImeWindow=window;
+ log("Component input: IME composition routing armed");
+}
+
 /* ---- Mods manager UI -----------------------------------------------------
    Plain ImGui calls from the engine's own export table (every one of them was
    checked against the pinned build's exports before use).  Nothing here draws
@@ -2078,6 +2138,23 @@ extern "C" __declspec(dllexport) bool igInvisibleButton(const char* id,V2 size,i
    the input state for the frame.  A click that landed in the panel is
    therefore already accounted for when the game asks, which is what keeps it
    out of the circuit board.  Every other call site is forwarded untouched. */
+extern "C" __declspec(dllexport) void ImGuiIO_AddInputCharacter(void* self,unsigned int codepoint){
+ init();if(!componentTextForwarding&&compatible&&nativeRuntime&&nativeRuntime->componentTextCodepoint(codepoint))return;
+ api<void(*)(void*,unsigned int)>("ImGuiIO_AddInputCharacter")(self,codepoint);
+}
+extern "C" __declspec(dllexport) void ImGuiIO_AddInputCharacterUTF16(void* self,unsigned short codepoint){
+ init();if(!componentTextForwarding&&compatible&&nativeRuntime&&!(codepoint>=0xd800&&codepoint<=0xdfff)&&
+    nativeRuntime->componentTextCodepoint(codepoint))return;
+ api<void(*)(void*,unsigned short)>("ImGuiIO_AddInputCharacterUTF16")(self,codepoint);
+}
+extern "C" __declspec(dllexport) void ImGuiIO_AddInputCharactersUTF8(void* self,const char* text){
+ init();if(!componentTextForwarding&&compatible&&nativeRuntime&&nativeRuntime->componentTextUtf8(text))return;
+ api<void(*)(void*,const char*)>("ImGuiIO_AddInputCharactersUTF8")(self,text);
+}
+extern "C" __declspec(dllexport) void ImGuiIO_AddMouseWheelEvent(void* self,float x,float y){
+ init();if(compatible&&nativeRuntime)nativeRuntime->componentMouseWheel(x,y);
+ api<void(*)(void*,float,float)>("ImGuiIO_AddMouseWheelEvent")(self,x,y);
+}
 extern "C" __declspec(dllexport) bool igIsAnyItemActive(){
  auto rva=(uintptr_t)__builtin_return_address(0)-(uintptr_t)GetModuleHandleW(nullptr);init();
  /* A plugin may have hooked this entry point itself, in which case the call
@@ -2086,7 +2163,8 @@ extern "C" __declspec(dllexport) bool igIsAnyItemActive(){
     then still on the stack a few frames up, so the check falls back to a short
     stack walk; the fast path stays for the ordinary case. */
  bool atBoardSample=rva==TC_BOARD_INPUT_SAMPLE_RVA;
- if(!atBoardSample&&compatible&&nativeRuntime&&nativeRuntime->hasBoardSlots()){
+ if(!atBoardSample&&compatible&&nativeRuntime&&
+    (nativeRuntime->hasBoardSlots()||nativeRuntime->hasComponentInputs())){
   void* frames[10]{};
   const unsigned short count=RtlCaptureStackBackTrace(2,10,frames,nullptr);
   const uintptr_t base=(uintptr_t)GetModuleHandleW(nullptr);
@@ -2101,13 +2179,15 @@ extern "C" __declspec(dllexport) bool igIsAnyItemActive(){
    sampleSeen=true;log("Board input sample site reached; board panels are drawn from here");
   }
   bool consumed=false;
-  try{consumed=nativeRuntime->boardSlotFrame();}catch(const std::exception&e){log(std::string("Board panel error: ")+e.what());}catch(...){}
+  try{consumed=nativeRuntime->componentInputFrame();}catch(const std::exception&e){log(std::string("Component input error: ")+e.what());}catch(...){}
+  try{consumed|=nativeRuntime->boardSlotFrame();}catch(const std::exception&e){log(std::string("Board panel error: ")+e.what());}catch(...){}
   if(consumed)return true;
  }
  return api<bool(*)()>("igIsAnyItemActive")();
 }
 extern "C" __declspec(dllexport) void igEnd(){
  auto rva=(uintptr_t)__builtin_return_address(0)-(uintptr_t)GetModuleHandleW(nullptr);init();
+ ensureComponentImeWindow();
  devShotTick();
  flushTextTrace();
 #if defined(TC_PIN_PATCH_ONLY) || defined(TC_PIN_PATCH_PLUGIN)

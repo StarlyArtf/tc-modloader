@@ -388,6 +388,10 @@ class Services {
     static int componentInstancesResetCall(void*,const TCComponentInstanceHandle* handle){
         return tc::logic::instanceReset(handle);
     }
+    static int componentInstancesTopLevelCall(void*,const TCComponentInstanceHandle* handle,
+                                              uint64_t* out){
+        return tc::logic::instanceTopLevelId(handle,out);
+    }
     /* tc.component.storage: generation-checked whole-blob configuration and
        simulation-state snapshots owned by the same live binding. */
     static int componentStorageInfoCall(void*,const TCComponentInstanceHandle* handle,
@@ -529,6 +533,15 @@ public:
             return TC_SERVICE_OK;
         }
         if(std::strcmp(id,TC_SERVICE_COMPONENT_INSTANCES)==0){
+            if(version==TC_COMPONENT_INSTANCES_API_VERSION_2){
+                if(outSize<sizeof(TCComponentInstancesApiV2))return TC_SERVICE_ERR_SIZE;
+                *static_cast<TCComponentInstancesApiV2*>(out)=TCComponentInstancesApiV2{
+                    sizeof(TCComponentInstancesApiV2),TC_COMPONENT_INSTANCES_API_VERSION_2,this,
+                    &componentInstancesEnumerateCall,&componentInstancesValidateCall,
+                    &componentInstancesInfoCall,&componentInstancesStateCall,
+                    &componentInstancesResetCall,&componentInstancesTopLevelCall};
+                return TC_SERVICE_OK;
+            }
             if(version!=TC_COMPONENT_INSTANCES_API_VERSION_1)return TC_SERVICE_ERR_VERSION;
             if(outSize<sizeof(TCComponentInstancesApiV1))return TC_SERVICE_ERR_SIZE;
             *static_cast<TCComponentInstancesApiV1*>(out)=TCComponentInstancesApiV1{

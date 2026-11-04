@@ -184,8 +184,11 @@ void saveSchematic() {
     *loaded_level_global = level;
     const char* appdata = std::getenv("APPDATA");
     if (!appdata || !save_this_schematic || !get_command_setting) return;
+    const char* selected = std::getenv("TC_TEST_SAVE_PROFILE");
+    const std::string profile = selected && selected[0] ? selected : "default";
     const auto path = (std::filesystem::u8path(appdata) /
-        "Turing Complete Mods/profiles/default/schematics/not_gate/Default/circuit.data").generic_u8string();
+        "Turing Complete Mods/profiles" / profile /
+        "schematics/not_gate/Default/circuit.data").generic_u8string();
     tc::TCNimString target{};
     mod.game.raw_new_string(&target, static_cast<int64_t>(path.size()));
     target.length = path.size();
@@ -446,9 +449,16 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
     definition.default_config = kDefaultConfig;
     definition.config_migration_version = TC_COMPONENT_CONFIG_MIGRATION_VERSION_1;
     definition.migrate_config = &migrateConfig;
-    static const TCComponentLifecycleV1 lifecycle = {
-        sizeof(TCComponentLifecycleV1), TC_COMPONENT_LIFECYCLE_VERSION_1, nullptr, nullptr,
-        &configChanged, nullptr, &loaded, &saving};
+    /* Field by field: the structure grows by appending callbacks. */
+    static const TCComponentLifecycleV1 lifecycle = [] {
+        TCComponentLifecycleV1 value{};
+        value.size = sizeof(value);
+        value.version = TC_COMPONENT_LIFECYCLE_VERSION_1;
+        value.on_config_changed = &configChanged;
+        value.on_load = &loaded;
+        value.on_save = &saving;
+        return value;
+    }();
     definition.lifecycle = &lifecycle;
     if (tc::component_types::registerDefinition(types, &definition) != TC_COMPONENT_TYPES_OK)
         return 4;
@@ -456,6 +466,14 @@ extern "C" TC_MOD_EXPORT int tc_mod_load(const TCHost* h, TCPlugin* plugin) {
         !tc::component_storage::table(h, &storage))
         return 5;
     registered = true;
+    // The missing-Mod control has its own board driver. Register the owner
+    // without competing for that driver's raw hook.
+    if (const char* only = std::getenv("TC_STORAGE_REGISTER_ONLY")) {
+        if (only[0] == '1') {
+            log("storage-probe: registration only");
+            return 0;
+        }
+    }
 
     load_level = reinterpret_cast<LoadLevel>(h->resolve_symbol(
         h->context, "load_level__modelZutilities_u7740"));

@@ -1,10 +1,14 @@
-/* The M2 vertical slice: FP32 Constant, FP32 Add and FP32 Display.
+/* The float catalogue: Constant, Add and Display, then every operation of the
+   family, each one registered once per IEEE 754 format.
 
-   The three types exist to prove the whole path - configuration, arithmetic,
-   text and the game's own rendering - before the rest of the catalogue is
-   built.  Their configuration layouts are the archived contract (plan 7.1):
-   every blob starts with a `format` byte whose only legal value today is 32,
-   so binary16/binary64 can be added later without a new schema. */
+   One format is one component type (plan 6.4.1): a Mod type's pin widths are
+   frozen when it registers, so "the same Add, switched between 16/32/64" is not
+   expressible - FP16 Add, FP32 Add and FP64 Add are three types with three pin
+   sets, and the width box on the body only reports which one an instance is.
+   The configuration layouts are the archived contract (plan 7.1): every blob
+   starts with a `format` byte, so a record always says which width it was
+   written for and one written by another width is refused instead of being read
+   at the wrong size. */
 
 #ifndef float_ops_components_hpp
 #define float_ops_components_hpp
@@ -17,7 +21,21 @@
 namespace floatops {
 
 /* Stable identities: they are what a saved circuit stores, so they never
-   change. */
+   change.  Every family has three of them and the three differ only in the two
+   width digits (`F16ADD_1`, `F32ADD_1`, `F64ADD_1`), so they are built from the
+   family's five trailing characters.  The named constants below keep the
+   hexadecimal spelling the earlier releases shipped, and the static assertions
+   prove the builder reproduces them byte for byte. */
+constexpr uint64_t floatTypeId(uint32_t format, const char* tail) {
+    uint64_t id = static_cast<uint64_t>('F') << 56;
+    id |= static_cast<uint64_t>('0' + (format / 10)) << 48;
+    id |= static_cast<uint64_t>('0' + (format % 10)) << 40;
+    for (uint32_t index = 0; index < 5; ++index)
+        id |= static_cast<uint64_t>(static_cast<unsigned char>(tail[index]))
+              << (32 - 8 * index);
+    return id;
+}
+
 constexpr uint64_t kConstantId = UINT64_C(0x463332434f4e5331); /* F32CONS1 */
 constexpr uint64_t kAddId = UINT64_C(0x4633324144445f31);      /* F32ADD_1 */
 constexpr uint64_t kDisplayId = UINT64_C(0x4633324449535031);  /* F32DISP1 */
@@ -46,10 +64,35 @@ constexpr uint64_t kFp32ToU32Id = UINT64_C(0x4633324632555f31);/* F32F2U_1 */
 constexpr uint64_t kSplitBitsId = UINT64_C(0x46333253504c5f31);/* F32SPL_1 */
 constexpr uint64_t kMakeBitsId = UINT64_C(0x4633324d4b425f31); /* F32MKB_1 */
 
+static_assert(floatTypeId(32, "CONS1") == kConstantId, "F32CONS1");
+static_assert(floatTypeId(32, "ADD_1") == kAddId, "F32ADD_1");
+static_assert(floatTypeId(32, "DISP1") == kDisplayId, "F32DISP1");
+static_assert(floatTypeId(32, "SUB_1") == kSubtractId, "F32SUB_1");
+static_assert(floatTypeId(32, "MUL_1") == kMultiplyId, "F32MUL_1");
+static_assert(floatTypeId(32, "DIV_1") == kDivideId, "F32DIV_1");
+static_assert(floatTypeId(32, "SQT_1") == kSquareRootId, "F32SQT_1");
+static_assert(floatTypeId(32, "NEG_1") == kNegateId, "F32NEG_1");
+static_assert(floatTypeId(32, "ABS_1") == kAbsoluteId, "F32ABS_1");
+static_assert(floatTypeId(32, "CMP_1") == kCompareId, "F32CMP_1");
+static_assert(floatTypeId(32, "CLS_1") == kClassifyId, "F32CLS_1");
+static_assert(floatTypeId(32, "FMA_1") == kFusedMultiplyAddId, "F32FMA_1");
+static_assert(floatTypeId(32, "REM_1") == kRemainderId, "F32REM_1");
+static_assert(floatTypeId(32, "RND_1") == kRoundToIntegralId, "F32RND_1");
+static_assert(floatTypeId(32, "MIN_1") == kMinimumId, "F32MIN_1");
+static_assert(floatTypeId(32, "MAX_1") == kMaximumId, "F32MAX_1");
+static_assert(floatTypeId(32, "I2F_1") == kI32ToFp32Id, "F32I2F_1");
+static_assert(floatTypeId(32, "U2F_1") == kU32ToFp32Id, "F32U2F_1");
+static_assert(floatTypeId(32, "F2I_1") == kFp32ToI32Id, "F32F2I_1");
+static_assert(floatTypeId(32, "F2U_1") == kFp32ToU32Id, "F32F2U_1");
+static_assert(floatTypeId(32, "SPL_1") == kSplitBitsId, "F32SPL_1");
+static_assert(floatTypeId(32, "MKB_1") == kMakeBitsId, "F32MKB_1");
+
 /* 3 adds the per-instance label (the text the player types in the game's own
    component drawer, shown where the stock parts show CONST/STATIC); 2 is the
    layout with the format byte but no label, and 1 was the pre-format layout
-   that only a development build ever wrote (see migrate() below). */
+   that only a development build ever wrote (see migrateLegacyConfig below).
+   Only the three binary32 types above ever shipped 1 or 2; binary16/binary64
+   are new types whose records are always schema 3. */
 constexpr uint32_t kConfigSchema = 3;
 constexpr uint32_t kLabelSchema = 2;
 constexpr uint32_t kLegacyConfigSchema = 1;
@@ -61,15 +104,27 @@ constexpr uint32_t kLegacyConfigSchema = 1;
    small enough for the 1024-byte budget (plan 3). */
 constexpr size_t kLabelBytes = 16;
 
-/* The only legal format value in this release (plan 7.1). */
-constexpr uint8_t kFormatBinary32 = 32;
-
 #pragma pack(push, 1)
+/* The archived binary32 Constant: four bytes of pattern with the label right
+   after them.  binary32 shipped first, so this layout cannot grow without
+   moving the label of every constant already in a player's save. */
 struct ConstantConfig {
     uint8_t format;
     uint8_t display;
     uint16_t reserved;
     uint32_t bits;
+    char label[kLabelBytes];
+};
+/* What binary16 and binary64 use instead: the same three bytes of header, a
+   64-bit pattern field, then the label.  A separate layout rather than a wider
+   ConstantConfig, because the FP32 blob above is already archived; binary16
+   keeps its two bytes in the low half of the 64-bit field, and its drawer row
+   is declared with the format's own width so the upper bytes stay zero. */
+struct ConstantConfigWide {
+    uint8_t format;
+    uint8_t display;
+    uint16_t reserved;
+    uint64_t bits;
     char label[kLabelBytes];
 };
 struct AddConfig {
@@ -101,27 +156,37 @@ struct OpsConfig {
    The registration table in components.cpp is the single source of truth: the
    rows in the game's own panel ask for it by custom id instead of repeating the
    same list. */
+/* Which configuration blob a type registers.  Every blob starts with the format
+   byte, but the three families differ after it (components.hpp's structs), and
+   the drawer needs to know which rows a type gets. */
+enum class ConfigLayout : uint8_t { ops, constant_narrow, constant_wide, display };
+
+/* What the body prints in the middle (plan 7.2). */
+enum class BodyKind : uint8_t { operator_symbol, constant_value, display_text };
+
 struct CatalogueInfo {
     uint64_t id;
-    const char* type_id;      /* "local.float-ops/fp32-multiply" */
-    const char* name;         /* "FP32 Multiply" */
-    const char* description;  /* the drawer's own description text */
-    const char* board_name;   /* what an unlabelled instance prints (MUL) */
-    const char* symbol;       /* what the body prints in the middle (x) */
-    bool rounding;            /* stores and shows a rounding mode */
-    const char* hint;         /* the drawer's second row when there is no
-                                 rounding choice (bit order, saturating policy,
-                                 pin meaning) */
+    uint32_t format;         /* 16, 32 or 64 - the width this type works in */
+    ConfigLayout layout;     /* which configuration layout it registered */
+    BodyKind body;           /* what its body prints */
+    const char* type_id;     /* "local.float-ops/fp32-multiply" */
+    const char* group;       /* "计算" - the folder under 浮点/FP32 this type lives in */
+    const char* name;        /* "FP32 Multiply" */
+    const char* description; /* the drawer's own description text */
+    const char* board_name;  /* what an unlabelled instance prints (MUL) */
+    const char* symbol;      /* what the body prints in the middle (×) */
+    bool rounding;           /* stores and shows a rounding mode */
 };
 
 /* The catalogue, in registration order (never NULL; count is its length). */
 size_t catalogueCount();
 const CatalogueInfo* catalogueAt(size_t index);
-/* The entry for one custom id, or nullptr for the three M2 types. */
+/* The entry for one custom id, or nullptr when the id is not this Mod's. */
 const CatalogueInfo* catalogueInfo(uint64_t custom_id);
 
 /* Registration plus the frame callback that drives the editors.  Returns false
-   when the loader cannot provide what M2 needs; the caller then reports it. */
+   when the loader cannot provide what the components need; the caller then
+   reports it. */
 bool initialize(const TCHost* host, TCPlugin* plugin);
 
 /* For the true-game test: the number of live instances whose configuration the

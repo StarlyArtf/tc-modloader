@@ -71,3 +71,8 @@ if (transactions.commit(transactions.context, id) != TC_TRANSACTION_OK) return 5
 
 冲突语义与 V1 完全一致：begin 记录 Board 结构指纹，commit 时若指纹变了就 `CONFLICT`、一步不跑。
 这意味着"先读快照决定放哪里、再提交"这类 Mod 不会被别人的编辑挤掉。
+
+`stage` 的形状校验与 `submit` **同一份实现**（`src/native.hpp` 的 `validateCommand`）：type 范围、
+放置载荷、删除命令的"实例 id + 类型"与类型归属都在这一步判定，不合法即 `TC_TRANSACTION_ERR_ARGUMENT`
+且这一步不入队。事务执行时(steps 逐条走同一个执行器)因此不会出现"总线拒绝、事务放行"的差额——
+早先这里少了 type 上界与删除归属两条检查，一个臆造的 type 会在提交时落进 redo 分支。

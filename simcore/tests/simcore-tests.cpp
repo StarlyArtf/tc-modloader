@@ -223,6 +223,528 @@ void testMultiDriver() {
     check(engine.value("m3").toString() == "z", "a driver that turns off leaves the net floating");
 }
 
+void testTriStateSwitch() {
+    tcsim::NetList list;
+    const tcsim::NetId enable_a = list.addNet("switch_enable_a", 1);
+    const tcsim::NetId data_a = list.addNet("switch_data_a", 4);
+    const tcsim::NetId enable_b = list.addNet("switch_enable_b", 1);
+    const tcsim::NetId data_b = list.addNet("switch_data_b", 4);
+    const tcsim::NetId bus = list.addNet("switch_bus", 4);
+    const tcsim::DeviceSpec& spec = tcsim::deviceTriState(4);
+    const tcsim::DeviceId a = list.addDevice(&spec, "switch_a");
+    const tcsim::DeviceId b = list.addDevice(&spec, "switch_b");
+    list.connect(a, "S", enable_a);
+    list.connect(a, "A", data_a);
+    list.connect(a, "Y", bus);
+    list.connect(b, "S", enable_b);
+    list.connect(b, "A", data_b);
+    list.connect(b, "Y", bus);
+
+    tcsim::Engine engine(list, tcsim::EngineOptions{});
+    engine.addStimulus(0, enable_a, tcsim::BitVector::fromText("0", 1));
+    engine.addStimulus(0, data_a, tcsim::BitVector::fromText("1010", 4));
+    engine.addStimulus(0, enable_b, tcsim::BitVector::fromText("0", 1));
+    engine.addStimulus(0, data_b, tcsim::BitVector::fromText("0101", 4));
+    engine.addStimulus(10, enable_a, tcsim::BitVector::fromText("1", 1));
+    engine.addStimulus(20, enable_b, tcsim::BitVector::fromText("1", 1));
+    engine.addStimulus(30, enable_a, tcsim::BitVector::fromText("0", 1));
+    engine.runUntil(5);
+    check(engine.value("switch_bus").toString() == "zzzz", "disabled game switches drive high impedance");
+    engine.runUntil(15);
+    check(engine.value("switch_bus").toString() == "1010", "an enabled word switch passes every data bit");
+    engine.runUntil(25);
+    check(engine.value("switch_bus").toString() == "xxxx", "two enabled switches still use normal bus resolution");
+    engine.runUntil(35);
+    check(engine.value("switch_bus").toString() == "0101", "disabling one switch leaves the other driver intact");
+
+    tcsim::BoardView board;
+    tcsim::BoardComponent component;
+    component.kind = 0x19;
+    component.input_count = 2;
+    component.output_count = 1;
+    component.memory_bits = 32;
+    board.components.push_back(component);
+    board.wires.push_back(tcsim::BoardWire{0, 1, 0, 3, 1, 100});
+    board.wires.push_back(tcsim::BoardWire{-1, 0, -3, 0, 32, 102});
+    board.wires.push_back(tcsim::BoardWire{2, 0, 4, 0, 32, 106});
+    const auto geometry = [](const tcsim::BoardComponent& candidate, tcsim::KindPins& pins) {
+        if (candidate.kind != 0x19) return false;
+        pins = tcsim::KindPins{};
+        pins.kind = candidate.kind;
+        pins.name = "Switch";
+        pins.input_count = 2;
+        pins.output_count = 1;
+        pins.in_x[0] = 0;
+        pins.in_y[0] = 1;
+        pins.in_x[1] = -1;
+        pins.out_x[0] = 2;
+        return true;
+    };
+    const tcsim::BuildResult built = tcsim::buildNetList(board, geometry);
+    check(!built.fatal() && built.netlist.deviceCount() == 1,
+          "the game's 0x19 Word Switch builds as a supported device");
+    check(!built.netlist.devices().empty() && built.netlist.devices()[0].spec->inputs[1].bits == 32 &&
+              built.netlist.devices()[0].spec->outputs[0].bits == 32,
+          "the board builder preserves the game's resolved word-switch width");
+}
+
+/* The game's word Mux (kind 0x2a), at both layers.  The device level pins the
+   select/data widths and the three phases of the truth table the `byte_mux`
+   level is built on; the board level pins that the builder gives the mux the
+   width the record resolved instead of leaving it one bit wide. */
+void testMux() {
+    const tcsim::DeviceSpec& spec = tcsim::deviceMux(4, tcsim::ArcDelay{5, 5});
+    check(spec.name == "mux4" && spec.inputs.size() == 3 && spec.inputs[0].bits == 1 &&
+              spec.inputs[1].bits == 4 && spec.inputs[2].bits == 4 && spec.outputs[0].bits == 4,
+          "the word mux keeps the select at one bit and both data pins at the bus width");
+    check(&tcsim::deviceMux2() == &tcsim::deviceMux(1) && tcsim::builtinDevice("mux2") == &tcsim::deviceMux(1),
+          "the catalogue's mux2 is the one-bit member of the same family");
+
+    tcsim::NetList list;
+    const tcsim::NetId select = list.addNet("mux_sel");
+    const tcsim::NetId a = list.addNet("mux_a", 4);
+    const tcsim::NetId b = list.addNet("mux_b", 4);
+    const tcsim::NetId y = list.addNet("mux_y", 4);
+    const tcsim::DeviceId mux = list.addDevice(&spec, "u_mux");
+    list.connect(mux, "S", select);
+    list.connect(mux, "A", a);
+    list.connect(mux, "B", b);
+    list.connect(mux, "Y", y);
+    tcsim::Engine engine(list);
+    engine.addStimulus(0, select, tcsim::fixtures::one("0"));
+    engine.addStimulus(0, a, tcsim::BitVector::fromText("1010", 4));
+    engine.addStimulus(0, b, tcsim::BitVector::fromText("1100", 4));
+    engine.addStimulus(20, select, tcsim::fixtures::one("1"));
+    engine.addStimulus(40, select, tcsim::fixtures::one("x"));
+    engine.addStimulus(40, b, tcsim::BitVector::fromText("1110", 4));
+    engine.addStimulus(60, select, tcsim::fixtures::one("0"));
+    engine.addStimulus(80, a, tcsim::BitVector::fromText("1111", 4));
+    engine.runUntil(15);
+    check(engine.value("mux_y").toString() == "1010", "S=0 passes A down the whole bus");
+    engine.runUntil(35);
+    check(engine.value("mux_y").toString() == "1100", "S=1 passes B");
+    engine.runUntil(55);
+    check(engine.value("mux_y").toString() == "1x10",
+          "an unknown select keeps the bit positions the two branches agree on");
+    engine.runUntil(75);
+    check(engine.value("mux_y").toString() == "1010", "a settled select takes its branch again");
+    engine.runUntil(95);
+    check(engine.value("mux_y").toString() == "1111", "and it follows a change on that branch");
+    check(!engine.aborted() && engine.violations().empty(), "a mux on a settled board reports nothing");
+
+    /* Board level: a 0x2a record whose `+0xe0` carries the width the game
+       resolved (a live board's 32-bit mux does), and the same record with that
+       field empty so the width has to come off the data wires. */
+    const auto build_mux_board = [](uint16_t resolved_bits, uint16_t data_bits) {
+        tcsim::BoardView board;
+        tcsim::BoardComponent component;
+        component.kind = 0x2a;
+        component.x = 4;
+        component.input_count = 3;
+        component.output_count = 1;
+        component.memory_bits = resolved_bits;
+        board.components.push_back(component);
+        /* Select (one bit), A, B and the output, all ending on the mux's pins. */
+        board.wires.push_back(tcsim::BoardWire{3, -1, 0, -1, 1, 256});
+        board.wires.push_back(tcsim::BoardWire{3, 0, 0, 0, data_bits, 258});
+        board.wires.push_back(tcsim::BoardWire{3, 1, 0, 1, data_bits, 260});
+        board.wires.push_back(tcsim::BoardWire{6, 0, 9, 0, data_bits, 262});
+        const auto geometry = [](const tcsim::BoardComponent& candidate, tcsim::KindPins& pins) {
+            if (candidate.kind != 0x2a) return false;
+            pins = tcsim::KindPins{};
+            pins.kind = candidate.kind;
+            pins.name = "Mux";
+            pins.input_count = 3;
+            pins.output_count = 1;
+            pins.in_x[0] = pins.in_x[1] = pins.in_x[2] = -1;
+            pins.in_y[0] = -1;
+            pins.in_y[1] = 0;
+            pins.in_y[2] = 1;
+            pins.in_bits[0] = 1;
+            pins.in_bits[1] = pins.in_bits[2] = 8;
+            pins.out_x[0] = 2;
+            pins.out_bits[0] = 8;
+            return true;
+        };
+        return tcsim::buildNetList(board, geometry);
+    };
+
+    const tcsim::BuildResult resolved = build_mux_board(8, 8);
+    check(!resolved.fatal() && resolved.netlist.deviceCount() == 1,
+          "the game's 0x2a Mux builds as a supported device");
+    const tcsim::DeviceInstance& device = resolved.netlist.devices()[0];
+    check(device.spec->name == "mux8" && device.spec->inputs[0].bits == 1 && device.spec->inputs[1].bits == 8 &&
+              device.spec->outputs[0].bits == 8,
+          "the built mux takes the width the record resolved and keeps the select at one bit");
+    check(device.inputs[0] == resolved.net_of_wire[0] && device.inputs[1] == resolved.net_of_wire[1] &&
+              device.inputs[2] == resolved.net_of_wire[2] && device.outputs[0] == resolved.net_of_wire[3],
+          "its pins are wired select, A, B and output, in the catalogue's order");
+
+    tcsim::Engine built_engine(resolved.netlist);
+    built_engine.addStimulus(0, resolved.net_of_wire[0], tcsim::fixtures::one("0"));
+    built_engine.addStimulus(0, resolved.net_of_wire[1], tcsim::BitVector::fromText("10100101", 8));
+    built_engine.addStimulus(0, resolved.net_of_wire[2], tcsim::BitVector::fromText("11000011", 8));
+    built_engine.runUntil(10);
+    check(built_engine.netlist().net(resolved.net_of_wire[3]).value == tcsim::BitVector::fromText("10100101", 8),
+          "a board-built mux passes A while its select is low");
+    built_engine.addStimulus(20, resolved.net_of_wire[0], tcsim::fixtures::one("1"));
+    built_engine.runUntil(30);
+    check(built_engine.netlist().net(resolved.net_of_wire[3]).value ==
+              tcsim::BitVector::fromText("11000011", 8),
+          "and B once the select goes high");
+
+    const tcsim::BuildResult recovered = build_mux_board(0, 8);
+    check(!recovered.fatal() && recovered.netlist.deviceCount() == 1 &&
+              recovered.netlist.devices()[0].spec->name == "mux8",
+          "a record with no resolved width recovers it from the data wires");
+    const tcsim::BuildResult one_bit = build_mux_board(0, 1);
+    check(one_bit.netlist.devices()[0].spec->name == "mux1",
+          "a mux whose data wires are one bit wide stays a one-bit mux");
+    const tcsim::BuildResult widened = build_mux_board(1, 8);
+    check(widened.netlist.devices()[0].spec->name == "mux8",
+          "a wider data wire is never truncated to a narrower record field");
+}
+
+/* The game's word operations (docs/research/simcore-kind-coverage.md).  These
+   are the kinds a player's board is full of the moment it leaves the gate
+   levels, so every one of them gets a row here: the operation itself, the
+   four-state rule where an operand has not settled, and the facts a wrong guess
+   would hide (division by zero, a carry in, a shift amount wider than the
+   word). */
+void testWordOps() {
+    using tcsim::BitVector;
+    using tcsim::DeviceSpec;
+
+    /* Runs one device's behavior directly: these tests are about the truth
+       table, and the engine's own scheduling is covered elsewhere. */
+    const auto apply = [](const DeviceSpec& spec, const std::vector<BitVector>& inputs) {
+        std::vector<BitVector> outputs;
+        tcsim::EvalContext context;
+        spec.behavior(context, inputs, outputs);
+        std::string text;
+        for (const BitVector& output : outputs) {
+            if (!text.empty()) text += " ";
+            text += output.toString();
+        }
+        return text;
+    };
+    const auto word = [](const char* text, size_t bits) { return BitVector::fromText(text, bits); };
+    const auto single = [](const char* text) { return BitVector::fromText(text, 1); };
+
+    /* One Add, 4 bits wide, carry in and out: kind 0x1e's own shape. */
+    const DeviceSpec& add = tcsim::deviceWordBinary(tcsim::WordOp::kAdd, 4, 4);
+    check(add.name == "wordbinary0_4" && add.inputs.size() == 3 && add.outputs.size() == 2 &&
+              add.inputs[0].bits == 4 && add.inputs[1].bits == 4 && add.inputs[2].bits == 1 &&
+              add.outputs[0].bits == 4 && add.outputs[1].bits == 1,
+          "Add carries a one-bit carry in and out beside the 4-bit data path");
+    check(apply(add, {word("1010", 4), word("0110", 4), single("0")}) == "0000 1",
+          "10 + 6 wraps to 0 with the carry out set at 4 bits");
+    check(apply(add, {word("0010", 4), word("0011", 4), single("1")}) == "0110 0",
+          "the carry in is added: 2 + 3 + 1 = 6");
+    check(apply(add, {word("1111", 4), word("0001", 4), single("0")}) == "0000 1",
+          "15 + 1 carries out of a 4-bit adder");
+    check(apply(add, {word("0001", 4), word("0000", 4), single("x")}) == "xxxx x",
+          "an unknown carry in poisons the whole word, which is what the game's own C does", "got " +
+          apply(add, {word("0001", 4), word("0000", 4), single("x")}));
+
+    /* The comparisons: one bit out, and X only where the orderings disagree. */
+    const DeviceSpec& equal = tcsim::deviceWordBinary(tcsim::WordOp::kEqual, 4, 4);
+    check(apply(equal, {word("1010", 4), word("1010", 4)}) == "1", "Equal is 1 on equal words");
+    check(apply(equal, {word("1010", 4), word("1011", 4)}) == "0", "Equal is 0 on different words");
+    check(apply(equal, {word("101x", 4), word("1010", 4)}) == "x",
+          "Equal is X while an unknown bit could still change the answer");
+    check(apply(equal, {word("1011", 4), word("101x", 4)}) == "x",
+          "Equal is X when a bit of either operand has not settled",
+          "got " + apply(equal, {word("1011", 4), word("101x", 4)}));
+    const DeviceSpec& less_unsigned = tcsim::deviceWordBinary(tcsim::WordOp::kLessUnsigned, 4, 4);
+    check(apply(less_unsigned, {word("0011", 4), word("0100", 4)}) == "1", "unsigned < on 3 vs 4");
+    check(apply(less_unsigned, {word("1111", 4), word("0000", 4)}) == "0", "unsigned 15 is not < 0");
+    const DeviceSpec& less_signed = tcsim::deviceWordBinary(tcsim::WordOp::kLessSigned, 4, 4);
+    check(apply(less_signed, {word("1111", 4), word("0000", 4)}) == "1", "signed -1 is < 0");
+    check(apply(less_signed, {word("0111", 4), word("1000", 4)}) == "0", "signed 7 is not < -8");
+
+    /* Unary: Negate, Increment, NOT, and the two counts. */
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kNegate, 4), {word("0001", 4)}) == "1111",
+          "Negate is two's complement: -1 in 4 bits");
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kIncrement, 4), {word("1111", 4)}) == "0000",
+          "Increment wraps at the declared width");
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kNot, 4), {word("1010", 4)}) == "0101",
+          "the word NOT inverts every bit",
+          "got " + apply(tcsim::deviceWordUnary(tcsim::WordOp::kNot, 4), {word("1010", 4)}));
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kNot, 4), {word("10x0", 4)}) == "xxxx",
+          "the word NOT poisons the whole word too: it is one C operation on a word");
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kCountLeadingZero, 4), {word("0010", 4)}) == "0010",
+          "count leading zeroes of 0010 is 2");
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kCountLeadingZero, 4), {word("0000", 4)}) == "0100",
+          "an all-zero word has as many leading zeroes as it has bits");
+    check(apply(tcsim::deviceWordUnary(tcsim::WordOp::kCountTrailingZero, 4), {word("0100", 4)}) == "0010",
+          "count trailing zeroes of 0100 is 2");
+
+    /* The shifts and rotates.  A shift amount at the word's own width is the
+       corner that separates the two families. */
+    const DeviceSpec& shl = tcsim::deviceWordBinary(tcsim::WordOp::kShiftLeft, 4, 2);
+    check(apply(shl, {word("0011", 4), word("01", 2)}) == "0110", "shift left by 1");
+    check(apply(shl, {word("0011", 4), word("11", 2)}) == "1000", "shift left by 3");
+    check(apply(shl, {word("0011", 4), word("00", 2)}) == "0011", "shift left by 0 keeps the word");
+    const DeviceSpec& rol = tcsim::deviceWordBinary(tcsim::WordOp::kRotateLeft, 4, 2);
+    check(apply(rol, {word("1001", 4), word("01", 2)}) == "0011", "rotate left by 1 wraps the top bit round");
+    check(apply(rol, {word("1001", 4), word("00", 2)}) == "1001", "rotate left by 0 is the identity");
+    const DeviceSpec& asr = tcsim::deviceWordBinary(tcsim::WordOp::kArithmeticShiftRight, 4, 2);
+    check(apply(asr, {word("1000", 4), word("01", 2)}) == "1100", "arithmetic shift right copies the sign bit");
+    check(apply(asr, {word("0100", 4), word("10", 2)}) == "0001", "arithmetic shift right of a positive word");
+
+    /* Multiply, Divide and Modulo.  Division by zero is worth pinning because
+       the level's own test names it; see the coverage note for what is still
+       unmeasured about the signed readings. */
+    const DeviceSpec& multiply = tcsim::deviceWordBinary(tcsim::WordOp::kMultiply, 4, 4);
+    check(apply(multiply, {word("0011", 4), word("0100", 4)}) == "1100", "3 x 4 = 12");
+    check(apply(multiply, {word("1111", 4), word("0010", 4)}) == "1110", "15 x 2 wraps to 14 in 4 bits");
+    const DeviceSpec& divide = tcsim::deviceWordBinary(tcsim::WordOp::kDivide, 4, 4);
+    check(apply(divide, {word("1100", 4), word("0011", 4)}) == "0100", "12 / 3 = 4");
+    check(apply(divide, {word("0000", 4), word("0000", 4)}) == "1111",
+          "division by zero is all ones, which is what the byte_divide level's test describes");
+    const DeviceSpec& modulo = tcsim::deviceWordBinary(tcsim::WordOp::kModulo, 4, 4);
+    check(apply(modulo, {word("1101", 4), word("0101", 4)}) == "0011", "13 mod 5 = 3");
+
+    /* The word-wide bitwise gates.  Known operands are per-bit, exactly like
+       the gate of the same name. */
+    const DeviceSpec& and_word = tcsim::deviceWordBinary(tcsim::WordOp::kAnd, 4, 4);
+    check(apply(and_word, {word("1010", 4), word("1100", 4)}) == "1000", "the word AND is per bit",
+          "got " + apply(and_word, {word("1010", 4), word("1100", 4)}));
+    check(apply(and_word, {word("1010", 4), word("x100", 4)}) == "xxxx",
+          "the word AND is still one C operation on a word: an unknown bit poisons it");
+    const DeviceSpec& or_word = tcsim::deviceWordBinary(tcsim::WordOp::kOr, 4, 4);
+    check(apply(or_word, {word("1010", 4), word("0101", 4)}) == "1111", "the word OR is per bit");
+    const DeviceSpec& xor_word = tcsim::deviceWordBinary(tcsim::WordOp::kXor, 4, 4);
+    check(apply(xor_word, {word("1111", 4), word("0000", 4)}) == "1111", "the word XOR is per bit");
+
+    /* The 2-in Concatenator: the first pin is the high half. */
+    const DeviceSpec& concat = tcsim::deviceConcat(4, 2);
+    check(concat.inputs[0].bits == 4 && concat.inputs[1].bits == 2 && concat.outputs[0].bits == 6,
+          "the concatenator's result is as wide as its two pins together");
+    check(apply(concat, {word("1010", 4), word("11", 2)}) == "101011", "in0 lands in the high bits");
+
+    /* The library publishes the new names, so a caller can ask before it
+       builds. */
+    const std::vector<std::string> names = tcsim::builtinWordDeviceNames();
+    check(std::find(names.begin(), names.end(), "addW") != names.end() &&
+              std::find(names.begin(), names.end(), "mulW") != names.end(),
+          "the word operation names are enumerable");
+    check(tcsim::builtinWordDevice("addW", 8, 8) != nullptr && tcsim::builtinWordDevice("nope", 8, 8) == nullptr,
+          "an unknown word name is null, never a guess");
+}
+
+/* The game's Screen (kind 0x5b) and the two host peripherals beside it.  The
+   settings latched by its three pins and the pixels those settings describe are
+   both taken from the game's own files - its manual page, the level's ISA and
+   the prototype table - so none of this is a guess; see screen.hpp. */
+void testScreen() {
+    const auto bits = [](uint64_t value, uint16_t width) {
+        std::string text;
+        for (int position = static_cast<int>(width) - 1; position >= 0; --position) {
+            text.push_back(((value >> position) & 1u) ? '1' : '0');
+        }
+        return tcsim::BitVector::fromText(text, width);
+    };
+
+    /* Device level: the three pins, and nothing driven back. */
+    const std::shared_ptr<tcsim::ScreenSettings> settings = std::make_shared<tcsim::ScreenSettings>();
+    const std::unique_ptr<tcsim::DeviceSpec> spec = tcsim::screenSpec(settings, tcsim::ArcDelay{0, 0});
+    check(spec->inputs.size() == 3 && spec->inputs[0].bits == 1 && spec->inputs[1].bits == 8 &&
+              spec->inputs[2].bits == 64 && spec->outputs.empty(),
+          "the screen keeps the catalogue's Enable/Setting/Value pins and drives nothing");
+    tcsim::NetList list;
+    const tcsim::NetId enable = list.addNet("screen_enable");
+    const tcsim::NetId index = list.addNet("screen_index", 8);
+    const tcsim::NetId value = list.addNet("screen_value", 64);
+    const tcsim::DeviceId screen = list.addDevice(spec.get(), "u_screen");
+    list.connect(screen, "Enable", enable);
+    list.connect(screen, "Setting", index);
+    list.connect(screen, "Value", value);
+    tcsim::Engine engine(list);
+    engine.addStimulus(0, enable, tcsim::fixtures::one("0"));
+    engine.addStimulus(0, index, bits(2, 8));
+    engine.addStimulus(0, value, bits(19, 64));
+    engine.runUntil(10);
+    check(settings->at(2) == 0, "a screen whose Enable is low keeps its settings");
+    engine.addStimulus(20, enable, tcsim::fixtures::one("1"));
+    engine.runUntil(30);
+    check(settings->at(2) == 19, "Enable high stores Value in Setting index");
+    engine.addStimulus(40, enable, tcsim::fixtures::one("0"));
+    engine.addStimulus(40, value, bits(7, 64));
+    engine.runUntil(50);
+    check(settings->at(2) == 19, "dropping Enable again stops the writes");
+    engine.addStimulus(60, enable, tcsim::fixtures::one("x"));
+    engine.addStimulus(60, value, bits(21, 64));
+    engine.runUntil(70);
+    check(settings->at(2) == 19, "an unknown Enable writes nothing rather than guessing");
+    engine.addStimulus(80, enable, tcsim::fixtures::one("1"));
+    engine.addStimulus(80, index, bits(200, 8));
+    engine.runUntil(90);
+    check(settings->unlisted_index == 200 && settings->at(2) == 19,
+          "a setting index outside the table is recorded, not invented",
+          "unlisted=" + std::to_string(settings->unlisted_index));
+    check(engine.violations().empty(), "a screen on a settled board reports nothing");
+
+    /* Renderer: the two pixel modes the manual documents, from the RAM the
+       settings point at. */
+    tcsim::MemoryImage ram;
+    ram.address_bits = 14; /* 16 KiB, enough for the biggest documented picture */
+    tcsim::ScreenSettings pixel8;
+    pixel8.setting[0] = 2;  /* Pixel 8 */
+    pixel8.setting[1] = 40; /* data offset */
+    pixel8.setting[2] = 19; /* the resolution the level's own program sets */
+    ram.writeByte(40, 0xE0); /* RRR = 7, GGG = 0, BB = 0 */
+    ram.writeByte(41, 0x1C); /* RRR = 0, GGG = 7, BB = 0 */
+    ram.writeByte(42, 0x03); /* RRR = 0, GGG = 0, BB = 3 */
+    tcsim::ScreenImage image;
+    std::string note;
+    check(tcsim::renderScreen(pixel8, ram, image, note) && note.empty(),
+          "a Pixel 8 screen renders from the RAM its settings point at");
+    check(image.width == 80 && image.height == 60,
+          "resolution setting 19 is the 80x60 the level's drawing code steps through");
+    check(image.pixels.size() == 4800 && image.pixels[0] == 0xFF0000u && image.pixels[1] == 0x00FF00u &&
+              image.pixels[2] == 0x0000FFu && image.pixels[3] == 0,
+          "RRRGGGBB spreads back over the three channels and unwritten bytes stay black");
+
+    tcsim::ScreenSettings pixel32;
+    pixel32.setting[0] = 3; /* Pixel 32 */
+    pixel32.setting[1] = 100;
+    pixel32.setting[2] = 0; /* 4x3 */
+    ram.writeByte(100, 0x11);
+    ram.writeByte(101, 0x22);
+    ram.writeByte(102, 0x33);
+    ram.writeByte(103, 0xEE); /* the padding byte the manual names */
+    check(tcsim::renderScreen(pixel32, ram, image, note) && image.width == 4 && image.height == 3 &&
+              image.pixels[0] == 0x112233u,
+          "a Pixel 32 screen takes red, green and blue and leaves the padding out");
+
+    tcsim::ScreenSettings ascii = pixel8;
+    ascii.setting[0] = 0;
+    check(!tcsim::renderScreen(ascii, ram, image, note) && note.find("font") != std::string::npos,
+          "ASCII mode is reported as needing the game's character font, not drawn");
+    tcsim::ScreenSettings unlisted = pixel8;
+    unlisted.setting[0] = 7;
+    check(!tcsim::renderScreen(unlisted, ram, image, note) && note.find("not one of the four") != std::string::npos,
+          "a mode number the manual does not list is reported by number");
+
+    /* Board level: the pins are wired the way a live board wires them - a 1-bit
+       Enable and 32-bit wires into the Setting and Value pins - and the built
+       screen latches what the game's own program writes. */
+    const auto build_screen_board = []() {
+        tcsim::BoardView board;
+        tcsim::BoardComponent component;
+        component.kind = 0x5b;
+        component.input_count = 3;
+        board.components.push_back(component);
+        board.wires.push_back(tcsim::BoardWire{-26, -19, -40, -19, 1, 256});
+        board.wires.push_back(tcsim::BoardWire{-26, -18, -17, -18, 32, 258});
+        board.wires.push_back(tcsim::BoardWire{-26, -17, -17, -17, 32, 260});
+        const auto geometry = [](const tcsim::BoardComponent& candidate, tcsim::KindPins& pins) {
+            if (candidate.kind != 0x5b) return false;
+            pins = tcsim::KindPins{};
+            pins.kind = candidate.kind;
+            pins.name = "Screen";
+            pins.input_count = 3;
+            pins.in_x[0] = pins.in_x[1] = pins.in_x[2] = -26;
+            pins.in_y[0] = -19;
+            pins.in_y[1] = -18;
+            pins.in_y[2] = -17;
+            pins.in_bits[0] = 1;
+            pins.in_bits[1] = 8;
+            pins.in_bits[2] = 64;
+            return true;
+        };
+        return tcsim::buildNetList(board, geometry);
+    };
+    const tcsim::BuildResult built = build_screen_board();
+    check(!built.fatal() && built.netlist.deviceCount() == 1,
+          "the game's 0x5b Screen builds as a supported device");
+    check(built.screens.size() == 1 && built.screens[0].settings != nullptr &&
+              built.screens[0].enable == built.net_of_wire[0] &&
+              built.screens[0].setting_index == built.net_of_wire[1] &&
+              built.screens[0].value == built.net_of_wire[2],
+          "the screen's binding keeps the three nets its settings come from");
+    check(built.observed_nets.size() == 3, "all three screen inputs are nets the game reads back");
+    tcsim::Engine built_engine(built.netlist);
+    built_engine.addStimulus(0, built.net_of_wire[0], tcsim::fixtures::one("1"));
+    built_engine.addStimulus(0, built.net_of_wire[1], bits(1, 32));
+    built_engine.addStimulus(0, built.net_of_wire[2], bits(16384, 32));
+    built_engine.runUntil(10);
+    check(built.screens[0].settings->data_offset() == 16384,
+          "a board-built screen latches the data offset, however wide the wire feeding it is");
+    built_engine.addStimulus(20, built.net_of_wire[1], bits(2, 32));
+    built_engine.addStimulus(20, built.net_of_wire[2], bits(19, 32));
+    built_engine.runUntil(30);
+    check(built.screens[0].settings->resolution() == 19 &&
+              tcsim::screenPixelWidth(built.screens[0].settings->resolution()) == 80,
+          "and the resolution its own program sets, which is the 80 pixel wide screen");
+
+    /* Time and Keyboard are host peripherals: their outputs come from the game,
+       the Keyboard's input pin is somebody else's output, and neither is a
+       device simcore pretends to know. */
+    tcsim::BoardView hosts;
+    const auto add_host = [&hosts](uint8_t kind, int16_t x, int16_t y, uint8_t in, uint8_t out) {
+        tcsim::BoardComponent component;
+        component.kind = kind;
+        component.x = x;
+        component.y = y;
+        component.input_count = in;
+        component.output_count = out;
+        hosts.components.push_back(component);
+    };
+    add_host(0x5c, 8, 0, 0, 1);   /* Time */
+    add_host(0x5d, 8, 8, 1, 3);   /* Keyboard */
+    const auto wire = [&hosts](int x1, int y1, int x2, int y2, uint16_t width) {
+        hosts.wires.push_back(tcsim::BoardWire{static_cast<int16_t>(x1), static_cast<int16_t>(y1),
+                                              static_cast<int16_t>(x2), static_cast<int16_t>(y2), width,
+                                              static_cast<uint64_t>(256 + hosts.wires.size() * 2)});
+    };
+    wire(10, 0, 20, 0, 64);   /* Time output */
+    wire(2, 6, -10, 6, 1);    /* Keyboard input */
+    wire(12, 5, 20, 5, 1);    /* Keyboard outputs */
+    wire(13, 8, 20, 8, 1);
+    wire(13, 9, 20, 9, 8);
+    const auto host_geometry = [](const tcsim::BoardComponent& candidate, tcsim::KindPins& pins) {
+        pins = tcsim::KindPins{};
+        pins.kind = candidate.kind;
+        if (candidate.kind == 0x5c) {
+            pins.name = "Time";
+            pins.output_count = 1;
+            pins.out_x[0] = 2;
+            pins.out_y[0] = 0;
+            pins.out_bits[0] = 64;
+            return true;
+        }
+        if (candidate.kind == 0x5d) {
+            pins.name = "Keyboard";
+            pins.input_count = 1;
+            pins.in_x[0] = -6;
+            pins.in_y[0] = -2;
+            pins.in_bits[0] = 1;
+            pins.output_count = 3;
+            pins.out_x[0] = 4;
+            pins.out_y[0] = -3;
+            pins.out_x[1] = 5;
+            pins.out_y[1] = 0;
+            pins.out_x[2] = 5;
+            pins.out_y[2] = 1;
+            pins.out_bits[0] = pins.out_bits[1] = 1;
+            pins.out_bits[2] = 8;
+            return true;
+        }
+        return false;
+    };
+    const tcsim::BuildResult host_build = tcsim::buildNetList(hosts, host_geometry);
+    check(!host_build.fatal() && host_build.netlist.deviceCount() == 0,
+          "Time and Keyboard build with no device of their own - the game is their source");
+    check(host_build.source_nets.size() == 4,
+          "their outputs are the externally driven nets: one from the Time, three from the Keyboard");
+    check(std::find(host_build.source_nets.begin(), host_build.source_nets.end(),
+                    host_build.net_of_wire[1]) == host_build.source_nets.end(),
+          "the Keyboard's own input pin is not mistaken for something it drives");
+}
+
 void testGateUnknown() {
     tcsim::fixtures::Fixture fixture = tcsim::fixtures::gateUnknown();
     tcsim::Engine engine = engineFor(fixture);
@@ -620,6 +1142,955 @@ bool testBoardNetlist() {
     check(tcsim::rotateOffset(-1, -1, 1) == std::make_pair(1, -1), "one quarter turn rotates clockwise");
     check(tcsim::rotateOffset(-1, -1, 3) == std::make_pair(-1, 1), "three quarter turns rotate the other way");
     return true;
+}
+
+/* The word Splitter (0x2f): "Splits a (2n)-bit value into two n-bit values",
+   the game's own description of the kind.  Its prototype declares the input as
+   one of the width sentinels and both outputs `wauto`, so the halved width has
+   to come from the wires - which is what the builder does, and this pins the
+   halves the device then produces. */
+void testWordSplitter() {
+    using tcsim::BitVector;
+    tcsim::NetList list;
+    const tcsim::NetId a = list.addNet("a", 8);
+    const tcsim::NetId high = list.addNet("high", 4);
+    const tcsim::NetId low = list.addNet("low", 4);
+    const tcsim::DeviceId split = list.addDevice(&tcsim::deviceWordSplit(4), "u_split");
+    list.connect(split, "A", a);
+    list.connect(split, "Y0", high);
+    list.connect(split, "Y1", low);
+    check(list.problems.empty(), "the word Splitter fixture builds cleanly");
+    tcsim::Engine engine(list);
+    engine.addStimulus(0, a, BitVector::fromText("10100011", 8));
+    engine.runUntil(10);
+    check(engine.netValue(high).toString() == "1010", "the top output is the high half");
+    check(engine.netValue(low).toString() == "0011", "and the bottom output the low half");
+    /* Four-state: an unsettled input bit poisons the half it belongs to and
+       leaves the other half alone. */
+    engine.addStimulus(20, a, BitVector::fromText("1x100011", 8));
+    engine.runUntil(30);
+    check(engine.netValue(high).toString() == "1x10", "an unknown bit poisons its own half");
+    check(engine.netValue(low).toString() == "0011", "and leaves the other half untouched");
+}
+
+/* The storage family: Register (0x27), Counter (0x26) and Delay Line (0x37),
+   the three kinds the game's own boards lean on and whose pins the prototype
+   table keeps out of its declared input list.
+
+   Two things are asserted here, and they are the two the plan called
+   unmeasured: where the pins are, and when the parts latch.  The pins come from
+   the prototype's hidden list (`hidden0=(-3,-1,w1)` and friends in
+   build/kinds.txt); the latching is the game's own LATE phase, which the
+   runtime models by toggling one cycle net - so this test drives that net by
+   hand and checks the register holds, the delay line stores, and the counter
+   counts and resets. */
+/* The two families the prototype table sizes with a sentinel.  Both numbers
+   were measured on the player's own board (tools/kind-wire-widths.py,
+   2026-09-30):
+       kind 0x2F Splitter   at 138,-2  in0 64 bits -> out0 32, out1 32
+       kind 0x30 Word Maker at -10,37  in0 8, in1 8 -> out0 16
+   with the record's own `+0xe0` agreeing (32 = the leaf width, 16 = the output
+   width).  So a Splitter's input is `leaves * n` and a Word Maker's output is
+   the sum of its inputs - and both widths come off the wires, which is what the
+   board half of this test checks. */
+void testAutoWidthSplitterAndMaker() {
+    using tcsim::BitVector;
+    using tcsim::BoardComponent;
+    using tcsim::BoardView;
+    using tcsim::BoardWire;
+
+    const auto apply = [](const tcsim::DeviceSpec& spec, const std::vector<BitVector>& inputs) {
+        std::vector<BitVector> outputs;
+        tcsim::EvalContext context;
+        spec.behavior(context, inputs, outputs);
+        std::string text;
+        for (const BitVector& output : outputs) {
+            if (!text.empty()) text += " ";
+            text += output.toString();
+        }
+        return text;
+    };
+
+    const std::vector<uint16_t> maker_widths{8, 8};
+    const tcsim::DeviceSpec& maker = tcsim::deviceWordMaker(maker_widths);
+    check(maker.name == "wordmaker16" && maker.inputs.size() == 2 && maker.outputs.size() == 1 &&
+              maker.inputs[0].bits == 8 && maker.inputs[1].bits == 8 && maker.outputs[0].bits == 16,
+          "a Word Maker over two 8-bit values is a 16-bit device");
+    check(apply(maker, {BitVector::fromText("10101011", 8), BitVector::fromText("11001101", 8)}) ==
+              "1010101111001101",
+          "the topmost input is the most significant half of the word");
+    check(apply(maker, {BitVector::fromText("1", 1), BitVector::fromText("0", 1)}) ==
+              "1xxxxxxx0xxxxxxx",
+          "an input narrower than the pin leaves the missing bits unknown");
+
+    const tcsim::DeviceSpec& split = tcsim::deviceWordSplitter(4, 4);
+    check(split.name == "wordsplit4x4" && split.inputs.size() == 1 && split.outputs.size() == 4 &&
+              split.inputs[0].bits == 16 && split.outputs[0].bits == 4,
+          "a four-way word Splitter takes 4n bits and gives four n-bit leaves");
+    check(apply(split, {BitVector::fromText("1010101111001101", 16)}) == "1010 1011 1100 1101",
+          "the topmost leaf is the most significant slice");
+
+    const auto component = [](uint8_t kind, int16_t x, int16_t y, uint8_t inputs, uint8_t outputs) {
+        BoardComponent value;
+        value.kind = kind;
+        value.x = x;
+        value.y = y;
+        value.input_count = inputs;
+        value.output_count = outputs;
+        return value;
+    };
+    const auto wire = [](int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t width) {
+        BoardWire value;
+        value.x1 = x1;
+        value.y1 = y1;
+        value.x2 = x2;
+        value.y2 = y2;
+        value.width = width;
+        return value;
+    };
+    const auto geometry = [](const BoardComponent& entry, tcsim::KindPins& pins) {
+        pins = tcsim::KindPins{};
+        pins.kind = entry.kind;
+        if (entry.kind == 0x30) {
+            pins.name = "Word Maker";
+            pins.input_count = 2;
+            pins.output_count = 1;
+            pins.in_x[0] = -1; pins.in_y[0] = -1; pins.in_bits[0] = 1;
+            pins.in_x[1] = -1; pins.in_y[1] = 0;  pins.in_bits[1] = 1;
+            pins.out_x[0] = 1; pins.out_y[0] = 0;  pins.out_bits[0] = 1;
+            return true;
+        }
+        if (entry.kind == 0x63) {
+            pins.name = "Splitter";
+            pins.input_count = 1;
+            pins.output_count = 4;
+            pins.in_x[0] = -1; pins.in_y[0] = 0; pins.in_bits[0] = 1;
+            for (uint8_t pin = 0; pin < 4; ++pin) {
+                pins.out_x[pin] = 1;
+                pins.out_y[pin] = static_cast<int8_t>(-1 + pin);
+                pins.out_bits[pin] = 1;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    BoardView board;
+    board.components.push_back(component(0x30, 0, 0, 2, 1));
+    board.components.push_back(component(0x63, 0, 30, 1, 4));
+    board.wires.push_back(wire(-4, -1, -1, -1, 8));   /* Word Maker in0: 8 bits */
+    board.wires.push_back(wire(-4, 0, -1, 0, 8));     /* Word Maker in1: 8 bits */
+    board.wires.push_back(wire(1, 0, 6, 0, 16));      /* its output: 16 bits */
+    board.wires.push_back(wire(-4, 30, -1, 30, 16));  /* Splitter input: 16 bits */
+    board.wires.push_back(wire(1, 29, 6, 29, 4));     /* four 4-bit leaves */
+    board.wires.push_back(wire(1, 30, 6, 30, 4));
+    board.wires.push_back(wire(1, 31, 6, 31, 4));
+    board.wires.push_back(wire(1, 32, 6, 32, 4));
+
+    const tcsim::BuildResult built = tcsim::buildNetList(board, geometry);
+    check(!built.fatal(), "the `wauto` board builds once the widths come off its wires");
+    const tcsim::DeviceId maker_device = built.devices_by_component[0];
+    const tcsim::DeviceId split_device = built.devices_by_component[1];
+    check(maker_device != tcsim::kNoDevice &&
+              built.netlist.device(maker_device).spec->name == "wordmaker16",
+          "an 8+8 Word Maker is built as a 16-bit concatenation");
+    check(maker_device == tcsim::kNoDevice ||
+              (built.netlist.device(maker_device).spec->inputs[0].bits == 8 &&
+               built.netlist.device(maker_device).spec->inputs[1].bits == 8),
+          "each Word Maker input keeps the width of the wire that reaches it");
+    check(split_device != tcsim::kNoDevice &&
+              built.netlist.device(split_device).spec->name == "wordsplit4x4",
+          "a four-way Splitter takes its leaf width from the wires (16 / 4 = 4)");
+
+    /* A definition's wires carry no width at all (measured on the player's
+       foundry definitions: every internal wire of every one of them reads 0), so
+       a net has to take the width its pins ask for.  Without that every
+       internal 32-bit path inside a custom component would be built as one-bit
+       nets. */
+    const auto geometry4 = [](const tcsim::BoardComponent& entry, tcsim::KindPins& pins) {
+        if (entry.kind != 0x6e) return false;
+        pins = tcsim::KindPins{};
+        pins.kind = entry.kind;
+        pins.name = "Splitter";
+        pins.input_count = 1;
+        pins.output_count = 4;
+        pins.in_x[0] = -1;
+        pins.in_y[0] = 0;
+        pins.in_bits[0] = 4;
+        for (uint8_t pin = 0; pin < 4; ++pin) {
+            pins.out_x[pin] = 1;
+            pins.out_y[pin] = static_cast<int8_t>(-1 + pin);
+            pins.out_bits[pin] = 1;
+        }
+        return true;
+    };
+    tcsim::BoardView definition_style;
+    definition_style.components.push_back(component(0x6e, 0, 0, 1, 4));
+    definition_style.wires.push_back(wire(-4, 0, -1, 0, 0)); /* the input, width unknown */
+    for (int pin = 0; pin < 4; ++pin) {
+        definition_style.wires.push_back(wire(1, static_cast<int16_t>(pin - 1), 6, static_cast<int16_t>(pin - 1), 0));
+    }
+    const tcsim::BuildResult built_zero = tcsim::buildNetList(definition_style, geometry4);
+    check(!built_zero.fatal() && built_zero.netlist.deviceCount() == 1 &&
+              built_zero.netlist.devices()[0].spec->name == "splitter4",
+          "a Splitter whose wires carry no width still builds at its declared four bits");
+    check(built_zero.net_of_wire.size() > 0 && built_zero.net_of_wire[0] != tcsim::kNoNet &&
+              built_zero.netlist.net(built_zero.net_of_wire[0]).bits == 4,
+          "the net a width-less wire reaches takes the width of the pin it lands on");
+}
+
+void testStorageFamily() {
+    using tcsim::BoardComponent;
+    using tcsim::BoardView;
+    using tcsim::BoardWire;
+    using tcsim::BitVector;
+    using tcsim::KindPins;
+
+    BoardView board;
+    const auto component = [](uint8_t kind, int16_t x, int16_t y, uint16_t width) {
+        BoardComponent value;
+        value.kind = kind;
+        value.x = x;
+        value.y = y;
+        /* The record counts the hidden pins: a register and a counter carry two
+           (enable/data, reset/data), a delay line one. */
+        value.input_count = kind == 0x37 ? 1 : 2;
+        value.output_count = 1;
+        value.memory_bits = width;
+        return value;
+    };
+    board.components.push_back(component(0x27, 0, 0, 8));    /* Register */
+    board.components.push_back(component(0x37, 0, 10, 8));   /* Delay Line */
+    board.components.push_back(component(0x26, 0, 20, 8));   /* Counter */
+    const auto wire = [](int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t width, uint64_t slot) {
+        BoardWire value;
+        value.x1 = x1;
+        value.y1 = y1;
+        value.x2 = x2;
+        value.y2 = y2;
+        value.width = width;
+        value.slot = slot;
+        return value;
+    };
+    board.wires.push_back(wire(-2, -1, -3, -1, 1, 100));   /* register enable */
+    board.wires.push_back(wire(-8, 0, -3, 0, 8, 110));     /* register data */
+    board.wires.push_back(wire(3, 0, 6, 0, 8, 120));       /* register output */
+    board.wires.push_back(wire(-8, 10, -3, 10, 8, 130));   /* delay line data */
+    board.wires.push_back(wire(3, 10, 6, 10, 8, 140));     /* delay line output */
+    board.wires.push_back(wire(-2, 19, -3, 19, 1, 150));   /* counter reset */
+    board.wires.push_back(wire(-8, 20, -3, 20, 8, 160));   /* counter data (not read) */
+    board.wires.push_back(wire(3, 20, 6, 20, 8, 170));     /* counter output */
+
+    const auto geometry = [](const BoardComponent& entry, KindPins& pins) {
+        pins.kind = entry.kind;
+        pins.declared_inputs = 0;
+        pins.output_count = 1;
+        pins.out_x[0] = 3;
+        pins.out_y[0] = 0;
+        pins.out_bits[0] = 0x7fff; /* wauto */
+        if (entry.kind == 0x27 || entry.kind == 0x26) {
+            pins.name = entry.kind == 0x27 ? "Register" : "Counter";
+            pins.hidden_count = 2;
+            pins.input_count = 2;
+            pins.hidden_x[0] = -3; pins.hidden_y[0] = -1; pins.hidden_bits[0] = 1;
+            pins.hidden_x[1] = -3; pins.hidden_y[1] = 0;  pins.hidden_bits[1] = 0x7fff;
+            return true;
+        }
+        if (entry.kind == 0x37) {
+            pins.name = "Delay Line";
+            pins.hidden_count = 1;
+            pins.input_count = 1;
+            pins.hidden_x[0] = -3; pins.hidden_y[0] = 0; pins.hidden_bits[0] = 0x7fff;
+            return true;
+        }
+        return false;
+    };
+    const tcsim::BuildResult built = tcsim::buildNetList(board, geometry);
+    check(!built.fatal(), "the storage board builds a runnable netlist");
+    check(built.cycle_token != tcsim::kNoNet, "the storage family creates the per-cycle clock net");
+    check(built.netlist.deviceCount() == 3, "the register, the delay line and the counter each become a device");
+    /* `publish()` walks the slot table by net index, so every net the builder
+       adds needs an entry there.  The `#cycle` token was added without one:
+       publish then read a vector past the end, which in the running game is an
+       intermittent null dereference (`dev.sandbox-sim in on_frame: access
+       violation at 0x0`, measured 2026-09-30 on a player's board).  The
+       toolchain's own bounds assertions make a repeat a hard failure here. */
+    check(built.slots_of_net.size() == built.netlist.netCount(),
+          "every net has a slot list, the cycle token included");
+    {
+        tcsim::SandboxRuntime runtime;
+        check(runtime.bind(board, geometry), "the storage board binds a runtime");
+        runtime.advance(runtime.stepTicksFor(1),
+                        [](tcsim::NetId, const std::vector<uint64_t>&) { return uint64_t{0}; });
+        size_t written = 0;
+        runtime.publish([&written](uint64_t slot, unsigned char byte) {
+            ++written;
+            (void)slot;
+            (void)byte;
+        });
+        check(written > 0, "publishing a board with a cycle token walks every net");
+    }
+
+    const tcsim::DeviceInstance& register_device = built.netlist.devices()[0];
+    check(register_device.spec->name == "register8" && register_device.spec->inputs.size() == 3 &&
+              register_device.spec->inputs[0].name == "EN" && register_device.spec->inputs[0].bits == 1 &&
+              register_device.spec->inputs[1].name == "D" && register_device.spec->inputs[1].bits == 8,
+          "the register takes a 1-bit enable and an 8-bit data pin", register_device.spec->name);
+    check(register_device.inputs[0] == built.net_of_wire[0] && register_device.inputs[1] == built.net_of_wire[1],
+          "its hidden pins are wired where the prototype's hidden list puts them");
+    check(register_device.inputs[2] == built.cycle_token, "and its clock is the cycle net");
+    const tcsim::DeviceInstance& delay_device = built.netlist.devices()[1];
+    check(delay_device.spec->name == "delayline8" && delay_device.inputs[0] == built.net_of_wire[3] &&
+              delay_device.inputs[1] == built.cycle_token,
+          "the delay line reads its data pin and clocks on the cycle net", delay_device.spec->name);
+    const tcsim::DeviceInstance& counter_device = built.netlist.devices()[2];
+    check(counter_device.spec->name == "counter8" && counter_device.spec->inputs[0].bits == 1 &&
+              counter_device.spec->inputs[1].bits == 8 && counter_device.inputs[2] == built.cycle_token,
+          "the counter takes a 1-bit reset beside its 8-bit data pin", counter_device.spec->name);
+
+    /* Now run it.  The cycle net is driven by hand so the test says exactly
+       which edge does what; the runtime drives this same net once per cycle. */
+    tcsim::Engine engine(built.netlist);
+    const tcsim::NetId token = built.cycle_token;
+    const tcsim::NetId enable = built.net_of_wire[0];
+    const tcsim::NetId data = built.net_of_wire[1];
+    const tcsim::NetId register_out = built.net_of_wire[2];
+    const tcsim::NetId delay_in = built.net_of_wire[3];
+    const tcsim::NetId delay_out = built.net_of_wire[4];
+    const tcsim::NetId reset = built.net_of_wire[5];
+    const tcsim::NetId counter_out = built.net_of_wire[7];
+    const auto byte = [](const char* bits) { return BitVector::fromText(bits, 8); };
+    engine.addStimulus(0, token, tcsim::fixtures::one("0"));
+    engine.addStimulus(0, enable, tcsim::fixtures::one("1"));
+    engine.addStimulus(0, data, byte("00010101"));
+    engine.addStimulus(0, reset, tcsim::fixtures::one("0"));
+    engine.runUntil(1);
+    check(engine.netValue(register_out).toString() == "00000000",
+          "a register starts at zero and does not follow its data pin between cycles");
+
+    engine.addStimulus(1, token, tcsim::fixtures::one("1")); /* the cycle boundary */
+    engine.runUntil(2);
+    check(engine.netValue(register_out).toString() == "00010101", "the register latches on the cycle edge");
+
+    engine.addStimulus(2, enable, tcsim::fixtures::one("0"));
+    engine.addStimulus(2, data, byte("10101010"));
+    engine.addStimulus(2, token, tcsim::fixtures::one("0"));
+    engine.runUntil(3);
+    engine.addStimulus(3, token, tcsim::fixtures::one("1"));
+    engine.runUntil(4);
+    check(engine.netValue(register_out).toString() == "00010101",
+          "with its enable low the register holds what it latched");
+
+    engine.addStimulus(4, enable, tcsim::fixtures::one("1"));
+    engine.addStimulus(4, token, tcsim::fixtures::one("0"));
+    engine.runUntil(5);
+    engine.addStimulus(5, token, tcsim::fixtures::one("1"));
+    engine.runUntil(6);
+    check(engine.netValue(register_out).toString() == "10101010", "and with it high it takes the new value");
+
+    engine.addStimulus(6, delay_in, byte("00111100"));
+    engine.addStimulus(6, token, tcsim::fixtures::one("0"));
+    engine.runUntil(7);
+    engine.addStimulus(7, token, tcsim::fixtures::one("1"));
+    engine.runUntil(8);
+    check(engine.netValue(delay_out).toString() == "00111100", "the delay line publishes what it saw one cycle earlier");
+
+    /* The counter counts every cycle edge, so the checks above (which already
+       made several edges) have to be cleared out of the way first: hold its
+       reset across one edge and measure from there. */
+    engine.addStimulus(8, reset, tcsim::fixtures::one("1"));
+    engine.addStimulus(8, token, tcsim::fixtures::one("0"));
+    engine.runUntil(9);
+    engine.addStimulus(9, token, tcsim::fixtures::one("1"));
+    engine.runUntil(10);
+    check(engine.netValue(counter_out).toString() == "00000000",
+          "the counter's reset holds it at zero across an edge");
+    engine.addStimulus(10, reset, tcsim::fixtures::one("0"));
+    engine.addStimulus(10, token, tcsim::fixtures::one("0"));
+    engine.runUntil(11);
+    engine.addStimulus(11, token, tcsim::fixtures::one("1"));
+    engine.runUntil(12);
+    check(engine.netValue(counter_out).toString() == "00000001", "one cycle edge counts one");
+    engine.addStimulus(12, token, tcsim::fixtures::one("0"));
+    engine.runUntil(13);
+    engine.addStimulus(13, token, tcsim::fixtures::one("1"));
+    engine.runUntil(14);
+    check(engine.netValue(counter_out).toString() == "00000010", "and the next counts two");
+    engine.addStimulus(14, reset, tcsim::fixtures::one("1"));
+    engine.addStimulus(14, token, tcsim::fixtures::one("0"));
+    engine.runUntil(15);
+    engine.addStimulus(15, token, tcsim::fixtures::one("1"));
+    engine.runUntil(16);
+    check(engine.netValue(counter_out).toString() == "00000000", "reset takes it back to zero");
+}
+
+void testWordWidthResolution() {
+    using tcsim::BoardComponent;
+    using tcsim::BoardView;
+    using tcsim::BoardWire;
+    using tcsim::KindPins;
+
+    /* A synthetic board with one word Mux whose record carries the width the
+       game resolved (32) and one word Add whose record does not.  The three
+       authorities are exercised in one go: the record's own number, the wire
+       widths, and the prototype's declared width. */
+    BoardView board;
+    const auto add_component = [](uint8_t kind, int16_t x, int16_t y, uint8_t inputs, uint8_t outputs,
+                                  uint16_t memory_bits) {
+        BoardComponent component;
+        component.kind = kind;
+        component.x = x;
+        component.y = y;
+        component.input_count = inputs;
+        component.output_count = outputs;
+        component.memory_bits = memory_bits;
+        return component;
+    };
+    board.components.push_back(add_component(0x2a, 0, 0, 3, 1, 32));  /* Mux */
+    board.components.push_back(add_component(0x1e, 20, 0, 3, 2, 0));  /* Add */
+    const auto wire = [](int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t width, uint64_t slot) {
+        BoardWire value;
+        value.x1 = x1;
+        value.y1 = y1;
+        value.x2 = x2;
+        value.y2 = y2;
+        value.width = width;
+        value.slot = slot;
+        return value;
+    };
+    /* Mux: select 1 bit, A and B 32, output 32. */
+    board.wires.push_back(wire(-5, -1, -1, -1, 1, 300));
+    board.wires.push_back(wire(-5, 0, -1, 0, 32, 320));
+    board.wires.push_back(wire(-5, 1, -1, 1, 32, 360));
+    board.wires.push_back(wire(2, 0, 8, 0, 32, 400));
+    /* Add: A and B come in as 8-bit wires, the carry in as one bit. */
+    board.wires.push_back(wire(15, -1, 19, -1, 8, 500));
+    board.wires.push_back(wire(15, 1, 19, 1, 8, 540));
+    board.wires.push_back(wire(20, -2, 20, -2, 1, 580));
+    board.wires.push_back(wire(22, 0, 28, 0, 8, 600));
+    board.wires.push_back(wire(21, 2, 21, 2, 1, 620));
+
+    const auto geometry = [](const BoardComponent& component, KindPins& pins) {
+        pins.kind = component.kind;
+        if (component.kind == 0x2a) {
+            pins.name = "Mux";
+            pins.input_count = 3;
+            pins.in_x[0] = -1; pins.in_y[0] = -1; pins.in_bits[0] = 0x7fff;
+            pins.in_x[1] = -1; pins.in_y[1] = 0;  pins.in_bits[1] = 0x7fff;
+            pins.in_x[2] = -1; pins.in_y[2] = 1;  pins.in_bits[2] = 0x7fff;
+            pins.output_count = 1;
+            pins.out_x[0] = 2; pins.out_y[0] = 0; pins.out_bits[0] = 0x7fff;
+            return true;
+        }
+        if (component.kind == 0x1e) {
+            pins.name = "Add";
+            pins.input_count = 3;
+            pins.in_x[0] = -1; pins.in_y[0] = -1; pins.in_bits[0] = 0x7fff;
+            pins.in_x[1] = -1; pins.in_y[1] = 1;  pins.in_bits[1] = 0x7fff;
+            pins.in_x[2] = 0;  pins.in_y[2] = -2; pins.in_bits[2] = 1;
+            pins.output_count = 2;
+            pins.out_x[0] = 2; pins.out_y[0] = 0; pins.out_bits[0] = 0x7fff;
+            pins.out_x[1] = 1; pins.out_y[1] = 2; pins.out_bits[1] = 1;
+            return true;
+        }
+        if (component.kind == 0x1a) { /* Equal, deliberately unwired */
+            pins.name = "Equal";
+            pins.input_count = 2;
+            pins.in_x[0] = -1; pins.in_y[0] = -1; pins.in_bits[0] = 0x7fff;
+            pins.in_x[1] = -1; pins.in_y[1] = 1;  pins.in_bits[1] = 0x7fff;
+            pins.output_count = 1;
+            pins.out_x[0] = 2; pins.out_y[0] = 0; pins.out_bits[0] = 1;
+            return true;
+        }
+        return false;
+    };
+    board.components.push_back(add_component(0x1a, 40, 0, 2, 1, 0)); /* Equal, unwired */
+    /* A third word component with neither a record width nor a single wire: the
+       one shape where the builder must refuse to invent a width. */
+    board.components.push_back(add_component(0x1a, 40, 0, 2, 1, 0)); /* Equal, unwired */
+
+    const tcsim::BuildResult result = tcsim::buildNetList(board, geometry);
+    check(!result.fatal(), "the synthetic word board builds a runnable netlist");
+    /* Three authorities, three answers: the Mux uses the record's 32, the Add
+       falls back to its 8-bit wires, and the unwired Equal is reported rather
+       than built at an invented width. */
+    check(result.netlist.deviceCount() == 2, "the wired word components become devices and the unwired one does not");
+    const tcsim::DeviceInstance& mux = result.netlist.devices()[0];
+    check(mux.spec->name == "mux32" && mux.spec->inputs[0].bits == 1 && mux.spec->inputs[1].bits == 32,
+          "the Mux's select stays at one bit while its data path takes the record's 32", mux.spec->name);
+    const tcsim::DeviceInstance& add = result.netlist.devices()[1];
+    check(add.spec->name == "wordbinary0_8" && add.spec->inputs[0].bits == 8 && add.spec->inputs[2].bits == 1 &&
+              add.spec->outputs.size() == 2 && add.spec->outputs[1].bits == 1,
+          "the Add takes its width from its 8-bit wires and keeps its carry at one bit", add.spec->name);
+    bool reported_unresolved = false;
+    for (const tcsim::BuildNote& note : result.notes) {
+        if (note.text.find("no resolved word width") != std::string::npos) reported_unresolved = true;
+    }
+    check(reported_unresolved, "an unresolved word width is reported instead of built at one bit");
+}
+
+/* The leaf kinds (Splitter / Maker / Concatenator).  Their width comes from
+   their own pin shape, and the one convention between them - the top leaf is
+   the most significant bit - is what this test pins down. */
+void testLeafKinds() {
+    using tcsim::BoardComponent;
+    using tcsim::BoardView;
+    using tcsim::BoardWire;
+    using tcsim::BitVector;
+    using tcsim::DeviceSpec;
+    using tcsim::KindPins;
+
+    const auto apply = [](const DeviceSpec& spec, const std::vector<BitVector>& inputs) {
+        std::vector<BitVector> outputs;
+        tcsim::EvalContext context;
+        spec.behavior(context, inputs, outputs);
+        std::string text;
+        for (const BitVector& output : outputs) {
+            if (!text.empty()) text += " ";
+            text += output.toString();
+        }
+        return text;
+    };
+
+    /* A 4-bit Splitter: leaf 0 is the top pin and the most significant bit. */
+    const DeviceSpec& split = tcsim::deviceSplitter(4);
+    check(split.inputs.size() == 1 && split.inputs[0].bits == 4 && split.outputs.size() == 4 &&
+              split.outputs[0].bits == 1,
+          "the Splitter takes one 4-bit word and gives four one-bit leaves");
+    check(apply(split, {BitVector::fromText("1010", 4)}) == "1 0 1 0",
+          "leaf 0 carries the most significant bit, top to bottom", apply(split, {BitVector::fromText("1010", 4)}));
+    const DeviceSpec& make = tcsim::deviceMaker(4);
+    check(apply(make, {BitVector::fromText("1", 1), BitVector::fromText("0", 1), BitVector::fromText("1", 1),
+                       BitVector::fromText("0", 1)}) == "1010",
+          "the Maker's first pin is the high end, so it is the Splitter's exact inverse");
+    check(apply(make, {BitVector::fromText("1", 1), BitVector::fromText("x", 1), BitVector::fromText("1", 1),
+                       BitVector::fromText("0", 1)}) == "1x10",
+          "a Maker keeps per-bit truth: a leaf moves one bit and only that bit");
+
+    /* The board builder: an 8-bit Splitter whose wires are the prototype's own
+       shape, then the same board with the unmeasured sentinel width. */
+    const auto geometry = [](const BoardComponent& component, KindPins& pins) {
+        pins.kind = component.kind;
+        if (component.kind == 0x11) { /* Splitter: in (1,-1) w8, out (1,-1)..(1,2) w1 */
+            pins.name = "Splitter";
+            pins.input_count = 1;
+            pins.in_x[0] = -1; pins.in_y[0] = 0; pins.in_bits[0] = 8;
+            pins.output_count = 8;
+            for (uint8_t pin = 0; pin < 8; ++pin) {
+                pins.out_x[pin] = 1;
+                pins.out_y[pin] = static_cast<int8_t>(pin == 0 ? -3 : (pin == 1 ? -2 : (pin == 2 ? -1 : (pin == 3 ? 0 : pin - 3))));
+                pins.out_bits[pin] = 1;
+            }
+            return true;
+        }
+        if (component.kind == 0x2f) { /* Splitter whose input is the sentinel */
+            pins.name = "Splitter";
+            pins.input_count = 1;
+            pins.in_x[0] = -1; pins.in_y[0] = 0; pins.in_bits[0] = 0x7ffeu;
+            pins.output_count = 2;
+            pins.out_x[0] = 1; pins.out_y[0] = -1; pins.out_bits[0] = 0x7fff;
+            pins.out_x[1] = 1; pins.out_y[1] = 0;  pins.out_bits[1] = 0x7fff;
+            return true;
+        }
+        return false;
+    };
+    BoardView board;
+    BoardComponent splitter;
+    splitter.kind = 0x11;
+    splitter.x = 0;
+    splitter.y = 0;
+    splitter.input_count = 1;
+    splitter.output_count = 8;
+    board.components.push_back(splitter);
+    /* The word arrives on the input pin at (-1,0), and the eight leaves leave
+       from (1,-3) down to (1,4).  No leaf sits on the input's own cell, which
+       is why the board is legal: a pin cell belongs to exactly one net. */
+    BoardWire bus;
+    bus.x1 = -4;
+    bus.y1 = 0;
+    bus.x2 = -1;
+    bus.y2 = 0;
+    bus.width = 8;
+    bus.slot = 800;
+    board.wires.push_back(bus);
+    for (uint8_t pin = 0; pin < 8; ++pin) {
+        BoardWire wire;
+        wire.x1 = 1;
+        wire.y1 = static_cast<int16_t>(pin - 3);
+        wire.x2 = 5;
+        wire.y2 = wire.y1;
+        wire.width = 1;
+        wire.slot = 700 + pin * 2;
+        board.wires.push_back(wire);
+    }
+    const tcsim::BuildResult built = tcsim::buildNetList(board, geometry);
+    check(built.netlist.deviceCount() == 1 && built.netlist.devices()[0].spec->name == "splitter8",
+          "the Splitter's width comes from its own declared pins, not from a wire");
+    check(!built.fatal(), "the Splitter board builds a runnable netlist");
+
+    /* The word Splitters (0x2f / 0x63 / 0x64) are the leaves whose width the
+       prototype does *not* pin down - their input is a sentinel and their
+       outputs are `wauto` - so the leaf width comes off the board, measured as
+       "input = leaves * n" (`kind 0x2F … in0 64 bits -> out0 32, out1 32`).
+       With no wire and no record width it must be reported rather than
+       invented; with wires it becomes `wordsplit<leaves>x<n>`. */
+    BoardView sentinel;
+    BoardComponent odd;
+    odd.kind = 0x2f;
+    odd.input_count = 1;
+    odd.output_count = 2;
+    sentinel.components.push_back(odd);
+    const tcsim::BuildResult refused = tcsim::buildNetList(sentinel, geometry);
+    check(refused.netlist.deviceCount() == 0, "an unwired word Splitter builds no device");
+    bool reported = false;
+    for (const tcsim::BuildNote& note : refused.notes) {
+        if (note.text.find("no resolved leaf width") != std::string::npos) reported = true;
+    }
+    check(reported, "a word Splitter whose leaves are unmeasured is reported, never invented");
+
+    BoardView halves;
+    BoardComponent word_splitter;
+    word_splitter.kind = 0x2f;
+    word_splitter.input_count = 1;
+    word_splitter.output_count = 2;
+    halves.components.push_back(word_splitter);
+    for (int pin = 0; pin < 2; ++pin) {
+        BoardWire wire;
+        wire.x1 = 1;
+        wire.y1 = static_cast<int16_t>(pin - 1);
+        wire.x2 = 5;
+        wire.y2 = wire.y1;
+        wire.width = 4;   /* the halves are four bits each */
+        wire.slot = 900 + pin * 2;
+        halves.wires.push_back(wire);
+    }
+    const tcsim::BuildResult built_halves = tcsim::buildNetList(halves, geometry);
+    check(built_halves.netlist.deviceCount() == 1 &&
+              built_halves.netlist.devices()[0].spec->name == "wordsplit2x4",
+          "the word Splitter takes its leaf width from the wires",
+          built_halves.netlist.devices().empty() ? "" : built_halves.netlist.devices()[0].spec->name);
+}
+
+/* The Static Indexer (0x65).  Its rule is read off the game's own files: the
+   `symphony_1_nand` ISA decodes with `(instruction >> 24) & 0b1111`, the level's
+   `hint_custom/Instruction Decoder` solution configures its seven indexers with
+   exactly those offsets and widths, and `campaign/multiply`'s solution shifts
+   left with negative indexes.  See `deviceIndexer`. */
+void testStaticIndexer() {
+    using tcsim::BitVector;
+    using tcsim::DeviceSpec;
+
+    const auto apply = [](const DeviceSpec& spec, const char* text, size_t bits) {
+        std::vector<BitVector> outputs;
+        tcsim::EvalContext context;
+        spec.behavior(context, {BitVector::fromText(text, bits)}, outputs);
+        return outputs.empty() ? std::string("-") : outputs[0].toString();
+    };
+
+    /* The five fields the ISA decodes, at the widths the solution configures.
+       The word below reads `0011` at bit 24, `00` at 29, `1` at 28 and
+       `1111_0000_1010_0101` at 0 - worked out from the bit numbering, not from
+       this device, so the test can fail. */
+    const DeviceSpec& opcode = tcsim::deviceIndexer(24, 4);
+    check(apply(opcode, "10010011101011001111000010100101", 32) == "0011",
+          "the indexer reads the field at bit 24, four bits wide (the ISA's opcode)");
+    const DeviceSpec& mode = tcsim::deviceIndexer(29, 2);
+    check(apply(mode, "10010011101011001111000010100101", 32) == "00",
+          "the mode field is two bits at bit 29");
+    const DeviceSpec& imm_flag = tcsim::deviceIndexer(28, 1);
+    check(apply(imm_flag, "10010011101011001111000010100101", 32) == "1",
+          "the immediate flag is the single bit at 28");
+    check(apply(tcsim::deviceIndexer(20, 4), "10010011101011001111000010100101", 32) == "1010",
+          "the destination field is four bits at 20");
+    const DeviceSpec& immediate = tcsim::deviceIndexer(0, 16);
+    check(apply(immediate, "10010011101011001111000010100101", 32) == "1111000010100101",
+          "index 0 with a 16-bit width is the low half of the instruction");
+    /* Reading past the input's own width gives zeroes, not garbage. */
+    check(apply(tcsim::deviceIndexer(6, 4), "1010", 4) == "0000",
+          "a field that starts past the input reads as zeroes");
+    /* A negative index shifts left, which is how the multiply table is built. */
+    check(apply(tcsim::deviceIndexer(-1, 8), "00000011", 8) == "00000110",
+          "index -1 is a left shift by one (the multiply solution's table)");
+    check(apply(tcsim::deviceIndexer(-7, 8), "00000001", 8) == "10000000",
+          "index -7 shifts the top of a byte off the end, leaving only the sign bit");
+    check(apply(tcsim::deviceIndexer(0, 8), "10110011", 8) == "10110011",
+          "width 0-ish: index 0 with the full width is the identity");
+    /* One unsettled bit settles nothing, the same rule as the word operations. */
+    check(apply(opcode, "1001001110101100111100001010x101", 32) == "xxxx",
+          "an unknown bit in the word makes the field X");
+}
+
+/* The custom component's interface pins (0x4f Input Pin, 0x51 Output Pin).
+   Both pass one signal through; the evidence is structural and covers the whole
+   corpus (see `devicePin`): every Output Pin in the game's own circuits has its
+   input wired and its output unwired, and every Input Pin the other way round,
+   which is what a pass-through looks like and what a source or sink does not. */
+void testInterfacePins() {
+    using tcsim::BitVector;
+    using tcsim::DeviceSpec;
+
+    const auto apply = [](const DeviceSpec& spec, const BitVector& input) {
+        std::vector<BitVector> outputs;
+        tcsim::EvalContext context;
+        spec.behavior(context, {input}, outputs);
+        return outputs.empty() ? std::string("-") : outputs[0].toString();
+    };
+
+    const DeviceSpec& pin = tcsim::devicePin(8);
+    check(pin.inputs.size() == 1 && pin.outputs.size() == 1 && pin.inputs[0].bits == 8 &&
+              pin.outputs[0].bits == 8,
+          "an interface pin is one signal in and the same signal out");
+    check(apply(pin, BitVector::fromText("10110011", 8)) == "10110011", "the pin passes its value through");
+    check(apply(tcsim::devicePin(1), BitVector::fromText("1", 1)) == "1", "a one-bit pin passes one bit");
+    check(apply(pin, BitVector::fromText("1011xx11", 8)) == "1011xx11",
+          "a pin keeps per-bit truth: it moves a value, it does not compute one");
+    /* A pin with nothing driving it passes the unsettled value on, exactly like
+       the input of a composite that nothing outside is feeding yet. */
+    const DeviceSpec& floating = tcsim::devicePin(4);
+    std::vector<BitVector> outputs;
+    tcsim::EvalContext context;
+    floating.behavior(context, {}, outputs);
+    check(outputs.size() == 1 && outputs[0].toString() == "zzzz",
+          "an undriven pin leaves its output high-impedance");
+
+    /* The board builder resolves the pin's width from the signal it carries.
+       An Input Pin's output is the only wired pin (the input is the composite's
+       boundary), so the width comes from that one wire. */
+    tcsim::BoardView board;
+    tcsim::BoardComponent pin_component;
+    pin_component.kind = 0x4f;
+    pin_component.input_count = 1;
+    pin_component.output_count = 1;
+    board.components.push_back(pin_component);
+    tcsim::BoardWire wire;
+    wire.x1 = 3;
+    wire.y1 = 0;
+    wire.x2 = 9;
+    wire.y2 = 0;
+    wire.width = 16;
+    wire.slot = 900;
+    board.wires.push_back(wire);
+    const auto geometry = [](const tcsim::BoardComponent& component, tcsim::KindPins& pins) {
+        pins.kind = component.kind;
+        pins.name = "Input Pin";
+        pins.input_count = 1;
+        pins.in_x[0] = 0; pins.in_y[0] = 0; pins.in_bits[0] = 0x7fff;
+        pins.output_count = 1;
+        pins.out_x[0] = 3; pins.out_y[0] = 0; pins.out_bits[0] = 0x7fff;
+        return true;
+    };
+    const tcsim::BuildResult built = tcsim::buildNetList(board, geometry);
+    check(built.netlist.deviceCount() == 1 && built.netlist.devices()[0].spec->name == "pin16",
+          "the Input Pin takes its width from the wire it drives");
+    check(!built.fatal(), "a board with an interface pin builds a runnable netlist");
+}
+
+/* The Decoder family (0x2b one address bit, 0x2c two, 0x2d three plus an
+   enable).  The shape is declared by the prototype table; the one-hot behaviour
+   is what the game's own ALU solutions use (a decoder's outputs join the high
+   leaves of a 4-input Maker whose low leaf comes from a Splitter, i.e. the
+   selection word of a mux).  See `deviceDecoder`. */
+void testDecoders() {
+    using tcsim::BitVector;
+    using tcsim::DeviceSpec;
+
+    const auto apply = [](const DeviceSpec& spec, const std::vector<BitVector>& inputs) {
+        std::vector<BitVector> outputs;
+        tcsim::EvalContext context;
+        spec.behavior(context, inputs, outputs);
+        std::string text;
+        for (const BitVector& output : outputs) {
+            if (!text.empty()) text += " ";
+            text += output.toString();
+        }
+        return text;
+    };
+
+    const DeviceSpec& one = tcsim::deviceDecoder(1, false);
+    check(one.inputs.size() == 1 && one.inputs[0].bits == 1 && one.outputs.size() == 2,
+          "the 1 Bit Decoder is one address bit and two one-bit outputs");
+    check(apply(one, {BitVector::fromText("0", 1)}) == "1 0", "address 0 lights the first output");
+    check(apply(one, {BitVector::fromText("1", 1)}) == "0 1", "address 1 lights the second output");
+    check(apply(one, {BitVector::fromText("x", 1)}) == "x x", "an unsettled address lights nothing for sure");
+
+    const DeviceSpec& two = tcsim::deviceDecoder(2, false);
+    check(apply(two, {BitVector::fromText("00", 2)}) == "1 0 0 0" &&
+              apply(two, {BitVector::fromText("01", 2)}) == "0 1 0 0" &&
+              apply(two, {BitVector::fromText("10", 2)}) == "0 0 1 0" &&
+              apply(two, {BitVector::fromText("11", 2)}) == "0 0 0 1",
+          "the 2 Bit Decoder is one-hot across four outputs");
+
+    const DeviceSpec& three = tcsim::deviceDecoder(3, true);
+    check(three.inputs.size() == 2 && three.inputs[0].bits == 3 && three.inputs[1].bits == 1 &&
+              three.outputs.size() == 8,
+          "the 3 Bit Decoder is a 3-bit address, an enable and eight outputs");
+    check(apply(three, {BitVector::fromText("101", 3), BitVector::fromText("1", 1)}) ==
+              "0 0 0 0 0 1 0 0",
+          "address 5 lights the sixth output");
+    check(apply(three, {BitVector::fromText("101", 3), BitVector::fromText("0", 1)}) ==
+              "0 0 0 0 0 0 0 0",
+          "a low enable holds every output at 0");
+    check(apply(three, {BitVector::fromText("000", 3), BitVector::fromText("x", 1)}) ==
+              "x x x x x x x x",
+          "an unsettled enable settles nothing");
+    /* With the enable left unwired the gate stays enabled, which is the reading
+       the corpus supports (it is wired once in eleven appearances). */
+    check(apply(three, {BitVector::fromText("000", 3)}) == "1 0 0 0 0 0 0 0",
+          "an unwired enable leaves the decoder enabled");
+}
+
+void testGameMemoryPorts() {
+    tcsim::MemoryImage endian;
+    endian.address_bits = 8;
+    endian.little_endian = false;
+    endian.write(4, 32, 0x11223344u);
+    check(endian.readByte(4) == 0x11 && endian.readByte(7) == 0x44,
+          "a big-endian game RAM stores the most significant byte first");
+    check(endian.read(4, 32) == 0x11223344u, "a big-endian RAM round-trips a 32-bit port value");
+    endian.little_endian = true;
+    endian.bytes.clear();
+    endian.write(4, 32, 0x11223344u);
+    check(endian.readByte(4) == 0x44 && endian.readByte(7) == 0x11,
+          "a little-endian game RAM stores the least significant byte first");
+    check(endian.read(0x104, 32) == 0x11223344u, "the port masks its starting address to RAM capacity");
+    endian.write(255, 16, 0xaabbu);
+    check(endian.readByte(255) == 0xbb && endian.readByte(256) == 0,
+          "a multi-byte access uses the game's zero guard instead of wrapping its tail");
+
+    tcsim::BoardView board;
+    tcsim::BoardComponent ram;
+    ram.kind = 0x76;
+    ram.id = 100;
+    ram.memory_bits = 8;
+    board.components.push_back(ram);
+    const auto add_port = [&](uint8_t kind, int16_t y) {
+        tcsim::BoardComponent port;
+        port.kind = kind;
+        port.y = y;
+        port.memory_bits = 32;
+        port.input_count = kind == 0x36 ? 3 : 5;
+        port.output_count = kind == 0x36 ? 2 : 1;
+        board.components.push_back(port);
+    };
+    add_port(0x36, -16); /* load before the store: observes old data */
+    add_port(0x38, -13); /* store */
+    add_port(0x36, -10); /* load after the store: observes new data */
+    const auto add_wire = [&](int x, int y, uint16_t width) {
+        const uint64_t slot = 1000 + board.wires.size() * 16;
+        board.wires.push_back(tcsim::BoardWire{static_cast<int16_t>(x), static_cast<int16_t>(y),
+                                               static_cast<int16_t>(x - 1), static_cast<int16_t>(y), width, slot});
+    };
+    /* old load: Enable, Address, Output */
+    add_wire(-15, -17, 1);
+    add_wire(-15, -16, 32);
+    add_wire(16, -17, 32);
+    /* store: Enable, Address, Value */
+    add_wire(-15, -14, 1);
+    add_wire(-15, -13, 32);
+    add_wire(-15, -12, 32);
+    /* new load: Enable, Address, Output */
+    add_wire(-15, -11, 1);
+    add_wire(-15, -10, 32);
+    add_wire(16, -11, 32);
+
+    const auto geometry = [](const tcsim::BoardComponent& component, tcsim::KindPins& pins) {
+        pins = tcsim::KindPins{};
+        pins.kind = component.kind;
+        if (component.kind == 0x76) { pins.name = "RAM"; return true; }
+        if (component.kind == 0x36) {
+            pins.name = "Load port";
+            pins.input_count = 3;
+            pins.output_count = 2;
+            pins.in_x[0] = pins.in_x[1] = -15;
+            pins.in_y[0] = -1;
+            pins.in_y[1] = 0;
+            pins.in_x[2] = 0;
+            pins.out_x[0] = 16;
+            pins.out_y[0] = -1;
+            pins.out_x[1] = 1;
+            return true;
+        }
+        if (component.kind == 0x38) {
+            pins.name = "Store port";
+            pins.input_count = 5;
+            pins.output_count = 1;
+            pins.in_x[0] = pins.in_x[1] = pins.in_x[2] = -15;
+            pins.in_y[0] = -1;
+            pins.in_y[1] = 0;
+            pins.in_y[2] = 1;
+            pins.in_x[3] = 0;
+            pins.in_x[4] = -1;
+            pins.out_x[0] = 1;
+            return true;
+        }
+        return false;
+    };
+    tcsim::BuildOptions options;
+    options.initialize_memory = [](const tcsim::BoardComponent&, tcsim::MemoryImage& image) {
+        image.write(4, 32, 0x11223344u);
+    };
+    tcsim::BuildResult built = tcsim::buildNetList(board, geometry, options);
+    check(!built.fatal() && built.memories.size() == 1, "a RAM and its three socket ports build as one memory");
+    check(built.memories[0].ports == std::vector<size_t>({1, 2, 3}),
+          "memory ports execute from the top of the socket toward the RAM");
+    check(built.netlist.deviceCount() == 3, "the RAM chain contains its three port devices");
+
+    tcsim::Engine engine(built.netlist);
+    const auto drive = [&](size_t wire, uint64_t value) {
+        const tcsim::NetId net = built.net_of_wire[wire];
+        engine.addStimulus(0, net, tcsim::memoryVector(value, built.netlist.net(net).bits));
+    };
+    drive(0, 1); drive(1, 4);
+    drive(3, 1); drive(4, 4); drive(5, 0xaabbccddu);
+    drive(6, 1); drive(7, 4);
+    engine.addStimulus(0, built.memories[0].order_root, tcsim::memoryVector(0, 8));
+    engine.runUntil(0);
+    check(engine.netValue(built.net_of_wire[2]).toUint64() == 0x11223344u,
+          "a Load port above a Store port reads the old same-address value",
+          engine.netValue(built.net_of_wire[2]).toString());
+    check(engine.netValue(built.net_of_wire[8]).toUint64() == 0xaabbccddu,
+          "a Load port below a Store port reads the newly stored value",
+          engine.netValue(built.net_of_wire[8]).toString());
+    check(built.memories[0].image->read(4, 32) == 0xaabbccddu,
+          "the Store port updates the RAM's persistent private byte state",
+          std::to_string(built.memories[0].image->read(4, 32)));
+    check(!engine.aborted() && !hasViolation(engine, tcsim::ViolationKind::kIncompleteDevice),
+          "all visible and implicit memory-port pins are connected");
+
+    /* The game-facing runtime, rather than a test manually poking the private
+       root, must re-run the whole port chain at every cycle boundary. */
+    tcsim::RuntimeConfig runtime_config;
+    runtime_config.ticks_per_unit = 1;
+    runtime_config.cycle_units = 1;
+    runtime_config.gate_delay = tcsim::ArcDelay{};
+    runtime_config.initialize_memory = options.initialize_memory;
+    tcsim::SandboxRuntime memory_runtime;
+    check(memory_runtime.bind(board, geometry, runtime_config),
+          "the SandboxRuntime binds the game memory board");
+    const auto runtime_drive = [&](size_t wire, uint64_t value) {
+        const tcsim::NetId net = memory_runtime.build().net_of_wire[wire];
+        memory_runtime.engine().addStimulus(
+            0, net, tcsim::memoryVector(value, memory_runtime.netlist().net(net).bits));
+    };
+    runtime_drive(0, 1); runtime_drive(1, 4);
+    runtime_drive(3, 1); runtime_drive(4, 4); runtime_drive(5, 0xaabbccddu);
+    runtime_drive(6, 1); runtime_drive(7, 4);
+    const auto no_sources = [](tcsim::NetId, const std::vector<uint64_t>&) { return uint64_t{0}; };
+    memory_runtime.stepCycle(no_sources);
+    memory_runtime.stepCycle(no_sources);
+    check(memory_runtime.engine().netValue(memory_runtime.build().net_of_wire[2]).toUint64() ==
+              0xaabbccddu,
+          "runtime cycle two re-runs a held Load and observes cycle one's Store");
+
+    tcsim::BoardView loose;
+    tcsim::BoardComponent loose_port;
+    loose_port.kind = 0x36;
+    loose_port.input_count = 3;
+    loose_port.output_count = 2;
+    loose_port.memory_bits = 8;
+    loose.components.push_back(loose_port);
+    const tcsim::BuildResult refused = tcsim::buildNetList(loose, geometry);
+    check(refused.fatal(), "an unattached memory port is reported instead of being approximated");
 }
 
 /* "The component's own node slot": the emitted program publishes each node into
@@ -1068,6 +2539,10 @@ int main(int argc, char** argv) {
     testScheduler();
     testDelayChain();
     testMultiDriver();
+    testTriStateSwitch();
+    testMux();
+    testWordOps();
+    testScreen();
     testGateUnknown();
     testRing();
     testDeltaChain();
@@ -1081,6 +2556,15 @@ int main(int argc, char** argv) {
     testVerilogExport();
     testCanonicalEvents();
     testBoardNetlist();
+    testGameMemoryPorts();
+    testWordSplitter();
+    testAutoWidthSplitterAndMaker();
+    testStorageFamily();
+    testWordWidthResolution();
+    testLeafKinds();
+    testStaticIndexer();
+    testInterfacePins();
+    testDecoders();
     testSandboxRuntime();
     testSandboxClockRuntime();
     testCycleUnblock();

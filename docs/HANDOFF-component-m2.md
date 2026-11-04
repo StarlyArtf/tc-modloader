@@ -1,5 +1,20 @@
 # 接手：元件接口 M2（实例、状态与生命周期）
 
+> **2026-09-28 补完（先读这一段）**：M2 的剩余项已经收口。
+> `TCComponentLifecycleV1` 追加了 `on_move` / `on_rotate` / `on_resize` / `on_compile` / `on_unbind`
+> （按 `size` 生效），`TCLogicIOV2` 追加了**放置尾巴**：`cell_x`/`cell_y`/`rotation`/
+> `half_width`/`half_height`；新相位 `TC_LOGIC_MOVE=9` … `TC_LOGIC_UNBIND=13`。宿主每帧读一次棋盘
+> 记录，只在变化时派发 move/rotate；逐实例占位写入派发 resize；生成器产出这次编译的代码之后派发
+> compile；`releaseInstances(nullptr, …)`（离开棋盘）派发 **unbind** 而不是 destroy。真机证据在
+> `tests/pin-shape-playtest.ps1 -Shape wide9`（`on_compile` / `on_resize` / `on_unbind` 三条断言），
+> 离线派发在 `tests/native-component.cpp`。
+>
+> **仍未关**：`on_move` / `on_rotate` 的**自动真机**门禁——派发逻辑离线验过，但"棋盘记录真的变了"
+> 这一步要玩家拖动/旋转元件，而本构建不接受合成鼠标的棋盘拖动（与本文档引用的 hitbox 研究同一结论，
+> 见 [research/component-hitbox-path.md](research/component-hitbox-path.md)）。探针会打印尝试与结果
+> （`instances moves=0 rotations=0`），但不断言。`on_compile_failed` 没有可靠信号（失败路径不经过
+> 生成器），不进契约。
+
 更新时间：2026-09-22
 
 计划出处：[PLAN-custom-components.md](PLAN-custom-components.md) §7 与 §16 阶段 2。

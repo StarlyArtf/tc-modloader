@@ -1,0 +1,10 @@
+# Three inverters in a closed ring.  The game's compiler refuses this board
+# ("circular dependency"); simcore runs it, and with a one-tick gate arc the
+# ring oscillates with a period of six ticks.  This is the board that shows the
+# two simulators are not the same thing.
+component index=0 kind=0x03 x=0 y=0 rotation=0 word30=1 word40=1
+component index=1 kind=0x03 x=8 y=4 rotation=0 word30=1 word40=1
+component index=2 kind=0x03 x=4 y=8 rotation=0 word30=1 word40=1
+wire index=0 from=2,0 to=7,4 width=1 slot=256
+wire index=1 from=10,4 to=3,8 width=1 slot=258
+wire index=2 from=6,8 to=-1,0 width=1 slot=260

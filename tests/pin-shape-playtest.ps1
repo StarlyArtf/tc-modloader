@@ -18,7 +18,7 @@
 #
 # -KeepRunning leaves the game up for a person; the default run is headless.
 param(
-  [ValidateSet('source','sink','wide9')]
+  [ValidateSet('source','sink','wide9','wide2048','clocked')]
   [string]$Shape = 'source',
   [int]$Seconds = 50,
   [switch]$KeepRunning
@@ -30,12 +30,16 @@ $taskTest = Join-Path $taskRepo ('build\pin-shape-' + $Shape + '-' + [guid]::New
 $taskRoot = Join-Path $taskTest 'game'
 $taskProfile = Join-Path $taskTest 'home'
 $taskData = Join-Path $taskRoot 'tc-modloader-data\plugin-data\dev.pin-shape-probe'
-$taskLevel = if ($Shape -eq 'sink') { 'not_gate' } else { 'or_gate' }
+$taskLevel = if ($Shape -eq 'sink' -or $Shape -eq 'wide2048') { 'not_gate' }
+             elseif ($Shape -eq 'clocked') { 'full_adder' }
+             else { 'or_gate' }
 $taskSchema = Join-Path $taskProfile ("AppData\Roaming\Turing Complete Mods\profiles\default\schematics\$taskLevel\Default")
 $taskBoardName = switch ($Shape) {
   'source' { 'nl_src0board.data' }
   'sink'   { 'nl_sink0board.data' }
   'wide9'  { 'nl_wide9board.data' }
+  'wide2048' { 'nl_wide2048board.data' }
+  'clocked' { 'nl_adderboard.data' }
 }
 $taskBoard = Join-Path $taskRepo ('build\' + $taskBoardName)
 if (!(Test-Path -LiteralPath $taskBoard)) { throw "Missing $taskBoard; run build.ps1 first" }
@@ -97,7 +101,8 @@ $taskEvidence = $taskLines | Where-Object {
 $taskEvidence | Select-Object -First 40 | ForEach-Object { $_ }
 if (!$taskText.Contains('pin-shape: source registration') -and
     !$taskText.Contains('pin-shape: sink registration') -and
-    !$taskText.Contains('pin-shape: wide9 V2 registration')) {
+    !$taskText.Contains('pin-shape: wide9 V2 registration') -and
+    !$taskText.Contains('pin-shape: wide2048 V2 registration')) {
   throw "The probe never reached registration; inspect $taskLog"
 }
 if (!($taskText -match 'byte-adder: autotest finished')) {
@@ -108,6 +113,8 @@ $taskPattern = switch ($Shape) {
   'source' { 'pin-shape: source registration' }
   'sink'   { 'pin-shape: sink registration' }
   'wide9'  { 'pin-shape: wide9 V2 registration' }
+  'wide2048' { 'pin-shape: wide2048 V2 registration' }
+  'clocked' { 'pin-shape: clocked V2 registration' }
 }
 $taskStatus = $taskLines | Where-Object { $_ -match $taskPattern } | Select-Object -Last 1
 $null = $taskStatus -match '-> (-?\d+)'
@@ -126,6 +133,50 @@ if ($taskBound -lt 1) {
 }
 if ($taskCalls -lt 1) {
   throw "The $Shape callback never ran: the compiled program has no scheduled node for it"
+}
+if ($Shape -eq 'wide2048') {
+  $taskCycleLine = $taskLines | Where-Object { $_ -match 'pin-shape: wide2048 cycle=' } | Select-Object -Last 1
+  if (!($taskCycleLine -match 'inputs=(\d+) nonzero=(\d+) first=(\d+) last=(\d+)')) {
+    throw "The wide2048 callback log could not be read: $taskCycleLine"
+  }
+  if ([int]$Matches[1] -ne 32) { throw "The staged callback saw $($Matches[1]) inputs, expected 32" }
+  if ([int]$Matches[2] -ne 1) { throw "Expected exactly one driven wide input, saw $($Matches[2])" }
+  if ([uint64]$Matches[3] -ne 0) { throw "The unconnected first word was $($Matches[3]), expected 0" }
+  if ([uint64]$Matches[4] -ne 0x0123456789abcdef) {
+    throw "The word above bit 1984 was $($Matches[4]), expected 0x0123456789abcdef"
+  }
+  $taskNoted = $taskLines | Where-Object { $_ -match 'shape=32in/1out v2 state=0' } | Select-Object -First 1
+  if (!$taskNoted) { throw 'The loader did not report the 32-input V2 shape' }
+  "PASS wide2048 component: 32 x 64-bit inputs registered and the last staged word reached the callback intact"
+}
+if ($Shape -eq 'clocked') {
+  # The clocked contract: exact visible dependency cones plus a disconnected
+  # hidden sink that sees every input and advances state once per cycle.
+  $taskNoted = $taskLines | Where-Object {
+    $_ -match 'shape=3in/2out v3 state=4' -and $_ -match 'deps=0x7,0x7' -and
+    $_ -match 'tick=hidden' } | Select-Object -First 1
+  if (!$taskNoted) { throw 'The loader did not report exact clocked dependencies and the hidden tick' }
+  $taskCycleLines = @($taskLines | Where-Object { $_ -match 'pin-shape: clocked cycle=' })
+  $taskLast = $taskCycleLines | Select-Object -Last 1
+  if (!($taskLast -match 'cycle=(\d+) calls=(\d+) state=(\d+) clk=(\d)')) {
+    throw "The clocked callback log could not be read: $taskLast"
+  }
+  $taskCycle = [int]$Matches[1]; $taskCalls = [int]$Matches[2]
+  $taskState = [int]$Matches[3]
+  if ($taskCalls -ne $taskCycle + 1) {
+    throw "The clocked callback ran $taskCalls time(s) by cycle $taskCycle; expected exactly one tick per cycle"
+  }
+  if ($taskState -ne $taskCalls) {
+    throw "The clocked state advanced to $taskState after $taskCalls tick(s); a second call per cycle would double it"
+  }
+  if (!($taskCycleLines -match 'clk=1')) {
+    throw "The hidden tick never saw input 0 (the clock) high; it must receive every input"
+  }
+  $taskVerdict = $taskLines | Where-Object { $_ -match 'byte-adder: autotest finished' } | Select-Object -Last 1
+  if (!($taskVerdict -match 'verdict=1')) {
+    throw "The full_adder level did not pass ($taskVerdict); the precise public outputs did not reach the board"
+  }
+  "PASS clocked component: one hidden tick per cycle, every input packed, precise public outputs reached the board"
 }
 if ($Shape -eq 'wide9') {
   # The V2 shape: nine pins through TCLogicIOV2, and a state size the definition
@@ -152,7 +203,21 @@ if ($Shape -eq 'wide9') {
     @{Pattern='pin-shape: instances delete index=\d+';Why='the first instance was deleted from the board'},
     @{Pattern='pin-shape: wide9 on_destroy instance=\d+';Why='lifecycle on_destroy for the released instance'},
     @{Pattern='pin-shape: instances after delete: enum status=0 written=1 total=1';Why='only the second instance survives'},
-    @{Pattern='pin-shape: instances old_handle=-4 forged_handle=-4';Why='stale handles are refused, not resolved'}
+    @{Pattern='pin-shape: instances old_handle=-4 forged_handle=-4';Why='stale handles are refused, not resolved'},
+    # M2's placement half (2026-09-28): compile, resize, move and unbind are all
+    # driven from the probe with the game's own paths, and the type's lifecycle
+    # has to hear them.
+    @{Pattern='pin-shape: wide9 on_compile instance=\d+';Why='TC_LOGIC_COMPILE for an instance the board compiled'},
+    @{Pattern='pin-shape: geometry instance resize=0 \(half=3,2\)';Why='the per-instance footprint was accepted'},
+    @{Pattern='pin-shape: wide9 on_resize instance=\d+ cell=-?\d+,-?\d+ rotation=\d+ half=3(\.0+)?,2(\.0+)?';Why='TC_LOGIC_RESIZE with the new footprint in the placement tail'},
+    # Move and rotate are *attempted* here (the probe drags the component with
+    # synthetic input and tries the rotate candidates), but the game does not act
+    # on a synthetic board drag in this build - the same finding the hitbox
+    # research recorded - so their real-machine gate is still open.  What the
+    # probe writes about the attempt is a diagnostic, not an assertion.
+    @{Pattern='pin-shape: moving instance at \d+,\d+ by two cells';Why='the probe attempted the move gesture'},
+    @{Pattern='pin-shape: leaving the board for sandbox';Why='the probe left the board for a second level'},
+    @{Pattern='pin-shape: wide9 on_unbind instance=\d+ phase=13';Why='TC_LOGIC_UNBIND when the board went away (the instance was not deleted)'}
   )
   foreach ($taskExpect in $taskRequired) {
     if (!($taskText -match $taskExpect.Pattern)) {

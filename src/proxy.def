@@ -190,16 +190,16 @@ EXPORTS
  ImGuiIDStackTool_ImGuiIDStackTool=tc_game_engine.ImGuiIDStackTool_ImGuiIDStackTool @188
  ImGuiIDStackTool_destroy=tc_game_engine.ImGuiIDStackTool_destroy @189
  ImGuiIO_AddFocusEvent=tc_game_engine.ImGuiIO_AddFocusEvent @190
- ImGuiIO_AddInputCharacter=tc_game_engine.ImGuiIO_AddInputCharacter @191
- ImGuiIO_AddInputCharacterUTF16=tc_game_engine.ImGuiIO_AddInputCharacterUTF16 @192
- ImGuiIO_AddInputCharactersUTF8=tc_game_engine.ImGuiIO_AddInputCharactersUTF8 @193
+ ImGuiIO_AddInputCharacter @191
+ ImGuiIO_AddInputCharacterUTF16 @192
+ ImGuiIO_AddInputCharactersUTF8 @193
  ImGuiIO_AddKeyAnalogEvent=tc_game_engine.ImGuiIO_AddKeyAnalogEvent @194
  ImGuiIO_AddKeyEvent=tc_game_engine.ImGuiIO_AddKeyEvent @195
  ImGuiIO_AddMouseButtonEvent=tc_game_engine.ImGuiIO_AddMouseButtonEvent @196
  ImGuiIO_AddMousePosEvent=tc_game_engine.ImGuiIO_AddMousePosEvent @197
  ImGuiIO_AddMouseSourceEvent=tc_game_engine.ImGuiIO_AddMouseSourceEvent @198
  ImGuiIO_AddMouseViewportEvent=tc_game_engine.ImGuiIO_AddMouseViewportEvent @199
- ImGuiIO_AddMouseWheelEvent=tc_game_engine.ImGuiIO_AddMouseWheelEvent @200
+ ImGuiIO_AddMouseWheelEvent @200
  ImGuiIO_ClearEventsQueue=tc_game_engine.ImGuiIO_ClearEventsQueue @201
  ImGuiIO_ClearInputKeys=tc_game_engine.ImGuiIO_ClearInputKeys @202
  ImGuiIO_ClearInputMouse=tc_game_engine.ImGuiIO_ClearInputMouse @203
