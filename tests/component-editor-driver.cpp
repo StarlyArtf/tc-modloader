@@ -735,6 +735,20 @@ void rightClickAt(float game_x, float game_y) {
    carries *screen* coordinates, unlike the other mouse messages. */
 void postWheel(float game_x, float game_y, int notches) {
     if (!window || !notches) return;
+    // Drive the same ImGui event queue as the game's backend. The desktop
+    // cursor can be clipped by the monitor or moved by another window; a wheel
+    // event must still target this isolated game's row window.
+    using MouseEvent = void(*)(void*,float,float);
+    const auto position = reinterpret_cast<MouseEvent>(
+        host->engine_proc(host->context, "ImGuiIO_AddMousePosEvent"));
+    const auto wheel = reinterpret_cast<MouseEvent>(
+        host->engine_proc(host->context, "ImGuiIO_AddMouseWheelEvent"));
+    if (getIo && position && wheel) {
+        void* io = getIo();
+        position(io, game_x, game_y);
+        wheel(io, 0.f, float(notches));
+        return;
+    }
     const int client_x = static_cast<int>(game_x * scale_x);
     const int client_y = static_cast<int>(game_y * scale_y);
     POINT screen{client_x, client_y};

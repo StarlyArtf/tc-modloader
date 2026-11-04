@@ -230,9 +230,11 @@ if($LASTEXITCODE){throw 'Custom OR package apply failed'}
 
 $taskPreviousProfile = $env:USERPROFILE
 $taskPreviousAppData = $env:APPDATA
+$taskPreviousDumpSource = $env:TC_MODLOADER_DUMP_SOURCE
 try {
   $env:USERPROFILE = $taskProfile
   $env:APPDATA = Join-Path $taskProfile 'AppData\Roaming'
+  $env:TC_MODLOADER_DUMP_SOURCE = '1'
   $taskProcess = Start-Process -FilePath (Join-Path $taskRoot 'Turing Complete.exe') -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $taskTest "stdout.txt") -RedirectStandardError (Join-Path $taskTest "stderr.txt") -PassThru
   Start-Sleep -Seconds 45
   if(!$taskProcess.HasExited) {
@@ -242,6 +244,8 @@ try {
 } finally {
   $env:USERPROFILE = $taskPreviousProfile
   $env:APPDATA = $taskPreviousAppData
+  if($null -eq $taskPreviousDumpSource) { Remove-Item Env:\TC_MODLOADER_DUMP_SOURCE -ErrorAction SilentlyContinue }
+  else { $env:TC_MODLOADER_DUMP_SOURCE = $taskPreviousDumpSource }
 }
 
 $taskLog = Join-Path $taskRoot 'tc-modloader-data\loader.log'

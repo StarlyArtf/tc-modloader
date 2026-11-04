@@ -698,6 +698,60 @@ int main() {
     // A 64-bit pin crossing payload words used to overrun the payload array.
     // Construct payload independently, one bit at a time, then verify decoding.
     using namespace tc::logic;
+    // Binding a zero-output scaffold must also schedule its unconnected
+    // driver: side-effect-only components still run once per simulation cycle.
+    {
+        originalLine = output;
+        originalCircuit = [](void*, void*, uint8_t mode, void*, void*, void*) {
+            assert(emission && emission->instances.size() == 1);
+            auto& instance = emission->instances.begin()->second;
+            const size_t prefix = instance.inputs ? 2 * instance.inputs - 1 : 0;
+            const size_t driver = prefix + 1; // node 0 is the custom parent
+            const auto role = emission->nodes.find(driver);
+            assert(role != emission->nodes.end());
+            assert(role->second.first && !role->second.collector && !role->second.clockedTick && !role->second.triState);
+            for(uint32_t input = 0; input < instance.inputs; ++input) {
+                const auto node = std::to_string(input + 1);
+                if(instance.v3 && !mode) emit("let zid50 = false");
+                emit("// " + node);
+                emit(mode ? "let value_id" + node + " = ~(load(<U1>, #STATE + 50))" :
+                            "var vid" + node + " = U1 ~(U1 vid50)");
+            }
+            emit("// " + std::to_string(driver));
+            emit(mode ? "let value_id" + std::to_string(driver) + " = ~(load(<U1>, #STATE + 50))" :
+                        "var vid" + std::to_string(driver) + " = U1 ~(U1 vid50)");
+            assert(emission->rewritten == 1 && !instance.failed);
+            assert(lines.back().find(mode ? "tc_logic_peek" : "tc_logic_invoke") != std::string::npos);
+            if(instance.v3) assert(lines.back().find("tc_logic_drive_in") != std::string::npos);
+            assert(!emission->triRewriteValid);
+            const std::string unrelated = "if vid50 > 0 { halt() }";
+            emit(unrelated);
+            assert(lines.back() == unrelated);
+        };
+        for(bool v3 : {false, true}) for(uint32_t inputs : {0u, 1u, 3u}) for(uint8_t mode : {uint8_t(0), uint8_t(1)}) {
+            bindings.clear(); bindingKeys.clear(); definitions.clear(); lines.clear();
+            auto sink = std::make_shared<Definition>();
+            sink->api.version = 3; sink->api.custom_id = 0xf0000000000000e1ULL; sink->active = true;
+            sink->inputs = inputs; sink->outputs = 0; sink->inputWidths.fill(1);
+            sink->useV3 = v3;
+            const size_t prefix = inputs ? 2 * inputs - 1 : 0;
+            const size_t count = 1 + prefix + 1;
+            std::vector<unsigned char> nodes(8 + count * 0x238, 0);
+            auto put64 = [&](size_t node, size_t offset, uint64_t word) {
+                std::memcpy(nodes.data() + 8 + node * 0x238 + offset, &word, sizeof(word));
+            };
+            nodes[8] = 0x4e;
+            put64(0, 8, 0x1234); put64(0, 0x188, sink->api.custom_id);
+            for(size_t node = 1; node < count; ++node) {
+                nodes[8 + node * 0x238] = node <= inputs || node == count - 1 ? 0x12 : 0x17;
+                put64(node, 0x18, 0x1234);
+            }
+            definitions[sink->api.custom_id] = sink;
+            uint64_t board[] = {count, reinterpret_cast<uint64_t>(nodes.data())};
+            circuit(nullptr, board, mode, nullptr, nullptr, nullptr);
+        }
+        bindings.clear(); bindingKeys.clear(); definitions.clear(); originalCircuit = nullptr;
+    }
     auto definition=std::make_shared<Definition>();
     definition->inputs=3;definition->outputs=1;definition->inputWidths={1,64,63};
     placeInputs(definition->inputWidths,3,definition->inputWord,definition->inputShift);

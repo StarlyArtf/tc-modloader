@@ -11,7 +11,7 @@
 # Products: build/text-box-out/board.png (the board with the note) and the
 # loader log lines the run asserts on.
 param(
-  [int]$Seconds = 70,
+  [int]$Seconds = 115,
   [int]$ShotDelay = 24000,
   [switch]$KeepRunning,
   # Font-service scenario (render V8, 2026-09-28): the Mod loads the game's own
@@ -50,6 +50,18 @@ Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\tc-loader.dll') -Destination (
 foreach ($taskMod in @('local.text-box','dev.enter-board')) {
     Copy-Item -LiteralPath (Join-Path $taskRepo ('dist\'+$taskMod+'.mod')) -Destination (Join-Path $taskRoot 'mods') -Force
 }
+# Use the real note implementation with a test-only completion-triggered
+# framebuffer capture. The shipped package remains the ordinary build.
+$taskDriverPackage=Join-Path $taskSandbox 'text-box-driver'
+New-Item -ItemType Directory -Force (Join-Path $taskDriverPackage 'native') | Out-Null
+Copy-Item -LiteralPath (Join-Path $taskRepo 'examples\text-box\mod.json') -Destination $taskDriverPackage
+$taskCompiler=if($env:TC_MINGW_BIN){$env:TC_MINGW_BIN}else{'C:\msys64\ucrt64\bin'}
+$taskDriverHooks=@('mh-buffer.o','mh-hook.o','mh-trampoline.o','mh-hde-hde64.o') | ForEach-Object { Join-Path $taskRepo ('build\'+$_) }
+& (Join-Path $taskCompiler 'g++.exe') -std=c++17 -O2 -static -shared -Isdk (Join-Path $PSScriptRoot 'text-box-driver.cpp') @taskDriverHooks -lopengl32 -o (Join-Path $taskDriverPackage 'native\text-box.dll')
+if($LASTEXITCODE){throw 'Text-box test driver compilation failed'}
+$taskDriverMod=Join-Path $taskRoot 'mods\local.text-box.mod'
+Remove-Item -LiteralPath $taskDriverMod
+& (Join-Path $taskRepo 'tools\Pack-Mod.ps1') -Source $taskDriverPackage -Output $taskDriverMod | Out-Null
 # The live install's asset files may already carry another Mod's patch; the
 # sandbox starts from the loader's own copies of the originals so that applying
 # a Mod here can never patch an already-patched file twice.
@@ -78,6 +90,7 @@ $taskShot=Join-Path $taskOut 'board.bmp'
 Remove-Item -LiteralPath $taskLog,$taskShot -ErrorAction SilentlyContinue
 $taskPreviousProfile=$env:USERPROFILE;$taskPreviousAppData=$env:APPDATA
 $taskPreviousShot=$env:TC_MODLOADER_SHOT;$taskPreviousDelay=$env:TC_MODLOADER_SHOT_DELAY
+$taskPreviousTestShot=$env:TC_TEST_TEXTBOX_SHOT
 $taskPreviousRenderClip=$env:TC_MODLOADER_RENDER_CLIP
 $taskPreviousDefaultProbe=$env:TC_TEXTBOX_DEFAULT_PROBE
 $taskPreviousFont=$env:TC_TEXTBOX_FONT
@@ -86,7 +99,8 @@ try {
     $env:USERPROFILE=Join-Path $taskSandbox 'home'
     $env:APPDATA=Join-Path $env:USERPROFILE 'AppData\Roaming'
     $env:TC_MODLOADER_SHOT=$taskShot
-    $env:TC_MODLOADER_SHOT_DELAY="$ShotDelay"
+    $env:TC_MODLOADER_SHOT_DELAY='600000'
+    $env:TC_TEST_TEXTBOX_SHOT=$taskShot
     # Inset all four edges over clear board pixels. The Mod draws a different
     # opaque marker across each edge and this script checks the captured pixels.
     $env:TC_MODLOADER_RENDER_CLIP='800,200,1800,850'
@@ -105,21 +119,23 @@ try {
     do {
         Start-Sleep -Milliseconds 500
         $taskText=if(Test-Path -LiteralPath $taskLog){Get-Content -LiteralPath $taskLog -Raw}else{''}
-        if($taskText -match 'text-box autotest: the click' -and
-           $taskText -match 'Captured frame screenshot' -or
-           $taskText -match 'Captured frame screenshot' -or
+        if($taskText -match 'Captured frame screenshot \(text-box test completion\)' -or
            $taskText -match 'Plugin callback threw|Native failed' -or
            $taskProcess.HasExited){break}
     }while((Get-Date)-lt $taskDeadline)
 }finally{
     $env:USERPROFILE=$taskPreviousProfile;$env:APPDATA=$taskPreviousAppData
     $env:TC_MODLOADER_SHOT=$taskPreviousShot;$env:TC_MODLOADER_SHOT_DELAY=$taskPreviousDelay
+    $env:TC_TEST_TEXTBOX_SHOT=$taskPreviousTestShot
     $env:TC_MODLOADER_RENDER_CLIP=$taskPreviousRenderClip
     $env:TC_TEXTBOX_DEFAULT_PROBE=$taskPreviousDefaultProbe
     $env:TC_TEXTBOX_FONT=$taskPreviousFont
     if($taskProcess -and !$taskProcess.HasExited -and !$KeepRunning){
         [void]$taskProcess.CloseMainWindow()
-        if(!$taskProcess.WaitForExit(4000)){Stop-Process -Id $taskProcess.Id}
+        if(!$taskProcess.WaitForExit(4000)){
+            Stop-Process -Id $taskProcess.Id
+            if(!$taskProcess.WaitForExit(5000)){throw 'Isolated text-box game did not exit'}
+        }
     }
 }
 if(!(Test-Path -LiteralPath $taskLog)){throw 'No loader log: the game did not start'}

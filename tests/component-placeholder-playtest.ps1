@@ -49,9 +49,22 @@ Copy-Item -LiteralPath $taskSchematic -Destination $taskCircuit -Force
 $taskPreviousProfile = $env:USERPROFILE
 $taskPreviousAppData = $env:APPDATA
 $taskPreviousMigrate = $env:TC_STORAGE_MIGRATE
+$taskPreviousRegisterOnly = $env:TC_STORAGE_REGISTER_ONLY
+$taskPreviousSave = $env:TC_PLACEHOLDER_SAVE
+$taskPreviousSaveProfile = $env:TC_TEST_SAVE_PROFILE
 # The probe's dump and the fixture's hash are what every scenario compares against.
 $taskReport = Join-Path $taskData 'report.txt'
 $taskFixtureHash = (Get-FileHash -LiteralPath $taskSchematic).Hash
+
+function Select-ScenarioProfile([string]$Name) {
+  if($Name -notmatch '^[A-Za-z0-9_-]+$') { throw 'Invalid isolated profile name' }
+  $env:TC_TEST_SAVE_PROFILE = $Name
+  $script:taskSchema = Join-Path $taskProfile "AppData\Roaming\Turing Complete Mods\profiles\$Name\schematics\not_gate\Default"
+  New-Item -ItemType Directory -Force $script:taskSchema | Out-Null
+  $script:taskCircuit = Join-Path $script:taskSchema 'circuit.data'
+  "[saves]`r`nprofile=$Name`r`n" | Set-Content -LiteralPath (Join-Path $taskRoot 'tc-modloader-data\saves.ini') -Encoding ascii
+  Copy-Item -LiteralPath $taskSchematic -Destination $script:taskCircuit -Force
+}
 
 function Invoke-Launch([string]$Label,[string]$ResultPath,[switch]$AllowFailure) {
   if(Test-Path -LiteralPath $ResultPath) { Remove-Item -LiteralPath $ResultPath -Force }
@@ -99,6 +112,9 @@ try {
   $env:USERPROFILE = $taskProfile
   $env:APPDATA = Join-Path $taskProfile 'AppData\Roaming'
   Remove-Item Env:\TC_STORAGE_MIGRATE -ErrorAction SilentlyContinue
+  Remove-Item Env:\TC_PLACEHOLDER_SAVE -ErrorAction SilentlyContinue
+  Remove-Item Env:\TC_STORAGE_REGISTER_ONLY -ErrorAction SilentlyContinue
+  $env:TC_TEST_SAVE_PROFILE = 'default'
 
   # Phases 1-2: the probe is applied, but nothing registers the instance's custom
   # id, so the component is a real "missing Mod" for the game.
@@ -112,7 +128,15 @@ try {
   & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply test.component-placeholder test.component-storage
   if($LASTEXITCODE){throw 'Probe packages could not be enabled'}
   $env:TC_STORAGE_MIGRATE = 'accept'
+  $env:TC_STORAGE_REGISTER_ONLY = '1'
   $taskControl = Invoke-Launch 'Scenario 0 (Mod installed)' (Join-Path $taskData 'result.txt')
+  Remove-Item Env:\TC_STORAGE_REGISTER_ONLY -ErrorAction SilentlyContinue
+  $taskControlLog = [IO.File]::ReadAllText((Get-LaunchLog 'Scenario 0 (Mod installed)'))
+  foreach($taskOwner in @('test.component-placeholder','test.component-storage')) {
+    if($taskControlLog -notmatch ('Native loaded: ' + [regex]::Escape($taskOwner))) {
+      throw "Scenario 0: $taskOwner did not load successfully"
+    }
+  }
   Remove-Item Env:\TC_STORAGE_MIGRATE -ErrorAction SilentlyContinue
   "scenario 0: $taskControl"
   if($taskControl -notmatch 'component=present') { throw "Scenario 0: the control did not see the component: $taskControl" }
@@ -127,6 +151,7 @@ try {
   if($LASTEXITCODE){throw 'Placeholder probe package apply failed'}
 
   # --- scenario 1: missing, not saved -------------------------------------------------
+  Select-ScenarioProfile 'unknown-unsaved'
   $taskFirst = Invoke-Launch 'Scenario 1 (no Mod, no save)' (Join-Path $taskData 'result.txt')
   "scenario 1: $taskFirst"
   if($taskFirst -notmatch 'component=missing') { throw "Scenario 1 expected the component to be a tombstone: $taskFirst" }
@@ -158,6 +183,7 @@ try {
   # Take the Mod away again (only the reporting probe stays enabled) and give the level
   # a fresh copy of the fixture, so this measures the save without the Mod and nothing else.
   & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply test.component-placeholder | Out-Null
+  Select-ScenarioProfile 'unknown-saved'
   Copy-Item -LiteralPath $taskSchematic -Destination $taskCircuit -Force
   $env:TC_PLACEHOLDER_SAVE = '1'
   $taskSaved = Invoke-Launch 'Scenario 3 (no Mod, save)' (Join-Path $taskData 'result.txt')
@@ -193,6 +219,7 @@ try {
   # This is the realistic "player disabled the Mod" case: the circuit file was written
   # while the Mod was installed, and the question is whether the game keeps a component
   # whose owner is no longer there.
+  Select-ScenarioProfile 'known-owner'
   Copy-Item -LiteralPath $taskSchematic -Destination $taskCircuit -Force
   & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply test.component-storage | Out-Null
   $env:TC_STORAGE_MIGRATE = 'accept'
@@ -203,17 +230,30 @@ try {
   Remove-Item Env:\TC_STORAGE_MIGRATE -ErrorAction SilentlyContinue
   $taskKnownAgain = Invoke-Launch 'Scenario 4 (Mod removed again)' (Join-Path $taskData 'result.txt')
   "scenario 4 (Mod removed): $taskKnownAgain"
-  Assert-MissingModReported 'Scenario 4 (Mod removed again)' $true
+  Assert-MissingModReported 'Scenario 4 (Mod removed again)' $false
+  if($taskKnownAgain -notmatch 'component=present' -or $taskKnownAgain -notmatch 'custom=1' -or $taskKnownAgain -notmatch 'wires=2') {
+    throw "Scenario 4: the persisted foundry definition did not retain the component and wires: $taskKnownAgain"
+  }
+  $taskKnownReport = [IO.File]::ReadAllText($taskReport)
+  foreach($taskPattern in @('x=-5 y=0 rot=0','custom=4e4f54315f303031','54434d3300000003=0000000700000004','54434d3300001000=00000000f00f5aa5','54434d3300003000=506c616365686f6c','wire=0 a=\(-6,-1\) b=\(-12,0\)','wire=1 a=\(12,0\) b=\(-3,-1\)')) {
+    if($taskKnownReport -notmatch $taskPattern) { throw "Scenario 4 lost stored geometry or configuration: $taskKnownReport" }
+  }
   Copy-Item -LiteralPath $taskReport -Destination (Join-Path $taskTest 'report-4-known.txt') -Force
   if((Get-FileHash -LiteralPath $taskCircuit).Hash -ne $taskAfterMod) {
     throw 'Scenario 4: loading without the Mod rewrote the schematic the Mod had saved'
   }
 
-  'PASS missing Mod: the component becomes a tombstone, the file survives until a save, a reinstall restores the configuration, and a save without the Mod is recovered from the loader''s own store once the Mod is back'
+  'PASS missing Mod: unknown definitions become tombstones, reinstall restores configuration after unsaved and saved loss, and known foundry definitions retain geometry, wires and stored configuration after the owner is disabled'
   "Evidence: $taskTest"
 } finally {
   $env:USERPROFILE = $taskPreviousProfile
   $env:APPDATA = $taskPreviousAppData
   if($null -eq $taskPreviousMigrate) { Remove-Item Env:\TC_STORAGE_MIGRATE -ErrorAction SilentlyContinue }
   else { $env:TC_STORAGE_MIGRATE = $taskPreviousMigrate }
+  if($null -eq $taskPreviousRegisterOnly) { Remove-Item Env:\TC_STORAGE_REGISTER_ONLY -ErrorAction SilentlyContinue }
+  else { $env:TC_STORAGE_REGISTER_ONLY = $taskPreviousRegisterOnly }
+  if($null -eq $taskPreviousSave) { Remove-Item Env:\TC_PLACEHOLDER_SAVE -ErrorAction SilentlyContinue }
+  else { $env:TC_PLACEHOLDER_SAVE = $taskPreviousSave }
+  if($null -eq $taskPreviousSaveProfile) { Remove-Item Env:\TC_TEST_SAVE_PROFILE -ErrorAction SilentlyContinue }
+  else { $env:TC_TEST_SAVE_PROFILE = $taskPreviousSaveProfile }
 }

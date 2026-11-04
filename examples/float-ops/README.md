@@ -3,6 +3,39 @@
 `local.float-ops` is an independent native Mod. It is not linked into
 `tc-loader.dll` and it does not patch the game or the loader.
 
+## CPU arithmetic by default (0.3.2)
+
+SSE/SSE2 is the default for FP32/FP64 add, subtract, multiply, divide and square
+root. No environment variable is needed. To force SoftFloat instead, set
+`TC_FLOATOPS_CPU=0` before launching. For example, from PowerShell in the game
+directory:
+
+```powershell
+$env:TC_FLOATOPS_CPU = '0'
+Start-Process -FilePath '.\Turing Complete.exe'
+```
+
+Unset the variable or set it to `1`, then restart, to return to CPU arithmetic.
+Existing circuit files and component configurations need no conversion.
+
+The CPU path preserves the result bits, signed zeros, all five exception flags
+and all five rounding modes. Ties-away, special/subnormal inputs, tiny results
+and overflow fall back to SoftFloat. FP16, FMA, remainder, conversions and the
+other operations keep their existing implementations. The complete caller
+MXCSR is restored, including sticky flags, rounding, FTZ/DAZ and trap masks.
+
+Performance depends on the circuit: isolated arithmetic benchmarks include
+the per-operation cost of preserving MXCSR and do not predict whole-game
+speed. CPU arithmetic is the default following the user's in-game comparison;
+the software override remains available. Simulation callbacks and display
+formatting are unchanged.
+
+`tests/float-hardware.cpp` compares both widths and all five basic operations
+against SoftFloat under hostile MXCSR settings, over edge cases and random
+bit patterns. `build.ps1` also runs the existing 7,571 FP32 golden vectors in
+both modes. The hardware test's `--bench` option compares arithmetic kernels
+only; it does not measure whole-game simulation speed.
+
 - **M0** (see `docs/PLAN-float-components.md`, section 4) measures the public
   component path this Mod needs.
 - **M1** (section 5) adds the IEEE 754 binary32 kernel: vendored SoftFloat 3e

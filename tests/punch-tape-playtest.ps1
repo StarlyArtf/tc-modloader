@@ -114,7 +114,8 @@ try {
   while([DateTime]::UtcNow -lt $taskDeadline) {
     Start-Sleep -Milliseconds 500
     if($taskProcess.HasExited) { break }
-    if(Test-Path -LiteralPath $taskShot) { break }
+    if((Test-Path -LiteralPath $taskShot) -and (Test-Path -LiteralPath $taskLog) -and
+       (Select-String -LiteralPath $taskLog -SimpleMatch 'PUNCHDRV: measurements finished' -Quiet)) { break }
   }
   if($taskProcess.HasExited) { throw "The game exited during the case (exit code $($taskProcess.ExitCode)); inspect $taskLog" }
   if(!(Test-Path -LiteralPath $taskLog)) { throw 'No loader log: the game did not start' }

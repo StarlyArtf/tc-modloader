@@ -2254,14 +2254,15 @@ inline void circuit(void* a,void* b,uint8_t c,void* d,void* e,void* f) {
                 if(generated && k<def->second->inputs)
                     context.nodes.emplace(nodesOfInstance[k],Emission::Role{
                         token,static_cast<uint32_t>(k),false,true,false,false});
-                else if(k>=prefix&&k<prefix+def->second->outputs) {
+                else if(k>=prefix&&(k<prefix+def->second->outputs ||
+                        (generated&&def->second->outputs==0&&k==prefix))) {
                     const uint32_t output=static_cast<uint32_t>(k-prefix);
                     context.nodes.emplace(nodesOfInstance[k],Emission::Role{
                         token,output,precise?
                             (def->second->groupedOutputs?
                                 outputGroupLeader(def->second->outputDependencies,output):true):
                             k==prefix,false,
-                        def->second->useV3,false});
+                        def->second->useV3&&def->second->outputs>0,false});
                 }
                 else if(precise&&def->second->clockedTick&&
                         k==prefix+def->second->outputs)

@@ -48,8 +48,37 @@ try {
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
       (Join-Path $taskRoot 'tests\float-kernel.cpp') $taskObjects -o $taskKernelTest
     if ($LASTEXITCODE) { throw 'Float Ops kernel test did not compile' }
-    & $taskKernelTest
-    if ($LASTEXITCODE) { throw 'Float Ops kernel test failed' }
+    $taskPreviousCpu = $env:TC_FLOATOPS_CPU
+    try {
+      foreach ($taskCpuMode in @('0', '1')) {
+        $env:TC_FLOATOPS_CPU = $taskCpuMode
+        & $taskKernelTest
+        if ($LASTEXITCODE) { throw "Float Ops kernel test failed (TC_FLOATOPS_CPU=$taskCpuMode)" }
+      }
+    } finally {
+      $env:TC_FLOATOPS_CPU = $taskPreviousCpu
+    }
+
+    $taskHardwareTest = Join-Path $taskBuild 'float-hardware-test.exe'
+    & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `
+      (Join-Path $taskRoot 'tests\float-hardware.cpp') $taskObjects -o $taskHardwareTest
+    if ($LASTEXITCODE) { throw 'Float Ops CPU backend test did not compile' }
+    $taskPreviousCpu = $env:TC_FLOATOPS_CPU
+    try {
+      foreach ($taskBackend in @(
+        @{ Value = $null; Expected = 'cpu' },
+        @{ Value = '1'; Expected = 'cpu' },
+        @{ Value = '0'; Expected = 'software' }
+      )) {
+        $env:TC_FLOATOPS_CPU = $taskBackend.Value
+        & $taskHardwareTest --backend $taskBackend.Expected
+        if ($LASTEXITCODE) { throw 'Float Ops backend selection test failed' }
+      }
+    } finally {
+      $env:TC_FLOATOPS_CPU = $taskPreviousCpu
+    }
+    & $taskHardwareTest
+    if ($LASTEXITCODE) { throw 'Float Ops CPU backend test failed' }
 
     $taskDecimalTest = Join-Path $taskBuild 'float-decimal-test.exe'
     & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror -static @taskKernelFlags `

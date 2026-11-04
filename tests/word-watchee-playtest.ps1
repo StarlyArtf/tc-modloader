@@ -135,14 +135,16 @@ try {
   $taskDeadline = [DateTime]::UtcNow.AddSeconds(45)
   while([DateTime]::UtcNow -lt $taskDeadline) {
     $taskLines = Get-Content -LiteralPath $taskLog
-    if($taskLines | Where-Object { $_ -match 'ENTER-BOARD: pressed a home page entry to reach a board' }) { break }
+    if(($taskLines | Where-Object { $_ -match 'ENTER-BOARD: pressed stage 0 candidate' }) -and
+       ($taskLines | Where-Object { $_ -match '^Level loaded: sandbox$' })) { break }
     if($taskProcess.HasExited) { throw "The game exited before reaching a board (exit code $($taskProcess.ExitCode))" }
     Start-Sleep -Milliseconds 500
   }
   $taskLines = Get-Content -LiteralPath $taskLog
   $taskRequired = @(
       'value_size ceiling 32 -> 64 at 0x.* \(mov eax,0x20; read back 64\)',
-      'ENTER-BOARD: pressed a home page entry to reach a board')
+      'ENTER-BOARD: pressed stage 0 candidate',
+      '^Level loaded: sandbox$')
   # report_status is a 0.6.0 entry point, so the Mods page line only exists on a
   # loader that has it; an older loader still gets the log line and the file.
   if($taskLines | Where-Object { $_ -match 'TC Mod Loader 0\.6' }) {

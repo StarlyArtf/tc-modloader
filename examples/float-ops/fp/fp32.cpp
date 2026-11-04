@@ -1,6 +1,7 @@
 /* Float Ops binary32 kernel: SoftFloat 3e behind the project's contract.
 
-   Every arithmetic entry point does the same four things:
+   The CPU backend handles ordinary FP32 add/subtract/multiply/divide and
+   square root first. Software mode and every declined case use SoftFloat:
 
      1. open a SoftFloatOperation, which sets the rounding mode, pins tininess
         to after-rounding and clears the flag word;
@@ -16,6 +17,7 @@
    not move when the vendored library is updated. */
 
 #include "environment.hpp"
+#include "hardware.hpp"
 
 #include <cstdint>
 
@@ -56,30 +58,45 @@ constexpr uint32_t kTwoTo32 = 0x4F800000u;
 /* ---- arithmetic --------------------------------------------------------- */
 
 FP32Result fp32_add(uint32_t a, uint32_t b, FPRounding rounding) {
+    hardware::Result fast{};
+    if (hardware::enabled() && hardware::evaluate32(hardware::Operation::add, a, b, rounding, &fast))
+        return {static_cast<uint32_t>(fast.bits), fast.flags};
     SoftFloatOperation operation(rounding);
     const uint32_t bits = fromF32(f32_add(toF32(a), toF32(b)));
     return canonical(bits, operation.flags());
 }
 
 FP32Result fp32_subtract(uint32_t a, uint32_t b, FPRounding rounding) {
+    hardware::Result fast{};
+    if (hardware::enabled() && hardware::evaluate32(hardware::Operation::subtract, a, b, rounding, &fast))
+        return {static_cast<uint32_t>(fast.bits), fast.flags};
     SoftFloatOperation operation(rounding);
     const uint32_t bits = fromF32(f32_sub(toF32(a), toF32(b)));
     return canonical(bits, operation.flags());
 }
 
 FP32Result fp32_multiply(uint32_t a, uint32_t b, FPRounding rounding) {
+    hardware::Result fast{};
+    if (hardware::enabled() && hardware::evaluate32(hardware::Operation::multiply, a, b, rounding, &fast))
+        return {static_cast<uint32_t>(fast.bits), fast.flags};
     SoftFloatOperation operation(rounding);
     const uint32_t bits = fromF32(f32_mul(toF32(a), toF32(b)));
     return canonical(bits, operation.flags());
 }
 
 FP32Result fp32_divide(uint32_t a, uint32_t b, FPRounding rounding) {
+    hardware::Result fast{};
+    if (hardware::enabled() && hardware::evaluate32(hardware::Operation::divide, a, b, rounding, &fast))
+        return {static_cast<uint32_t>(fast.bits), fast.flags};
     SoftFloatOperation operation(rounding);
     const uint32_t bits = fromF32(f32_div(toF32(a), toF32(b)));
     return canonical(bits, operation.flags());
 }
 
 FP32Result fp32_square_root(uint32_t a, FPRounding rounding) {
+    hardware::Result fast{};
+    if (hardware::enabled() && hardware::evaluate32(hardware::Operation::square_root, a, 0, rounding, &fast))
+        return {static_cast<uint32_t>(fast.bits), fast.flags};
     SoftFloatOperation operation(rounding);
     const uint32_t bits = fromF32(f32_sqrt(toF32(a)));
     return canonical(bits, operation.flags());

@@ -562,6 +562,9 @@ static void frame(void*, const TCFrame*) {
     if (!boardView(&view)) return;
     switch (stage) {
         case 0: {
+            // Do not select the menu's placeholder board: load_level replaces
+            // both its components and its drawer selection.
+            if (!autotestLoadedLevel()) break;
             uint64_t index = 0, id = 0, width = 0;
             if (findWideConstant(view, &index, &id, &width)) {
                 /* The level brought its own wide constant: nothing to place. */
@@ -612,6 +615,7 @@ static void frame(void*, const TCFrame*) {
                 say("runtime-only: checking setter and state without drawer wait");
                 stage=3;stageFrames=0;break;
             }
+            selectConstant(view, constantIndex);
             openDrawer(view, constantIndex);
             const std::string line = lastLineWith(readText(logPath), "punch tape: geometry drawer");
             if (parseGeometry(line, &geometry)) {
@@ -640,6 +644,13 @@ static void frame(void*, const TCFrame*) {
                 requestRecompile(view);
             }
             uint64_t offset = 0;
+            const char* dump = std::getenv("TC_MODLOADER_DUMP_SOURCE");
+            if (!dump || dump[0] != '1') {
+                say("no compiled source carries the constant (diagnostic dumps disabled)");
+                stage = 4;
+                stageFrames = 0;
+                break;
+            }
             if (stateOffsetFor(std::to_string(constantId), &offset)) {
                 say("compiled source carries component " + std::to_string(constantId) +
                     " at state offset " + std::to_string(offset));
@@ -672,6 +683,7 @@ static void frame(void*, const TCFrame*) {
                               mask & (0x5A5A5A5A5A5A5A5AULL >> 16));
                 const char* runtimeOnly=std::getenv("TC_TEST_PUNCH_RUNTIME_ONLY");
                 if(!(runtimeOnly && runtimeOnly[0]=='1'))runRealClicks(constantId, constantWidth);
+                say("measurements finished");
             }
             break;
         }

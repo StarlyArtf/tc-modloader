@@ -10,16 +10,18 @@
      * the two integer conversions, whose out-of-range policy is decision D2
        (saturate and raise NV) rather than the library's own returns.
 
-   Arithmetic goes to SoftFloat under the same `SoftFloatOperation` scoping the
+   Software arithmetic uses SoftFloat under the same `SoftFloatOperation` scoping the
    binary32 kernel uses: binary16 and binary64 straight to the f16/f64 entries,
    binary32 through fp32.cpp - the kernel with the golden vectors and the
    measured real-machine evidence - so this table never re-implements it.
    tests/float-kernel.cpp asserts that a binary32 call through here and the
-   same call through fp32.hpp agree bit for bit. */
+   same call through fp32.hpp agree bit for bit. Default SSE/SSE2 paths for
+   ordinary FP32/FP64 arithmetic preserve that same contract. */
 
 #include "format.hpp"
 
 #include "environment.hpp"
+#include "hardware.hpp"
 
 namespace tcfp {
 namespace {
@@ -310,26 +312,41 @@ struct Binary64 {
     static const Layout& layout() { return kLayout64; }
 
     static FormatResult add(uint64_t a, uint64_t b, FPRounding rounding) {
+        hardware::Result fast{};
+        if (hardware::enabled() && hardware::evaluate64(hardware::Operation::add, a, b, rounding, &fast))
+            return {fast.bits, fast.flags};
         SoftFloatOperation operation(rounding);
         const uint64_t bits = f64_add(toF64(a), toF64(b)).v;
             return canonicalResult(kLayout64, bits, operation.flags());
     }
     static FormatResult subtract(uint64_t a, uint64_t b, FPRounding rounding) {
+        hardware::Result fast{};
+        if (hardware::enabled() && hardware::evaluate64(hardware::Operation::subtract, a, b, rounding, &fast))
+            return {fast.bits, fast.flags};
         SoftFloatOperation operation(rounding);
         const uint64_t bits = f64_sub(toF64(a), toF64(b)).v;
             return canonicalResult(kLayout64, bits, operation.flags());
     }
     static FormatResult multiply(uint64_t a, uint64_t b, FPRounding rounding) {
+        hardware::Result fast{};
+        if (hardware::enabled() && hardware::evaluate64(hardware::Operation::multiply, a, b, rounding, &fast))
+            return {fast.bits, fast.flags};
         SoftFloatOperation operation(rounding);
         const uint64_t bits = f64_mul(toF64(a), toF64(b)).v;
             return canonicalResult(kLayout64, bits, operation.flags());
     }
     static FormatResult divide(uint64_t a, uint64_t b, FPRounding rounding) {
+        hardware::Result fast{};
+        if (hardware::enabled() && hardware::evaluate64(hardware::Operation::divide, a, b, rounding, &fast))
+            return {fast.bits, fast.flags};
         SoftFloatOperation operation(rounding);
         const uint64_t bits = f64_div(toF64(a), toF64(b)).v;
             return canonicalResult(kLayout64, bits, operation.flags());
     }
     static FormatResult squareRoot(uint64_t a, FPRounding rounding) {
+        hardware::Result fast{};
+        if (hardware::enabled() && hardware::evaluate64(hardware::Operation::square_root, a, 0, rounding, &fast))
+            return {fast.bits, fast.flags};
         SoftFloatOperation operation(rounding);
         const uint64_t bits = f64_sqrt(toF64(a)).v;
             return canonicalResult(kLayout64, bits, operation.flags());

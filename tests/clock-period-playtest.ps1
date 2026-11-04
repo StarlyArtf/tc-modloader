@@ -32,6 +32,16 @@ foreach ($taskFile in @('Turing Complete.exe', 'compile.dll', 'tc_game_engine.dl
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\tc-loader.dll') -Destination (Join-Path $taskRoot 'game_engine.dll')
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\dev.enter-board.mod') -Destination (Join-Path $taskRoot 'mods\dev.enter-board.mod')
 Copy-Item -LiteralPath (Join-Path $taskRepo 'dist\dev.clock-driver.mod') -Destination (Join-Path $taskRoot 'mods\dev.clock-driver.mod')
+$taskDriver=Join-Path $taskTest 'clock-driver'
+New-Item -ItemType Directory -Force (Join-Path $taskDriver 'native') | Out-Null
+Copy-Item -LiteralPath (Join-Path $taskRepo 'build\clock-driver-package\mod.json') -Destination $taskDriver
+$taskCompiler=if($env:TC_MINGW_BIN){$env:TC_MINGW_BIN}else{'C:\msys64\ucrt64\bin'}
+$taskHooks=@('mh-buffer.o','mh-hook.o','mh-trampoline.o','mh-hde-hde64.o') | ForEach-Object { Join-Path $taskRepo ('build\'+$_) }
+& (Join-Path $taskCompiler 'g++.exe') -std=c++17 -O2 -static -shared -Isdk (Join-Path $PSScriptRoot 'clock-period-driver.cpp') @taskHooks -lole32 -lwindowscodecs -o (Join-Path $taskDriver 'native\clock-driver.dll')
+if($LASTEXITCODE){throw 'Clock test cursor driver compilation failed'}
+$taskDriverMod=Join-Path $taskRoot 'mods\dev.clock-driver.mod'
+Remove-Item -LiteralPath $taskDriverMod
+& (Join-Path $taskRepo 'tools\Pack-Mod.ps1') -Source $taskDriver -Output $taskDriverMod | Out-Null
 $taskBoard = Join-Path $taskRepo 'build\sandbox_sim_clock_board.data'
 if (!(Test-Path -LiteralPath $taskBoard)) {
   throw "Missing $taskBoard (run tools/sandbox-sim-boards.py)"

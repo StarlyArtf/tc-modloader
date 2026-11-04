@@ -24,7 +24,8 @@
 
    Values cross this boundary as raw bit patterns in a uint64_t, exactly like
    the binary32 kernel: never as a host `float`, so nothing about the game's
-   MXCSR, FTZ/DAZ or the compiler's contraction can reach a result. */
+   MXCSR, FTZ/DAZ or the compiler's contraction can reach a result. The default
+   CPU backend scopes its own MXCSR and restores the caller's exact value. */
 
 #ifndef float_ops_format_hpp
 #define float_ops_format_hpp

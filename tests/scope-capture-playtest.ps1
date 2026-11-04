@@ -51,13 +51,13 @@ $taskCompilerRoot = if ($env:TC_MINGW_BIN) { $env:TC_MINGW_BIN } else { 'C:\msys
 & (Join-Path $taskCompilerRoot 'g++.exe') -std=c++17 -O2 -static -shared `
   (Join-Path $PSScriptRoot 'scope-byte-adder-driver.cpp') -o (Join-Path $taskFixtureNative 'byte-adder.dll')
 if ($LASTEXITCODE) { throw 'Scope navigation fixture compilation failed' }
-$taskFixtureManifest = Get-Content -LiteralPath (Join-Path $taskRepo 'examples\byte-adder\mod.json') -Raw | ConvertFrom-Json
+$taskFixtureManifest = Get-Content -LiteralPath (Join-Path $taskRepo 'examples\byte-adder\mod.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $taskFixtureManifest.capabilities = @('log','component','logic','symbol','hook','game_handles')
 $taskFixtureManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $taskFixtureRoot 'mod.json') -Encoding utf8
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $taskFixturePackage = Join-Path $taskRoot 'mods\example.byte-adder.mod'
 Remove-Item -LiteralPath $taskFixturePackage
-[System.IO.Compression.ZipFile]::CreateFromDirectory($taskFixtureRoot, $taskFixturePackage)
+& (Join-Path $taskRepo 'tools\Pack-Mod.ps1') -Source $taskFixtureRoot -Output $taskFixturePackage | Out-Null
 & (Join-Path $taskRepo 'dist\tcmod-cli.exe') $taskRoot apply example.byte-adder dev.scope-capture-driver | Out-Null
 if ($LASTEXITCODE) { throw 'Scope fixture package apply failed' }
 

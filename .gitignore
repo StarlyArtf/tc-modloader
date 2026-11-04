@@ -7,3 +7,4 @@ host.log
 loader.log
 fault.log
 native-logic-source*.txt
+/interactive-map.txt

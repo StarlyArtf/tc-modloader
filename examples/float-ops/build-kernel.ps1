@@ -82,7 +82,9 @@ foreach ($taskLine in Get-Content -LiteralPath $taskSourceList) {
 
 $taskKernelObject = Join-Path $taskObjectRoot 'fp32.o'
 $taskKernelSource = Join-Path $PSScriptRoot 'fp\fp32.cpp'
+$taskHardwareHeader = Join-Path $PSScriptRoot 'fp\hardware.hpp'
 if (Test-Stale $taskKernelObject @($taskKernelSource,
+    $taskHardwareHeader,
     (Join-Path $PSScriptRoot 'fp\fp32.hpp'),
     (Join-Path $PSScriptRoot 'fp\environment.hpp'), $taskPlatform)) {
   & $taskCxx -std=c++17 -O2 -Wall -Wextra -Werror @taskDefines @taskIncludes `
@@ -99,6 +101,7 @@ $taskObjects += $taskKernelObject
 $taskFormatObject = Join-Path $taskObjectRoot 'format.o'
 $taskFormatSource = Join-Path $PSScriptRoot 'fp\format.cpp'
 if (Test-Stale $taskFormatObject @($taskFormatSource,
+    $taskHardwareHeader,
     (Join-Path $PSScriptRoot 'fp\format.hpp'),
     (Join-Path $PSScriptRoot 'fp\fp32.hpp'),
     (Join-Path $PSScriptRoot 'fp\environment.hpp'), $taskPlatform)) {
